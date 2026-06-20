@@ -1,0 +1,4 @@
+[2026-06-20T16:45:04Z] loop start: 1 languages, orig_tokens=8805
+[2026-06-20T16:45:04Z]   >>> porting python (Python)
+[2026-06-20T16:46:17Z]       porter done: 400 bytes, 121 tokens, 72.8s
+[2026-06-20T16:46:19Z]       judge: completeness=35 notes=Python port provides only class/method stubs without implementation. No lexer, p

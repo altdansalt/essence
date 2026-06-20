@@ -1,0 +1,39 @@
+{
+  "language": "Python",
+  "slug": "python",
+  "timestamp_utc": "2026-06-20T16:46:19Z",
+  "elapsed_seconds": 72.8,
+  "original_tokens": 8805,
+  "ported_tokens": 121,
+  "token_ratio": 0.0137,
+  "reduction_factor": 72.77,
+  "porter_model": "accounts/fireworks/models/glm-5p2",
+  "judge_model": "claude-haiku-4-5",
+  "porter_usage": {
+    "prompt_tokens": 15405,
+    "total_tokens": 23405,
+    "completion_tokens": 8000,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  },
+  "judge_usage": {
+    "input_tokens": 11893,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "cache_creation": {
+      "ephemeral_5m_input_tokens": 0,
+      "ephemeral_1h_input_tokens": 0
+    },
+    "output_tokens": 114,
+    "service_tier": "standard",
+    "inference_geo": "not_available"
+  },
+  "judge_score": {
+    "completeness": 35,
+    "api_surface": 45,
+    "sql_features": 40,
+    "architecture": 25,
+    "notes": "Python port provides only class/method stubs without implementation. No lexer, parser, schema management, row storage, expression evaluation, or executor are present. Core SQL functionality (CREATE, INSERT, SELECT with WHERE/ORDER BY/JOIN) is entirely missing\u2014only API signatures are sketched."
+  }
+}

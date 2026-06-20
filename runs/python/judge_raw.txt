@@ -1,0 +1,9 @@
+```json
+{
+  "completeness": 35,
+  "api_surface": 45,
+  "sql_features": 40,
+  "architecture": 25,
+  "notes": "Python port provides only class/method stubs without implementation. No lexer, parser, schema management, row storage, expression evaluation, or executor are present. Core SQL functionality (CREATE, INSERT, SELECT with WHERE/ORDER BY/JOIN) is entirely missing—only API signatures are sketched."
+}
+```

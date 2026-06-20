@@ -1,0 +1,1106 @@
+[
+  {
+    "slug": "ada",
+    "name": "Ada",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/ada.md",
+    "lines": 417,
+    "promise_score": 6
+  },
+  {
+    "slug": "agda",
+    "name": "Agda",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/agda.md",
+    "lines": 400,
+    "promise_score": 5
+  },
+  {
+    "slug": "apl",
+    "name": "APL",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/apl.md",
+    "lines": 70,
+    "promise_score": 0
+  },
+  {
+    "slug": "arturo",
+    "name": "Arturo",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/arturo.md",
+    "lines": 433,
+    "promise_score": 1
+  },
+  {
+    "slug": "assemblyscript",
+    "name": "AssemblyScript",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/assemblyscript.md",
+    "lines": 203,
+    "promise_score": 5
+  },
+  {
+    "slug": "ats",
+    "name": "ATS",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/ats.md",
+    "lines": 608,
+    "promise_score": 6
+  },
+  {
+    "slug": "ballerina",
+    "name": "Ballerina",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/ballerina.md",
+    "lines": 433,
+    "promise_score": 5
+  },
+  {
+    "slug": "bash",
+    "name": "Bash",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/bash.md",
+    "lines": 1095,
+    "promise_score": 3
+  },
+  {
+    "slug": "bc",
+    "name": "bc",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/bc.md",
+    "lines": 96,
+    "promise_score": 1
+  },
+  {
+    "slug": "bf",
+    "name": "BF",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/bf.md",
+    "lines": 90,
+    "promise_score": 0
+  },
+  {
+    "slug": "bqn",
+    "name": "BQN",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/bqn.md",
+    "lines": 289,
+    "promise_score": 2
+  },
+  {
+    "slug": "c++",
+    "name": "C++",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/c++.md",
+    "lines": 1219,
+    "promise_score": 5
+  },
+  {
+    "slug": "c",
+    "name": "C",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/c.md",
+    "lines": 915,
+    "promise_score": 3
+  },
+  {
+    "slug": "chapel",
+    "name": "Chapel",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/chapel.md",
+    "lines": 1252,
+    "promise_score": 6
+  },
+  {
+    "slug": "chicken",
+    "name": "CHICKEN",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/chicken.md",
+    "lines": 518,
+    "promise_score": 5
+  },
+  {
+    "slug": "citron",
+    "name": "citron",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/citron.md",
+    "lines": 212,
+    "promise_score": 1
+  },
+  {
+    "slug": "clojure-macros",
+    "name": "Clojure macros",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/clojure-macros.md",
+    "lines": 150,
+    "promise_score": 2
+  },
+  {
+    "slug": "clojure",
+    "name": "Clojure",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/clojure.md",
+    "lines": 422,
+    "promise_score": 4
+  },
+  {
+    "slug": "cobol",
+    "name": "COBOL",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/cobol.md",
+    "lines": 198,
+    "promise_score": 0
+  },
+  {
+    "slug": "coffeescript",
+    "name": "CoffeeScript",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/coffeescript.md",
+    "lines": 105,
+    "promise_score": 1
+  },
+  {
+    "slug": "coldfusion",
+    "name": "ColdFusion",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/coldfusion.md",
+    "lines": 331,
+    "promise_score": 1
+  },
+  {
+    "slug": "common-lisp",
+    "name": "Common Lisp",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/common-lisp.md",
+    "lines": 680,
+    "promise_score": 3
+  },
+  {
+    "slug": "coq",
+    "name": "Coq",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/coq.md",
+    "lines": 511,
+    "promise_score": 7
+  },
+  {
+    "slug": "crystal",
+    "name": "Crystal",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/crystal.md",
+    "lines": 563,
+    "promise_score": 3
+  },
+  {
+    "slug": "csharp",
+    "name": "C#",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/csharp.md",
+    "lines": 1350,
+    "promise_score": 9
+  },
+  {
+    "slug": "cypher",
+    "name": "Cypher",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/cypher.md",
+    "lines": 231,
+    "promise_score": 1
+  },
+  {
+    "slug": "d",
+    "name": "D",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/d.md",
+    "lines": 260,
+    "promise_score": 5
+  },
+  {
+    "slug": "dart",
+    "name": "Dart",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/dart.md",
+    "lines": 724,
+    "promise_score": 7
+  },
+  {
+    "slug": "djot",
+    "name": "Djot",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/djot.md",
+    "lines": 214,
+    "promise_score": 0
+  },
+  {
+    "slug": "easylang",
+    "name": "Easylang",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/easylang.md",
+    "lines": 222,
+    "promise_score": 0
+  },
+  {
+    "slug": "edn",
+    "name": "EDN",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/edn.md",
+    "lines": 115,
+    "promise_score": 1
+  },
+  {
+    "slug": "elisp",
+    "name": "Emacs Lisp",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/elisp.md",
+    "lines": 353,
+    "promise_score": 0
+  },
+  {
+    "slug": "elixir",
+    "name": "Elixir",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/elixir.md",
+    "lines": 455,
+    "promise_score": 5
+  },
+  {
+    "slug": "elm",
+    "name": "Elm",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/elm.md",
+    "lines": 370,
+    "promise_score": 3
+  },
+  {
+    "slug": "erlang",
+    "name": "Erlang",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/erlang.md",
+    "lines": 346,
+    "promise_score": 7
+  },
+  {
+    "slug": "factor",
+    "name": "Factor",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/factor.md",
+    "lines": 181,
+    "promise_score": 0
+  },
+  {
+    "slug": "fish",
+    "name": "fish",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/fish.md",
+    "lines": 394,
+    "promise_score": 1
+  },
+  {
+    "slug": "forth",
+    "name": "Forth",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/forth.md",
+    "lines": 226,
+    "promise_score": 0
+  },
+  {
+    "slug": "fortran",
+    "name": "Fortran",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/fortran.md",
+    "lines": 503,
+    "promise_score": 3
+  },
+  {
+    "slug": "fsharp",
+    "name": "F#",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/fsharp.md",
+    "lines": 652,
+    "promise_score": 10
+  },
+  {
+    "slug": "gdscript",
+    "name": "GDScript",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/gdscript.md",
+    "lines": 371,
+    "promise_score": 1
+  },
+  {
+    "slug": "gleam",
+    "name": "Gleam",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/gleam.md",
+    "lines": 904,
+    "promise_score": 7
+  },
+  {
+    "slug": "go",
+    "name": "Go",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/go.md",
+    "lines": 494,
+    "promise_score": 5
+  },
+  {
+    "slug": "golfscript",
+    "name": "GolfScript",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/golfscript.md",
+    "lines": 631,
+    "promise_score": 2
+  },
+  {
+    "slug": "groovy",
+    "name": "Groovy",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/groovy.md",
+    "lines": 443,
+    "promise_score": 4
+  },
+  {
+    "slug": "hack",
+    "name": "Hack",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/hack.md",
+    "lines": 420,
+    "promise_score": 4
+  },
+  {
+    "slug": "haskell",
+    "name": "Haskell",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/haskell.md",
+    "lines": 616,
+    "promise_score": 5
+  },
+  {
+    "slug": "haxe",
+    "name": "Haxe",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/haxe.md",
+    "lines": 722,
+    "promise_score": 12
+  },
+  {
+    "slug": "hdl",
+    "name": "HDL",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/hdl.md",
+    "lines": 230,
+    "promise_score": 0
+  },
+  {
+    "slug": "hjson",
+    "name": "Hjson",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/hjson.md",
+    "lines": 94,
+    "promise_score": 3
+  },
+  {
+    "slug": "hq9+",
+    "name": "HQ9+",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/hq9+.md",
+    "lines": 40,
+    "promise_score": 0
+  },
+  {
+    "slug": "hy",
+    "name": "Hy",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/hy.md",
+    "lines": 192,
+    "promise_score": 2
+  },
+  {
+    "slug": "inform7",
+    "name": "Inform7",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/inform7.md",
+    "lines": 195,
+    "promise_score": 2
+  },
+  {
+    "slug": "janet",
+    "name": "Janet",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/janet.md",
+    "lines": 335,
+    "promise_score": 5
+  },
+  {
+    "slug": "java",
+    "name": "Java",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/java.md",
+    "lines": 1077,
+    "promise_score": 8
+  },
+  {
+    "slug": "javascript",
+    "name": "JavaScript",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/javascript.md",
+    "lines": 653,
+    "promise_score": 2
+  },
+  {
+    "slug": "jinja",
+    "name": "Jinja",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/jinja.md",
+    "lines": 270,
+    "promise_score": 1
+  },
+  {
+    "slug": "jsonnet",
+    "name": "Jsonnet",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/jsonnet.md",
+    "lines": 139,
+    "promise_score": 1
+  },
+  {
+    "slug": "julia",
+    "name": "Julia",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/julia.md",
+    "lines": 892,
+    "promise_score": 6
+  },
+  {
+    "slug": "kdb+",
+    "name": "kdb+",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/kdb+.md",
+    "lines": 774,
+    "promise_score": 3
+  },
+  {
+    "slug": "kotlin",
+    "name": "Kotlin",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/kotlin.md",
+    "lines": 465,
+    "promise_score": 3
+  },
+  {
+    "slug": "lbstanza",
+    "name": "LB Stanza",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/lbstanza.md",
+    "lines": 283,
+    "promise_score": 2
+  },
+  {
+    "slug": "ldpl",
+    "name": "LDPL",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/ldpl.md",
+    "lines": 172,
+    "promise_score": 0
+  },
+  {
+    "slug": "lean4",
+    "name": "Lean 4",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/lean4.md",
+    "lines": 520,
+    "promise_score": 1
+  },
+  {
+    "slug": "lfe",
+    "name": "Lisp Flavoured Erlang (LFE)",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/lfe.md",
+    "lines": 446,
+    "promise_score": 6
+  },
+  {
+    "slug": "livescript",
+    "name": "LiveScript",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/livescript.md",
+    "lines": 345,
+    "promise_score": 4
+  },
+  {
+    "slug": "logtalk",
+    "name": "Logtalk",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/logtalk.md",
+    "lines": 555,
+    "promise_score": 6
+  },
+  {
+    "slug": "lolcode",
+    "name": "LOLCODE",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/lolcode.md",
+    "lines": 186,
+    "promise_score": 1
+  },
+  {
+    "slug": "lua",
+    "name": "Lua",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/lua.md",
+    "lines": 419,
+    "promise_score": 4
+  },
+  {
+    "slug": "m",
+    "name": "M (MUMPS)",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/m.md",
+    "lines": 410,
+    "promise_score": 1
+  },
+  {
+    "slug": "makrellpy",
+    "name": "MakrellPy",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/makrellpy.md",
+    "lines": 393,
+    "promise_score": 5
+  },
+  {
+    "slug": "matlab",
+    "name": "MATLAB",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/matlab.md",
+    "lines": 559,
+    "promise_score": 1
+  },
+  {
+    "slug": "mercury",
+    "name": "Mercury",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/mercury.md",
+    "lines": 264,
+    "promise_score": 2
+  },
+  {
+    "slug": "miniscript",
+    "name": "MiniScript",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/miniscript.md",
+    "lines": 423,
+    "promise_score": 2
+  },
+  {
+    "slug": "mips",
+    "name": "MIPS Assembly",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/mips.md",
+    "lines": 379,
+    "promise_score": 1
+  },
+  {
+    "slug": "mongodb",
+    "name": "MongoDB",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/mongodb.md",
+    "lines": 407,
+    "promise_score": 1
+  },
+  {
+    "slug": "moonscript",
+    "name": "MoonScript",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/moonscript.md",
+    "lines": 571,
+    "promise_score": 3
+  },
+  {
+    "slug": "nim",
+    "name": "Nim",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/nim.md",
+    "lines": 304,
+    "promise_score": 2
+  },
+  {
+    "slug": "niva",
+    "name": "niva",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/niva.md",
+    "lines": 347,
+    "promise_score": 2
+  },
+  {
+    "slug": "nostos",
+    "name": "Nostos",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/nostos.md",
+    "lines": 634,
+    "promise_score": 11
+  },
+  {
+    "slug": "objective-c",
+    "name": "Objective-C",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/objective-c.md",
+    "lines": 820,
+    "promise_score": 6
+  },
+  {
+    "slug": "ocaml",
+    "name": "OCaml",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/ocaml.md",
+    "lines": 511,
+    "promise_score": 6
+  },
+  {
+    "slug": "odin",
+    "name": "Odin",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/odin.md",
+    "lines": 562,
+    "promise_score": 8
+  },
+  {
+    "slug": "openscad",
+    "name": "OpenSCAD",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/openscad.md",
+    "lines": 119,
+    "promise_score": 2
+  },
+  {
+    "slug": "osl",
+    "name": "OSL",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/osl.md",
+    "lines": 750,
+    "promise_score": 3
+  },
+  {
+    "slug": "paren",
+    "name": "Paren",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/paren.md",
+    "lines": 195,
+    "promise_score": 1
+  },
+  {
+    "slug": "pascal",
+    "name": "Pascal",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/pascal.md",
+    "lines": 206,
+    "promise_score": 0
+  },
+  {
+    "slug": "pcre",
+    "name": "PCRE",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/pcre.md",
+    "lines": 82,
+    "promise_score": 3
+  },
+  {
+    "slug": "perl",
+    "name": "Perl",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/perl.md",
+    "lines": 351,
+    "promise_score": 2
+  },
+  {
+    "slug": "phel",
+    "name": "Phel",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/phel.md",
+    "lines": 338,
+    "promise_score": 3
+  },
+  {
+    "slug": "phix",
+    "name": "Phix",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/phix.md",
+    "lines": 452,
+    "promise_score": 7
+  },
+  {
+    "slug": "php",
+    "name": "PHP",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/php.md",
+    "lines": 895,
+    "promise_score": 3
+  },
+  {
+    "slug": "powershell",
+    "name": "PowerShell",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/powershell.md",
+    "lines": 995,
+    "promise_score": 4
+  },
+  {
+    "slug": "processing",
+    "name": "Processing",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/processing.md",
+    "lines": 470,
+    "promise_score": 3
+  },
+  {
+    "slug": "prolog",
+    "name": "Prolog",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/prolog.md",
+    "lines": 340,
+    "promise_score": 0
+  },
+  {
+    "slug": "purescript",
+    "name": "PureScript",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/purescript.md",
+    "lines": 210,
+    "promise_score": 4
+  },
+  {
+    "slug": "python",
+    "name": "Python",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/python.md",
+    "lines": 1125,
+    "promise_score": 5
+  },
+  {
+    "slug": "pythonlegacy",
+    "name": "Python 2 (legacy)",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/pythonlegacy.md",
+    "lines": 824,
+    "promise_score": 3
+  },
+  {
+    "slug": "qml",
+    "name": "QML",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/qml.md",
+    "lines": 368,
+    "promise_score": 1
+  },
+  {
+    "slug": "qsharp",
+    "name": "Q#",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/qsharp.md",
+    "lines": 210,
+    "promise_score": 1
+  },
+  {
+    "slug": "r",
+    "name": "R",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/r.md",
+    "lines": 803,
+    "promise_score": 2
+  },
+  {
+    "slug": "racket",
+    "name": "Racket",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/racket.md",
+    "lines": 721,
+    "promise_score": 6
+  },
+  {
+    "slug": "raku-pod",
+    "name": "Pod",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/raku-pod.md",
+    "lines": 624,
+    "promise_score": 2
+  },
+  {
+    "slug": "raku",
+    "name": "Raku",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/raku.md",
+    "lines": 2273,
+    "promise_score": 7
+  },
+  {
+    "slug": "rdf",
+    "name": "RDF",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/rdf.md",
+    "lines": 160,
+    "promise_score": 2
+  },
+  {
+    "slug": "reason",
+    "name": "Reason",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/reason.md",
+    "lines": 545,
+    "promise_score": 5
+  },
+  {
+    "slug": "red",
+    "name": "Red",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/red.md",
+    "lines": 222,
+    "promise_score": 1
+  },
+  {
+    "slug": "rescript",
+    "name": "ReScript",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/rescript.md",
+    "lines": 535,
+    "promise_score": 6
+  },
+  {
+    "slug": "rst",
+    "name": "reStructuredText (RST)",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/rst.md",
+    "lines": 115,
+    "promise_score": 2
+  },
+  {
+    "slug": "ruby",
+    "name": "Ruby",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/ruby.md",
+    "lines": 676,
+    "promise_score": 3
+  },
+  {
+    "slug": "rust",
+    "name": "Rust",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/rust.md",
+    "lines": 365,
+    "promise_score": 8
+  },
+  {
+    "slug": "scala",
+    "name": "Scala",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/scala.md",
+    "lines": 753,
+    "promise_score": 7
+  },
+  {
+    "slug": "self",
+    "name": "Self",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/self.md",
+    "lines": 163,
+    "promise_score": 3
+  },
+  {
+    "slug": "sing",
+    "name": "Sing",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/sing.md",
+    "lines": 445,
+    "promise_score": 3
+  },
+  {
+    "slug": "smallbasic",
+    "name": "SmallBASIC",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/smallbasic.md",
+    "lines": 131,
+    "promise_score": 0
+  },
+  {
+    "slug": "smalltalk",
+    "name": "Smalltalk",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/smalltalk.md",
+    "lines": 1042,
+    "promise_score": 5
+  },
+  {
+    "slug": "snobol",
+    "name": "SNOBOL",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/snobol.md",
+    "lines": 171,
+    "promise_score": 3
+  },
+  {
+    "slug": "solidity",
+    "name": "Solidity",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/solidity.md",
+    "lines": 958,
+    "promise_score": 4
+  },
+  {
+    "slug": "sorbet",
+    "name": "Sorbet",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/sorbet.md",
+    "lines": 1041,
+    "promise_score": 6
+  },
+  {
+    "slug": "sql",
+    "name": "SQL",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/sql.md",
+    "lines": 159,
+    "promise_score": 0
+  },
+  {
+    "slug": "standard-ml",
+    "name": "Standard ML",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/standard-ml.md",
+    "lines": 483,
+    "promise_score": 5
+  },
+  {
+    "slug": "swift",
+    "name": "Swift",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/swift.md",
+    "lines": 1010,
+    "promise_score": 8
+  },
+  {
+    "slug": "tailspin",
+    "name": "Tailspin",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/tailspin.md",
+    "lines": 383,
+    "promise_score": 4
+  },
+  {
+    "slug": "tcl",
+    "name": "Tcl",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/tcl.md",
+    "lines": 587,
+    "promise_score": 1
+  },
+  {
+    "slug": "tcsh",
+    "name": "tcsh",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/tcsh.md",
+    "lines": 791,
+    "promise_score": 3
+  },
+  {
+    "slug": "texinfo",
+    "name": "Texinfo",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/texinfo.md",
+    "lines": 184,
+    "promise_score": 1
+  },
+  {
+    "slug": "textile",
+    "name": "Textile",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/textile.md",
+    "lines": 501,
+    "promise_score": 1
+  },
+  {
+    "slug": "typescript",
+    "name": "TypeScript",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/typescript.md",
+    "lines": 302,
+    "promise_score": 7
+  },
+  {
+    "slug": "uxntal",
+    "name": "Uxntal",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/uxntal.md",
+    "lines": 175,
+    "promise_score": 1
+  },
+  {
+    "slug": "v",
+    "name": "V",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/v.md",
+    "lines": 230,
+    "promise_score": 3
+  },
+  {
+    "slug": "vala",
+    "name": "Vala",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/vala.md",
+    "lines": 503,
+    "promise_score": 7
+  },
+  {
+    "slug": "vim9script",
+    "name": "Vim9 script",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/vim9script.md",
+    "lines": 1000,
+    "promise_score": 9
+  },
+  {
+    "slug": "vimscript",
+    "name": "Vimscript",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/vimscript.md",
+    "lines": 659,
+    "promise_score": 3
+  },
+  {
+    "slug": "visualbasic",
+    "name": "Visual Basic",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/visualbasic.md",
+    "lines": 275,
+    "promise_score": 1
+  },
+  {
+    "slug": "wasm",
+    "name": "WebAssembly",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/wasm.md",
+    "lines": 312,
+    "promise_score": 4
+  },
+  {
+    "slug": "wikitext",
+    "name": "Wikitext",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/wikitext.md",
+    "lines": 268,
+    "promise_score": 1
+  },
+  {
+    "slug": "wolfram",
+    "name": "Wolfram",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/wolfram.md",
+    "lines": 145,
+    "promise_score": 4
+  },
+  {
+    "slug": "zig",
+    "name": "Zig",
+    "category": "",
+    "path": "/tmp/lxim/learnxinyminutes-docs/zig.md",
+    "lines": 1000,
+    "promise_score": 4
+  }
+]
