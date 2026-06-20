@@ -112,3 +112,5 @@ NameError: name 'finish' is not defined
 [2026-06-20T17:38:31Z]       porter done: 25385 bytes, 6506 tokens, 224.7s
 [2026-06-20T17:38:35Z]       judge: completeness=42 notes=The port captures core architectural elements (lexer, parser, AST, schema, execu
 [2026-06-20T17:38:36Z] loop done: 1 runs
+[2026-06-20T17:39:51Z]       porter done: 478 bytes, 136 tokens, 304.0s
+[2026-06-20T17:39:53Z]       judge: completeness=15 notes=Port is severely incomplete: only two small cleanup procedures shown (free_stmt,

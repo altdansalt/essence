@@ -1,0 +1,1953 @@
+Let me port the C SQLite-style engine to Odin faithfully. I need to implement:
+
+1. Value type (NULL/INT/TEXT)
+2. Schema/Table
+3. Row/RowStore
+4. Lexer
+5. Parser (AST)
+6. Executor
+7. Public API: open, exec, prepare_v2, step, finalize, close, column_count, column_text, column_int64, errmsg
+8. Demo main
+
+Let me write this in idiomatic Odin. I'll use Odin's features like tagged unions, dynamic arrays, defer, etc.
+
+Let me structure this carefully.
+
+Key types:
+- Value: tagged union of null/int/text
+- Table: name + columns
+- Schema: list of tables
+- Row: []Value
+- RowStore: linked list or dynamic array of rows
+- Token: kind + text
+- Lexer
+- Expr: tagged union
+- Stmt: struct with fields for create/insert/select
+- sqlite3 (Database)
+- sqlite3_stmt (Statement)
+
+Let me write the code.
+
+In Odin, I'll use:
+- `union` for Value
+- dynamic arrays for lists
+- strings for text
+
+Let me be careful about string handling. In Odin, strings are not null-terminated. I'll use `string` type.
+
+For case-insensitive comparison, I'll need a helper.
+
+Let me write this out:
+
+```odin
+package main
+
+import "core:fmt"
+import "core:strings"
+
+// Value
+VType :: enum { NULL, INT, TEXT }
+
+Value :: union {
+    nil,
+    i64,
+    string,
+}
+
+v_cmp :: proc(a, b: Value) -> int {
+    // type ordering: NULL=0, INT=1, TEXT=2
+    ta := value_type(a)
+    tb := value_type(b)
+    if ta != tb {
+        return int(ta) - int(tb)
+    }
+    switch v in a {
+    case i64:
+        bv := b.(i64)
+        if v < bv { return -1 }
+        if v > bv { return 1 }
+        return 0
+    case string:
+        bv := b.(string)
+        return strings.compare(v, bv)
+    case nil:
+        return 0
+    }
+    return 0
+}
+```
+
+Wait, Odin unions don't have a direct way to get the type tag. Let me think...
+
+Actually in Odin, you can use `switch v in a` and the case labels tell you the type. But to compare types, I need a helper.
+
+Let me use a struct instead for Value to make it cleaner:
+
+```odin
+Value :: struct {
+    type: VType,
+    ival: i64,
+    sval: string,
+}
+```
+
+This is closer to the C version and easier to work with.
+
+Let me write the full port now.
+
+For the lexer, I need to handle SQL parsing. Let me use Odin strings.
+
+For case-insensitive string comparison, I'll write a helper using `strings.equal_fold` or manual.
+
+Actually, let me check - Odin's `core:strings` has `equal_fold` for case-insensitive comparison. Let me use that.
+
+Let me write the complete code:
+
+```odin
+package main
+
+import "core:fmt"
+import "core:strings"
+import "core:strconv"
+
+// ---------- Value ----------
+VType :: enum u8 { NULL, INT, TEXT }
+
+Value :: struct {
+    type: VType,
+    ival: i64,
+    sval: string,
+}
+
+v_null :: proc() Value { return Value{type = .NULL} }
+v_int :: proc(i: i64) Value { return Value{type = .INT, ival = i} }
+v_text :: proc(s: string) Value { return Value{type = .TEXT, sval = s} }
+
+v_copy :: proc(v: Value) -> Value {
+    if v.type == .TEXT { return v_text(v.sval) }
+    return v
+}
+
+v_cmp :: proc(a, b: Value) -> int {
+    if a.type != b.type { return int(a.type) - int(b.type) }
+    switch a.type {
+    case .INT:
+        if a.ival < b.ival { return -1 }
+        if a.ival > b.ival { return 1 }
+        return 0
+    case .TEXT:
+        return strings.compare(a.sval, b.sval)
+    case .NULL:
+        return 0
+    }
+    return 0
+}
+
+v_to_text :: proc(v: Value) -> string {
+    switch v.type {
+    case .INT: return fmt.tprintf("%d", v.ival)
+    case .TEXT: return v.sval
+    case .NULL: return "NULL"
+    }
+    return "NULL"
+}
+
+v_truthy :: proc(v: Value) -> bool {
+    return v_cmp(v, v_int(0)) != 0
+}
+```
+
+Now the schema:
+
+```odin
+Table :: struct {
+    name: string,
+    cols: [dynamic]string,
+}
+
+Schema :: struct {
+    tables: [dynamic]Table,
+}
+
+schema_find :: proc(s: ^Schema, name: string) -> ^Table {
+    for i in 0..<len(s.tables) {
+        if strings.equal_fold(s.tables[i].name, name) {
+            return &s.tables[i]
+        }
+    }
+    return nil
+}
+
+schema_index :: proc(s: ^Schema, name: string) -> int {
+    for i in 0..<len(s.tables) {
+        if strings.equal_fold(s.tables[i].name, name) {
+            return i
+        }
+    }
+    return -1
+}
+
+schema_add :: proc(s: ^Schema, name: string, cols: [dynamic]string) -> bool {
+    if schema_find(s, name) != nil { return false }
+    append(&s.tables, Table{name = name, cols = cols})
+    return true
+}
+
+table_colindex :: proc(t: ^Table, col: string) -> int {
+    for i in 0..<len(t.cols) {
+        if strings.equal_fold(t.cols[i], col) { return i }
+    }
+    return -1
+}
+```
+
+Row and store:
+
+```odin
+Row :: struct {
+    vals: [dynamic]Value,
+}
+
+RowStore :: struct {
+    rows: [dynamic]Row,
+}
+```
+
+Actually the C version uses a linked list, but in Odin a dynamic array is more idiomatic and behavior is the same (ordered insertion).
+
+Lexer:
+
+```odin
+TokKind :: enum {
+    EOF, ID, INT, STRING, KW, PUNCT, STAR, COMMA, LP, RP, SEMI, OP, DOT
+}
+
+Token :: struct {
+    kind: TokKind,
+    text: string,
+}
+
+KEYWORDS := []string{
+    "create","table","insert","into","values","select","from","where",
+    "order","by","asc","desc","and","or","not","null","begin","commit",
+    "inner","join","on","int","integer","text","primary","key","transaction",
+}
+
+is_kw :: proc(s: string) -> bool {
+    for kw in KEYWORDS {
+        if strings.equal_fold(s, kw) { return true }
+    }
+    return false
+}
+
+lex :: proc(sql: string) -> [dynamic]Token {
+    toks: [dynamic]Token
+    pos := 0
+    src := sql
+    push :: proc(toks: ^[dynamic]Token, k: TokKind, s: string) {
+        append(toks, Token{kind = k, text = s})
+    }
+    while pos < len(src) {
+        c := src[pos]
+        if c == ' ' || c == '\t' || c == '\n' || c == '\r' { pos += 1; continue }
+        if c == '-' && pos+1 < len(src) && src[pos+1] == '-' {
+            while pos < len(src) && src[pos] != '\n' { pos += 1 }
+            continue
+        }
+        if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' {
+            st := pos
+            while pos < len(src) && ((src[pos] >= 'a' && src[pos] <= 'z') || (src[pos] >= 'A' && src[pos] <= 'Z') || (src[pos] >= '0' && src[pos] <= '9') || src[pos] == '_') {
+                pos += 1
+            }
+            word := src[st:pos]
+            push(&toks, is_kw(word) ? .KW : .ID, word)
+            continue
+        }
+        if c >= '0' && c <= '9' {
+            st := pos
+            while pos < len(src) && src[pos] >= '0' && src[pos] <= '9' { pos += 1 }
+            push(&toks, .INT, src[st:pos])
+            continue
+        }
+        if c == '\'' {
+            pos += 1
+            st := pos
+            while pos < len(src) && src[pos] != '\'' { pos += 1 }
+            push(&toks, .STRING, src[st:pos])
+            if pos < len(src) && src[pos] == '\'' { pos += 1 }
+            continue
+        }
+        if c == '"' {
+            pos += 1
+            st := pos
+            while pos < len(src) && src[pos] != '"' { pos += 1 }
+            push(&toks, .ID, src[st:pos])
+            if pos < len(src) && src[pos] == '"' { pos += 1 }
+            continue
+        }
+        switch c {
+        case '*': push(&toks, .STAR, "*"); pos += 1
+        case ',': push(&toks, .COMMA, ","); pos += 1
+        case '(': push(&toks, .LP, "("); pos += 1
+        case ')': push(&toks, .RP, ")"); pos += 1
+        case ';': push(&toks, .SEMI, ";"); pos += 1
+        case '.': push(&toks, .DOT, "."); pos += 1
+        case:
+            if c == '=' || c == '<' || c == '>' || c == '!' {
+                st := pos
+                if pos+1 < len(src) && src[pos+1] == '=' { pos += 1 }
+                if c == '<' && pos+1 < len(src) && src[pos+1] == '>' { pos += 1 }
+                if c == '!' && pos+1 < len(src) && src[pos+1] == '=' { pos += 1 }
+                pos += 1
+                push(&toks, .OP, src[st:pos])
+            } else {
+                push(&toks, .PUNCT, string([1]u8{c}))
+                pos += 1
+            }
+        }
+    }
+    push(&toks, .EOF, "")
+    return toks
+}
+```
+
+Hmm, the `push` proc inside `lex` - in Odin, can I define a nested proc? Yes, but it can't capture variables. I need to pass things explicitly. Let me restructure.
+
+Actually, let me just inline the append calls.
+
+AST:
+
+```odin
+ExprKind :: enum { COL, INT, STR, BINOP }
+
+Expr :: struct {
+    kind: ExprKind,
+    col: string,
+    ival: i64,
+    sval: string,
+    op: string,
+    l: ^Expr,
+    r: ^Expr,
+}
+
+ResultCol :: struct {
+    col: string,
+    star: bool,
+}
+
+TableRef :: struct {
+    tname: string,
+    alias: string,
+}
+
+Stmt :: struct {
+    is_create: bool,
+    is_insert: bool,
+    is_select: bool,
+    is_begin: bool,
+    is_commit: bool,
+    ct_name: string,
+    ct_cols: [dynamic]string,
+    ins_table: string,
+    ins_vals: [dynamic]Value,
+    sel_cols: [dynamic]ResultCol,
+    sel_star: bool,
+    sel_tables: [dynamic]TableRef,
+    sel_where: ^Expr,
+    sel_order_col: string,
+    sel_order_desc: bool,
+    sel_join_on: ^Expr,
+}
+```
+
+Parser:
+
+```odin
+Parser :: struct {
+    toks: []Token,
+    i: int,
+}
+
+p_accept :: proc(p: ^Parser, k: TokKind, text: string) -> bool {
+    if p.toks[p.i].kind != k { return false }
+    if text != "" && !strings.equal_fold(p.toks[p.i].text, text) { return false }
+    p.i += 1
+    return true
+}
+
+p_accept_kw :: proc(p: ^Parser, kw: string) -> bool {
+    return p_accept(p, .KW, kw)
+}
+
+p_peek_kw :: proc(p: ^Parser, kw: string) -> bool {
+    return p.toks[p.i].kind == .KW && strings.equal_fold(p.toks[p.i].text, kw)
+}
+```
+
+For expressions, I need to allocate Expr on the heap. In Odin, I'll use `new(Expr)`.
+
+Let me write parse_primary, parse_cmp, parse_expr:
+
+```odin
+new_expr :: proc(k: ExprKind) -> ^Expr {
+    e := new(Expr)
+    e.kind = k
+    return e
+}
+
+parse_primary :: proc(p: ^Parser) -> ^Expr {
+    t := p.toks[p.i]
+    if t.kind == .INT {
+        e := new_expr(.INT)
+        e.ival = strconv.parse_int(t.text, 10) or_else 0
+        p.i += 1
+        return e
+    }
+    if t.kind == .STRING {
+        e := new_expr(.STR)
+        e.sval = t.text
+        p.i += 1
+        return e
+    }
+    if t.kind == .ID || t.kind == .KW {
+        e := new_expr(.COL)
+        buf := t.text
+        p.i += 1
+        if p.toks[p.i].kind == .DOT {
+            p.i += 1
+            buf = fmt.tprintf("%s.%s", buf, p.toks[p.i].text)
+            p.i += 1
+        }
+        e.col = buf
+        return e
+    }
+    if p_accept(p, .LP, "") {
+        e := parse_expr(p)
+        p_accept(p, .RP, "")
+        return e
+    }
+    return nil
+}
+
+parse_cmp :: proc(p: ^Parser) -> ^Expr {
+    l := parse_primary(p)
+    if p.toks[p.i].kind == .OP {
+        e := new_expr(.BINOP)
+        e.op = p.toks[p.i].text
+        p.i += 1
+        e.l = l
+        e.r = parse_primary(p)
+        return e
+    }
+    return l
+}
+
+parse_expr :: proc(p: ^Parser) -> ^Expr {
+    l := parse_cmp(p)
+    if p_peek_kw(p, "and") || p_peek_kw(p, "or") {
+        e := new_expr(.BINOP)
+        e.op = p_peek_kw(p, "and") ? "AND" : "OR"
+        p.i += 1
+        e.l = l
+        e.r = parse_expr(p)
+        return e
+    }
+    return l
+}
+```
+
+Now parse_create, parse_insert, parse_select, parse:
+
+```odin
+parse_create :: proc(p: ^Parser, st: ^Stmt) -> bool {
+    st.is_create = true
+    if p.toks[p.i].kind != .ID && p.toks[p.i].kind != .KW { return false }
+    st.ct_name = p.toks[p.i].text
+    p.i += 1
+    if !p_accept(p, .LP, "") { return false }
+    while p.toks[p.i].kind != .RP && p.toks[p.i].kind != .EOF {
+        if p.toks[p.i].kind != .ID && p.toks[p.i].kind != .KW { return false }
+        append(&st.ct_cols, p.toks[p.i].text)
+        p.i += 1
+        while p.toks[p.i].kind != .COMMA && p.toks[p.i].kind != .RP && p.toks[p.i].kind != .EOF {
+            p.i += 1
+        }
+        p_accept(p, .COMMA, "")
+    }
+    p_accept(p, .RP, "")
+    return true
+}
+
+parse_insert :: proc(p: ^Parser, st: ^Stmt) -> bool {
+    st.is_insert = true
+    if !p_accept_kw(p, "into") { return false }
+    if p.toks[p.i].kind != .ID { return false }
+    st.ins_table = p.toks[p.i].text
+    p.i += 1
+    if !p_accept_kw(p, "values") { return false }
+    if !p_accept(p, .LP, "") { return false }
+    while p.toks[p.i].kind != .RP && p.toks[p.i].kind != .EOF {
+        if p.toks[p.i].kind == .INT {
+            append(&st.ins_vals, v_int(strconv.parse_int(p.toks[p.i].text, 10) or_else 0))
+        } else if p.toks[p.i].kind == .STRING {
+            append(&st.ins_vals, v_text(p.toks[p.i].text))
+        } else if p_accept_kw(p, "null") {
+            append(&st.ins_vals, v_null())
+            // p_accept_kw already advanced
+            if !p_accept(p, .COMMA, "") { break }
+            continue
+        } else {
+            return false
+        }
+        p.i += 1
+        if !p_accept(p, .COMMA, "") { break }
+    }
+    p_accept(p, .RP, "")
+    return true
+}
+```
+
+Wait, there's a subtlety with the null case. `p_accept_kw` advances `p.i`, so after it returns true, we've already consumed "null". Then we need to check for comma. Let me restructure:
+
+```odin
+parse_insert :: proc(p: ^Parser, st: ^Stmt) -> bool {
+    st.is_insert = true
+    if !p_accept_kw(p, "into") { return false }
+    if p.toks[p.i].kind != .ID { return false }
+    st.ins_table = p.toks[p.i].text
+    p.i += 1
+    if !p_accept_kw(p, "values") { return false }
+    if !p_accept(p, .LP, "") { return false }
+    while p.toks[p.i].kind != .RP && p.toks[p.i].kind != .EOF {
+        if p.toks[p.i].kind == .INT {
+            append(&st.ins_vals, v_int(strconv.parse_int(p.toks[p.i].text, 10) or_else 0))
+            p.i += 1
+        } else if p.toks[p.i].kind == .STRING {
+            append(&st.ins_vals, v_text(p.toks[p.i].text))
+            p.i += 1
+        } else if p_accept_kw(p, "null") {
+            append(&st.ins_vals, v_null())
+        } else {
+            return false
+        }
+        if !p_accept(p, .COMMA, "") { break }
+    }
+    p_accept(p, .RP, "")
+    return true
+}
+```
+
+Now parse_select:
+
+```odin
+parse_select :: proc(p: ^Parser, st: ^Stmt) -> bool {
+    st.is_select = true
+    if p_accept(p, .STAR, "") {
+        st.sel_star = true
+    } else {
+        do {
+            rc := ResultCol{star = false}
+            if p_accept(p, .STAR, "") {
+                rc.star = true
+            } else if p.toks[p.i].kind == .ID || p.toks[p.i].kind == .KW {
+                buf := p.toks[p.i].text
+                p.i += 1
+                if p.toks[p.i].kind == .DOT {
+                    p.i += 1
+                    if p_accept(p, .STAR, "") {
+                        rc.star = true
+                    } else {
+                        buf = fmt.tprintf("%s.%s", buf, p.toks[p.i].text)
+                        p.i += 1
+                        rc.col = buf
+                    }
+                } else {
+                    rc.col = buf
+                }
+            } else {
+                return false
+            }
+            append(&st.sel_cols, rc)
+        } while p_accept(p, .COMMA, "")
+    }
+    if !p_accept_kw(p, "from") { return false }
+    if p.toks[p.i].kind != .ID { return false }
+    // first table
+    {
+        tr := TableRef{tname = p.toks[p.i].text}
+        p.i += 1
+        if p.toks[p.i].kind == .ID && !p_peek_kw(p, "on") && !p_peek_kw(p, "where") && !p_peek_kw(p, "order") && !p_peek_kw(p, "inner") && !p_peek_kw(p, "join") {
+            tr.alias = p.toks[p.i].text
+            p.i += 1
+        }
+        append(&st.sel_tables, tr)
+    }
+    // joins
+    while p_peek_kw(p, "inner") || p_peek_kw(p, "join") {
+        if p_accept_kw(p, "inner") {
+            if !p_accept_kw(p, "join") { return false }
+        } else {
+            p_accept_kw(p, "join")
+        }
+        if p.toks[p.i].kind != .ID { return false }
+        tr := TableRef{tname = p.toks[p.i].text}
+        p.i += 1
+        if p.toks[p.i].kind == .ID && !p_peek_kw(p, "on") && !p_peek_kw(p, "where") && !p_peek_kw(p, "order") {
+            tr.alias = p.toks[p.i].text
+            p.i += 1
+        }
+        append(&st.sel_tables, tr)
+        if p_accept_kw(p, "on") {
+            on := parse_expr(p)
+            if st.sel_join_on == nil {
+                st.sel_join_on = on
+            } else {
+                and := new_expr(.BINOP)
+                and.op = "AND"
+                and.l = st.sel_join_on
+                and.r = on
+                st.sel_join_on = and
+            }
+        }
+    }
+    if p_accept_kw(p, "where") {
+        st.sel_where = parse_expr(p)
+    }
+    if p_accept_kw(p, "order") {
+        if !p_accept_kw(p, "by") { return false }
+        if p.toks[p.i].kind != .ID && p.toks[p.i].kind != .KW { return false }
+        st.sel_order_col = p.toks[p.i].text
+        p.i += 1
+        if p_accept_kw(p, "desc") {
+            st.sel_order_desc = true
+        } else {
+            p_accept_kw(p, "asc")
+        }
+    }
+    return true
+}
+```
+
+Wait, `do { ... } while` - does Odin have this? Let me check. Odin has `for` as the only loop. I think I can use:
+
+```odin
+for {
+    // ...
+    if !p_accept(p, .COMMA, "") { break }
+}
+```
+
+That's the equivalent of do-while.
+
+Now the main parse function:
+
+```odin
+parse :: proc(p: ^Parser, st: ^Stmt) -> bool {
+    // st is already zero-initialized
+    if p_peek_kw(p, "begin") {
+        st.is_begin = true
+        p.i += 1
+        p_accept_kw(p, "transaction")
+    } else if p_peek_kw(p, "commit") {
+        st.is_commit = true
+        p.i += 1
+        p_accept_kw(p, "transaction")
+    } else if p_accept_kw(p, "create") {
+        if p_accept_kw(p, "table") {
+            if !parse_create(p, st) { return false }
+        } else {
+            return false
+        }
+    } else if p_accept_kw(p, "insert") {
+        if !parse_insert(p, st) { return false }
+    } else if p_accept_kw(p, "select") {
+        if !parse_select(p, st) { return false }
+    } else {
+        return false
+    }
+    p_accept(p, .SEMI, "")
+    return true
+}
+```
+
+Now the Database:
+
+```odin
+DB :: struct {
+    schema: Schema,
+    stores: [dynamic]RowStore,
+    errmsg: string,
+    in_txn: bool,
+}
+```
+
+For the API, I'll create a `Sqlite3` wrapper. Actually, let me just use `DB` as the main type and provide procedures.
+
+Let me think about the API surface. The C code has:
+- `sqlite3_open(name, &db)` -> int
+- `sqlite3_exec(db, sql, cb, arg, &err)` -> int
+- `sqlite3_prepare_v2(db, sql, n, &stmt, &tail)` -> int
+- `sqlite3_step(stmt)` -> int
+- `sqlite3_finalize(stmt)` -> int
+- `sqlite3_close(db)` -> int
+- `sqlite3_column_count(stmt)` -> int
+- `sqlite3_column_text(stmt, i)` -> string
+- `sqlite3_column_int64(stmt, i)` -> i64
+- `sqlite3_errmsg(db)` -> string
+
+In Odin, I'll make these procedures. Let me use the names as given but in Odin style.
+
+Actually, the requirements say "Name them as idiomatic for Odin (e.g. a class/module Sqlite3 with methods open/exec/prepare/step/finalize/close)". In Odin, there's no class, but I can use procedures with the DB/Stmt as first parameter. Let me just use the `sqlite3_` prefix or make a package-like structure.
+
+Let me just use procedures named `sqlite3_open`, `sqlite3_exec`, etc. since Odin uses snake_case and these are the API names. Or I could use `open`, `exec`, etc. with the DB type. Let me keep the sqlite3_ prefix for clarity.
+
+Actually, let me make it cleaner. I'll define the types and procedures:
+
+```odin
+Sqlite3 :: DB
+Sqlite3_Stmt :: Stmt_Handle
+```
+
+Hmm, let me just use the DB and Stmt types directly and name the procedures `sqlite3_open`, etc.
+
+Let me think about the Stmt handle. In C, `sqlite3_stmt` contains the parsed Stmt and execution state. Let me define:
+
+```odin
+Stmt_Handle :: struct {
+    db: ^DB,
+    st: Stmt,
+    started: bool,
+    done: bool,
+    sorted: [dynamic]Row,
+    cur_sorted: int,
+    outrow: [dynamic]Value,
+    nout: int,
+}
+```
+
+Now the executor. Let me implement `collect_matching` and `stmt_step_select`.
+
+For the RowCtx, I need to track which tables and rows are being used:
+
+```odin
+RowCtx :: struct {
+    refs: []TableRef,
+    tabs: []^Table,
+    rows: []Row,
+}
+
+rowctx_colindex :: proc(c: RowCtx, col: string) -> (int, int, bool) {
+    // returns (tabidx, colidx, ok)
+    dot_pos := strings.index(col, ".")
+    if dot_pos >= 0 {
+        tname := col[:dot_pos]
+        cname := col[dot_pos+1:]
+        for i in 0..<len(c.refs) {
+            tn := c.refs[i].alias != "" ? c.refs[i].alias : c.refs[i].tname
+            if strings.equal_fold(tn, tname) {
+                ci := table_colindex(c.tabs[i], cname)
+                if ci >= 0 { return i, ci, true }
+            }
+        }
+        return 0, 0, false
+    }
+    for i in 0..<len(c.tabs) {
+        ci := table_colindex(c.tabs[i], col)
+        if ci >= 0 { return i, ci, true }
+    }
+    return 0, 0, false
+}
+
+eval_expr :: proc(e: ^Expr, c: RowCtx) -> Value {
+    if e == nil { return v_null() }
+    switch e.kind {
+    case .INT: return v_int(e.ival)
+    case .STR: return v_text(e.sval)
+    case .COL:
+        ti, ci, ok := rowctx_colindex(c, e.col)
+        if !ok { return v_null() }
+        return v_copy(c.rows[ti].vals[ci])
+    case .BINOP:
+        a := eval_expr(e.l, c)
+        b := eval_expr(e.r, c)
+        res := v_null()
+        if strings.equal_fold(e.op, "AND") {
+            res = v_int(v_truthy(a) && v_truthy(b) ? 1 : 0)
+        } else if strings.equal_fold(e.op, "OR") {
+            res = v_int(v_truthy(a) || v_truthy(b) ? 1 : 0)
+        } else {
+            cmp := v_cmp(a, b)
+            #partial switch e.op {
+            case "=": res = v_int(cmp == 0 ? 1 : 0)
+            case "<>": res = v_int(cmp != 0 ? 1 : 0)
+            case "<": res = v_int(cmp < 0 ? 1 : 0)
+            case ">": res = v_int(cmp > 0 ? 1 : 0)
+            case "<=": res = v_int(cmp <= 0 ? 1 : 0)
+            case ">=": res = v_int(cmp >= 0 ? 1 : 0)
+            case: res = v_null()
+            }
+        }
+        return res
+    }
+    return v_null()
+}
+
+row_match :: proc(where: ^Expr, c: RowCtx) -> bool {
+    if where == nil { return true }
+    v := eval_expr(where, c)
+    return v_truthy(v)
+}
+```
+
+Now collect_matching:
+
+```odin
+collect_matching :: proc(s: ^Stmt_Handle) {
+    db := s.db
+    n := len(s.st.sel_tables)
+    idx: [dynamic]int
+    for i in 0..<n {
+        append(&idx, schema_index(&db.schema, s.st.sel_tables[i].tname))
+    }
+    tabs: [dynamic]^Table
+    for i in 0..<n {
+        if idx[i] >= 0 {
+            append(&tabs, &db.schema.tables[idx[i]])
+        } else {
+            append(&tabs, nil)
+        }
+    }
+    // nested loop
+    cur: [dynamic]int  // index into stores[idx[i]].rows
+    for i in 0..<n {
+        append(&cur, 0)
+    }
+    
+    for {
+        // check all cursors valid
+        ok := true
+        for i in 0..<n {
+            if idx[i] < 0 || cur[i] >= len(db.stores[idx[i]].rows) {
+                ok = false
+                break
+            }
+        }
+        if !ok { break }
+        
+        // build row context
+        rows: [dynamic]Row
+        for i in 0..<n {
+            append(&rows, db.stores[idx[i]].rows[cur[i]])
+        }
+        c := RowCtx{refs = s.st.sel_tables[:], tabs = tabs[:], rows = rows[:]}
+        
+        if row_match(s.st.sel_where, c) && (s.st.sel_join_on == nil || row_match(s.st.sel_join_on, c)) {
+            // collect combined row
+            r: Row
+            for i in 0..<n {
+                for j in 0..<len(rows[i].vals) {
+                    append(&r.vals, v_copy(rows[i].vals[j]))
+                }
+            }
+            append(&s.sorted, r)
+        }
+        
+        // advance innermost
+        k := n - 1
+        for k >= 0 {
+            cur[k] += 1
+            if idx[k] >= 0 && cur[k] < len(db.stores[idx[k]].rows) {
+                break
+            }
+            if k > 0 {
+                cur[k] = 0
+            }
+            k -= 1
+        }
+        if k < 0 { break }
+    }
+    
+    delete(&idx)
+    delete(&tabs)
+    delete(&cur)
+    
+    // ORDER BY
+    if s.st.sel_order_col != "" && len(s.st.sel_tables) == 1 {
+        tabs2: [dynamic]^Table
+        for i in 0..<len(s.st.sel_tables) {
+            append(&tabs2, schema_find(&db.schema, s.st.sel_tables[i].tname))
+        }
+        cidx := table_colindex(tabs2[0], s.st.sel_order_col)
+        if cidx >= 0 {
+            // insertion sort
+            for i in 1..<len(s.sorted) {
+                for j in i; j > 0; j -= 1 {
+                    a := s.sorted[j-1].vals[cidx]
+                    b := s.sorted[j].vals[cidx]
+                    cmp := v_cmp(a, b)
+                    if (s.st.sel_order_desc && cmp < 0) || (!s.st.sel_order_desc && cmp > 0) {
+                        tmp := s.sorted[j-1]
+                        s.sorted[j-1] = s.sorted[j]
+                        s.sorted[j] = tmp
+                    } else {
+                        break
+                    }
+                }
+            }
+        }
+        delete(&tabs2)
+    }
+}
+```
+
+Now stmt_step_select:
+
+```odin
+stmt_step_select :: proc(s: ^Stmt_Handle) -> int {
+    if !s.started {
+        s.started = true
+        collect_matching(s)
+    }
+    if s.cur_sorted >= len(s.sorted) { return 101 } // DONE
+    r := s.sorted[s.cur_sorted]
+    s.cur_sorted += 1
+    n := len(s.st.sel_tables)
+    tabs: [dynamic]^Table
+    for i in 0..<n {
+        append(&tabs, schema_find(&s.db.schema, s.st.sel_tables[i].tname))
+    }
+    // compute offsets
+    offsets: [dynamic]int
+    off := 0
+    for i in 0..<n {
+        append(&offsets, off)
+        off += len(tabs[i].cols)
+    }
+    // build output row
+    clear(&s.outrow)
+    if s.st.sel_star {
+        for i in 0..<n {
+            for j in 0..<len(tabs[i].cols) {
+                append(&s.outrow, v_copy(r.vals[offsets[i]+j]))
+            }
+        }
+    } else {
+        for k in 0..<len(s.st.sel_cols) {
+            rc := s.st.sel_cols[k]
+            if rc.star {
+                for i in 0..<n {
+                    for j in 0..<len(tabs[i].cols) {
+                        append(&s.outrow, v_copy(r.vals[offsets[i]+j]))
+                    }
+                }
+            } else {
+                dot_pos := strings.index(rc.col, ".")
+                ti := 0
+                ci := -1
+                if dot_pos >= 0 {
+                    tname := rc.col[:dot_pos]
+                    cname := rc.col[dot_pos+1:]
+                    for i in 0..<n {
+                        tn := s.st.sel_tables[i].alias != "" ? s.st.sel_tables[i].alias : s.st.sel_tables[i].tname
+                        if strings.equal_fold(tn, tname) {
+                            ci = table_colindex(tabs[i], cname)
+                            ti = i
+                            break
+                        }
+                    }
+                } else {
+                    for i in 0..<n {
+                        ci = table_colindex(tabs[i], rc.col)
+                        if ci >= 0 { ti = i; break }
+                    }
+                }
+                if ci < 0 {
+                    append(&s.outrow, v_null())
+                } else {
+                    append(&s.outrow, v_copy(r.vals[offsets[ti]+ci]))
+                }
+            }
+        }
+    }
+    s.nout = len(s.outrow)
+    delete(&tabs)
+    delete(&offsets)
+    return 100 // ROW
+}
+```
+
+Now the public API:
+
+```odin
+sqlite3_open :: proc(name: string) -> (^DB, int) {
+    db := new(DB)
+    return db, 0
+}
+
+sqlite3_close :: proc(db: ^DB) -> int {
+    if db == nil { return 0 }
+    for i in 0..<len(db.schema.tables) {
+        delete(db.schema.tables[i].cols)
+        for j in 0..<len(db.stores[i].rows) {
+            delete(db.stores[i].rows[j].vals)
+        }
+        delete(db.stores[i].rows)
+    }
+    delete(db.schema.tables)
+    delete(db.stores)
+    free(db)
+    return 0
+}
+
+sqlite3_errmsg :: proc(db: ^DB) -> string {
+    if db == nil { return "" }
+    return db.errmsg
+}
+
+sqlite3_exec :: proc(db: ^DB, sql: string, cb: proc(arg: rawptr, n: int, vals: []string, cols: []string), arg: rawptr) -> (int, string) {
+    toks := lex(sql)
+    defer delete(toks)
+    p := Parser{toks = toks[:]}
+    rc := 0
+    err_msg := ""
+    while p.toks[p.i].kind != .EOF {
+        st: Stmt
+        if !parse(&p, &st) {
+            return 1, "parse error"
+        }
+        if st.is_begin {
+            db.in_txn = true
+        } else if st.is_commit {
+            db.in_txn = false
+        } else if st.is_create {
+            if !schema_add(&db.schema, st.ct_name, st.ct_cols) {
+                err_msg = fmt.tprintf("table already exists: %s", st.ct_name)
+                rc = 1
+                break
+            }
+            // st.ct_cols ownership transferred
+            append(&db.stores, RowStore{})
+            // Don't delete st.ct_cols since it's now owned by schema
+            st.ct_cols = {}
+            continue
+        } else if st.is_insert {
+            idx := schema_index(&db.schema, st.ins_table)
+            if idx < 0 {
+                err_msg = fmt.tprintf("no such table: %s", st.ins_table)
+                rc = 1
+                break
+            }
+            row: Row
+            for v in st.ins_vals {
+                append(&row.vals, v_copy(v))
+            }
+            append(&db.stores[idx].rows, row)
+        } else if st.is_select {
+            s := new(Stmt_Handle)
+            s.db = db
+            s.st = st
+            // Note: st's dynamic arrays are now owned by s.st
+            // We need to not free them below
+            r := 0
+            for {
+                r = stmt_step_select(s)
+                if r != 100 { break }
+                vals: [dynamic]string
+                for i in 0..<s.nout {
+                    append(&vals, v_to_text(s.outrow[i]))
+                }
+                if cb != nil {
+                    cb(arg, s.nout, vals[:], nil)
+                }
+                delete(vals)
+            }
+            // cleanup
+            for i in 0..<len(s.sorted) {
+                delete(s.sorted[i].vals)
+            }
+            delete(s.sorted)
+            delete(s.outrow)
+            free(s)
+            // Don't free_stmt since we moved st into s
+            continue
+        }
+        // free stmt resources (for non-select, non-create cases)
+        // Actually for create, ct_cols was transferred. For insert, we need to free ins_vals.
+        // For begin/commit, nothing to free.
+        if !st.is_select && !st.is_create {
+            delete(st.ins_vals)
+        }
+        if st.is_create {
+            // ct_cols was transferred to schema, but we set st.ct_cols = {} above
+            // Actually we `continue`d above so this won't be reached
+        }
+    }
+    if rc != 0 && err_msg == "" {
+        err_msg = db.errmsg
+    }
+    return rc, err_msg
+}
+```
+
+Hmm, this is getting complicated with ownership. Let me think more carefully.
+
+In the C code, `free_stmt` is called after each statement in `sqlite3_exec`, but for SELECT, the Stmt is copied into the sqlite3_stmt and then free_stmt is called on the original (but the strings were already moved). Actually wait, in C, `s->st = st` is a shallow copy, so free_stmt on the original st would free the strings that s->st also points to. That's actually a bug in the C code, but since it works for the demo, let me not worry about it.
+
+In Odin, I need to be more careful. Let me think about ownership:
+
+For `sqlite3_exec`:
+- CREATE TABLE: ct_cols is transferred to schema
+- INSERT: ins_vals can be freed after copying values into the row
+- SELECT: the Stmt fields are used by the Stmt_Handle, so they should not be freed until the Stmt_Handle is freed
+- BEGIN/COMMIT: nothing to free
+
+Actually, in the C code for exec with SELECT, it creates a stmt, runs it to completion, frees the stmt, then calls free_stmt on the original st. But since s->st = st is a shallow copy, free_stmt(&st) would free the strings that s->st also points to. But since s is already freed by that point, it's fine (use-after-free but not observed).
+
+In Odin, I'll handle this differently. For exec with SELECT, I'll move the Stmt into the handle and not call free_stmt on the original. For other statements, I'll clean up as needed.
+
+Let me simplify by making Stmt have a `free` procedure and being careful about ownership.
+
+Actually, let me take a different approach. Since Odin has GC-free but manual memory management, and this is a demo, let me just be pragmatic. I'll use `delete` on dynamic arrays when I'm done with them.
+
+Let me restructure to be cleaner:
+
+```odin
+free_stmt :: proc(st: ^Stmt) {
+    delete(st.ct_cols)
+    delete(st.ins_vals)
+    for i in 0..<len(st.sel_cols) {
+        // sel_cols[i].col is a string, which is a slice - no need to free individually
+    }
+    delete(st.sel_cols)
+    delete(st.sel_tables)
+    free_expr(st.sel_where)
+    free_expr(st.sel_join_on)
+    // sel_order_col is a string, no need to free
+}
+
+free_expr :: proc(e: ^Expr) {
+    if e == nil { return }
+    free_expr(e.l)
+    free_expr(e.r)
+    free(e)
+}
+```
+
+Wait, in Odin, strings are not heap-allocated separately (they're slices into the original string or into fmt.tprintf buffers). So I don't need to free individual strings. But dynamic arrays do need to be freed.
+
+Actually, strings from `fmt.tprintf` ARE heap-allocated. And strings from slicing the input SQL are not (they point into the input). This is tricky.
+
+For simplicity, let me just not worry about freeing strings and only free dynamic arrays and heap-allocated Exprs. This is a demo program, and memory leaks won't cause issues for the demo.
+
+Let me simplify the ownership model:
+- Strings: don't free (they're either slices into input or temp allocations)
+- Dynamic arrays: delete when done
+- Expr nodes: free when done
+
+Let me rewrite more carefully:
+
+Actually, let me just write the whole thing and be pragmatic about memory. The demo creates a DB, runs some SQL, and closes it. Memory leaks are fine for a demo.
+
+Let me write the complete file now:
+
+```odin
+package main
+
+import "core:fmt"
+import "core:strings"
+import "core:strconv"
+
+// ---------- Value ----------
+VType :: enum u8 { NULL, INT, TEXT }
+
+Value :: struct {
+    type: VType,
+    ival: i64,
+    sval: string,
+}
+
+v_null :: proc() Value { return Value{type = .NULL} }
+v_int :: proc(i: i64) Value { return Value{type = .INT, ival = i} }
+v_text :: proc(s: string) Value { return Value{type = .TEXT, sval = s} }
+
+v_copy :: proc(v: Value) -> Value {
+    if v.type == .TEXT { return v_text(v.sval) }
+    return v
+}
+
+v_cmp :: proc(a, b: Value) -> int {
+    if a.type != b.type { return int(a.type) - int(b.type) }
+    switch a.type {
+    case .INT:
+        if a.ival < b.ival { return -1 }
+        if a.ival > b.ival { return 1 }
+        return 0
+    case .TEXT:
+        return strings.compare(a.sval, b.sval)
+    case .NULL:
+        return 0
+    }
+    return 0
+}
+
+v_to_text :: proc(v: Value) -> string {
+    switch v.type {
+    case .INT: return fmt.tprintf("%d", v.ival)
+    case .TEXT: return v.sval
+    case: return "NULL"
+    }
+}
+
+v_truthy :: proc(v: Value) -> bool {
+    return v_cmp(v, v_int(0)) != 0
+}
+
+// ---------- Schema ----------
+Table :: struct {
+    name: string,
+    cols: [dynamic]string,
+}
+
+Schema :: struct {
+    tables: [dynamic]Table,
+}
+
+schema_find :: proc(s: ^Schema, name: string) -> ^Table {
+    for i in 0..<len(s.tables) {
+        if strings.equal_fold(s.tables[i].name, name) {
+            return &s.tables[i]
+        }
+    }
+    return nil
+}
+
+schema_index :: proc(s: ^Schema, name: string) -> int {
+    for i in 0..<len(s.tables) {
+        if strings.equal_fold(s.tables[i].name, name) {
+            return i
+        }
+    }
+    return -1
+}
+
+schema_add :: proc(s: ^Schema, name: string, cols: [dynamic]string) -> bool {
+    if schema_find(s, name) != nil { return false }
+    append(&s.tables, Table{name = name, cols = cols})
+    return true
+}
+
+table_colindex :: proc(t: ^Table, col: string) -> int {
+    for i in 0..<len(t.cols) {
+        if strings.equal_fold(t.cols[i], col) { return i }
+    }
+    return -1
+}
+
+// ---------- Row / Store ----------
+Row :: struct {
+    vals: [dynamic]Value,
+}
+
+RowStore :: struct {
+    rows: [dynamic]Row,
+}
+
+// ---------- Lexer ----------
+TokKind :: enum { EOF, ID, INT, STRING, KW, PUNCT, STAR, COMMA, LP, RP, SEMI, OP, DOT }
+
+Token :: struct {
+    kind: TokKind,
+    text: string,
+}
+
+KEYWORDS := []string{
+    "create","table","insert","into","values","select","from","where",
+    "order","by","asc","desc","and","or","not","null","begin","commit",
+    "inner","join","on","int","integer","text","primary","key","transaction",
+}
+
+is_kw :: proc(s: string) -> bool {
+    for kw in KEYWORDS {
+        if strings.equal_fold(s, kw) { return true }
+    }
+    return false
+}
+
+lex :: proc(sql: string) -> [dynamic]Token {
+    toks: [dynamic]Token
+    pos := 0
+    src := sql
+    for pos < len(src) {
+        c := src[pos]
+        if c == ' ' || c == '\t' || c == '\n' || c == '\r' { pos += 1; continue }
+        if c == '-' && pos+1 < len(src) && src[pos+1] == '-' {
+            for pos < len(src) && src[pos] != '\n' { pos += 1 }
+            continue
+        }
+        if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' {
+            st := pos
+            for pos < len(src) && ((src[pos] >= 'a' && src[pos] <= 'z') || (src[pos] >= 'A' && src[pos] <= 'Z') || (src[pos] >= '0' && src[pos] <= '9') || src[pos] == '_') {
+                pos += 1
+            }
+            word := src[st:pos]
+            append(&toks, Token{kind = is_kw(word) ? .KW : .ID, text = word})
+            continue
+        }
+        if c >= '0' && c <= '9' {
+            st := pos
+            for pos < len(src) && src[pos] >= '0' && src[pos] <= '9' { pos += 1 }
+            append(&toks, Token{kind = .INT, text = src[st:pos]})
+            continue
+        }
+        if c == '\'' {
+            pos += 1
+            st := pos
+            for pos < len(src) && src[pos] != '\'' { pos += 1 }
+            append(&toks, Token{kind = .STRING, text = src[st:pos]})
+            if pos < len(src) && src[pos] == '\'' { pos += 1 }
+            continue
+        }
+        if c == '"' {
+            pos += 1
+            st := pos
+            for pos < len(src) && src[pos] != '"' { pos += 1 }
+            append(&toks, Token{kind = .ID, text = src[st:pos]})
+            if pos < len(src) && src[pos] == '"' { pos += 1 }
+            continue
+        }
+        switch c {
+        case '*': append(&toks, Token{.STAR, "*"}); pos += 1
+        case ',': append(&toks, Token{.COMMA, ","}); pos += 1
+        case '(': append(&toks, Token{.LP, "("}); pos += 1
+        case ')': append(&toks, Token{.RP, ")"}); pos += 1
+        case ';': append(&toks, Token{.SEMI, ";"}); pos += 1
+        case '.': append(&toks, Token{.DOT, "."}); pos += 1
+        case:
+            if c == '=' || c == '<' || c == '>' || c == '!' {
+                st := pos
+                if pos+1 < len(src) && src[pos+1] == '=' { pos += 1 }
+                if c == '<' && pos+1 < len(src) && src[pos+1] == '>' { pos += 1 }
+                if c == '!' && pos+1 < len(src) && src[pos+1] == '=' { pos += 1 }
+                pos += 1
+                append(&toks, Token{.OP, src[st:pos]})
+            } else {
+                append(&toks, Token{.PUNCT, string([1]u8{c})})
+                pos += 1
+            }
+        }
+    }
+    append(&toks, Token{.EOF, ""})
+    return toks
+}
+
+// ---------- AST ----------
+ExprKind :: enum { COL, INT, STR, BINOP }
+
+Expr :: struct {
+    kind: ExprKind,
+    col: string,
+    ival: i64,
+    sval: string,
+    op: string,
+    l: ^Expr,
+    r: ^Expr,
+}
+
+ResultCol :: struct {
+    col: string,
+    star: bool,
+}
+
+TableRef :: struct {
+    tname: string,
+    alias: string,
+}
+
+Stmt :: struct {
+    is_create: bool,
+    is_insert: bool,
+    is_select: bool,
+    is_begin: bool,
+    is_commit: bool,
+    ct_name: string,
+    ct_cols: [dynamic]string,
+    ins_table: string,
+    ins_vals: [dynamic]Value,
+    sel_cols: [dynamic]ResultCol,
+    sel_star: bool,
+    sel_tables: [dynamic]TableRef,
+    sel_where: ^Expr,
+    sel_order_col: string,
+    sel_order_desc: bool,
+    sel_join_on: ^Expr,
+}
+
+new_expr :: proc(k: ExprKind) -> ^Expr {
+    e := new(Expr)
+    e.kind = k
+    return e
+}
+
+free_expr :: proc(e: ^Expr) {
+    if e == nil { return }
+    free_expr(e.l)
+    free_expr(e.r)
+    free(e)
+}
+
+// ---------- Parser ----------
+Parser :: struct {
+    toks: []Token,
+    i: int,
+}
+
+p_accept :: proc(p: ^Parser, k: TokKind, text: string) -> bool {
+    if p.toks[p.i].kind != k { return false }
+    if text != "" && !strings.equal_fold(p.toks[p.i].text, text) { return false }
+    p.i += 1
+    return true
+}
+
+p_accept_kw :: proc(p: ^Parser, kw: string) -> bool {
+    return p_accept(p, .KW, kw)
+}
+
+p_peek_kw :: proc(p: ^Parser, kw: string) -> bool {
+    return p.toks[p.i].kind == .KW && strings.equal_fold(p.toks[p.i].text, kw)
+}
+
+parse_primary :: proc(p: ^Parser) -> ^Expr {
+    t := p.toks[p.i]
+    if t.kind == .INT {
+        e := new_expr(.INT)
+        e.ival = strconv.parse_int(t.text, 10) or_else 0
+        p.i += 1
+        return e
+    }
+    if t.kind == .STRING {
+        e := new_expr(.STR)
+        e.sval = t.text
+        p.i += 1
+        return e
+    }
+    if t.kind == .ID || t.kind == .KW {
+        e := new_expr(.COL)
+        buf := t.text
+        p.i += 1
+        if p.toks[p.i].kind == .DOT {
+            p.i += 1
+            buf = fmt.tprintf("%s.%s", buf, p.toks[p.i].text)
+            p.i += 1
+        }
+        e.col = buf
+        return e
+    }
+    if p_accept(p, .LP, "") {
+        e := parse_expr(p)
+        p_accept(p, .RP, "")
+        return e
+    }
+    return nil
+}
+
+parse_cmp :: proc(p: ^Parser) -> ^Expr {
+    l := parse_primary(p)
+    if p.toks[p.i].kind == .OP {
+        e := new_expr(.BINOP)
+        e.op = p.toks[p.i].text
+        p.i += 1
+        e.l = l
+        e.r = parse_primary(p)
+        return e
+    }
+    return l
+}
+
+parse_expr :: proc(p: ^Parser) -> ^Expr {
+    l := parse_cmp(p)
+    if p_peek_kw(p, "and") || p_peek_kw(p, "or") {
+        e := new_expr(.BINOP)
+        e.op = p_peek_kw(p, "and") ? "AND" : "OR"
+        p.i += 1
+        e.l = l
+        e.r = parse_expr(p)
+        return e
+    }
+    return l
+}
+
+parse_create :: proc(p: ^Parser, st: ^Stmt) -> bool {
+    st.is_create = true
+    if p.toks[p.i].kind != .ID && p.toks[p.i].kind != .KW { return false }
+    st.ct_name = p.toks[p.i].text
+    p.i += 1
+    if !p_accept(p, .LP, "") { return false }
+    for p.toks[p.i].kind != .RP && p.toks[p.i].kind != .EOF {
+        if p.toks[p.i].kind != .ID && p.toks[p.i].kind != .KW { return false }
+        append(&st.ct_cols, p.toks[p.i].text)
+        p.i += 1
+        for p.toks[p.i].kind != .COMMA && p.toks[p.i].kind != .RP && p.toks[p.i].kind != .EOF {
+            p.i += 1
+        }
+        p_accept(p, .COMMA, "")
+    }
+    p_accept(p, .RP, "")
+    return true
+}
+
+parse_insert :: proc(p: ^Parser, st: ^Stmt) -> bool {
+    st.is_insert = true
+    if !p_accept_kw(p, "into") { return false }
+    if p.toks[p.i].kind != .ID { return false }
+    st.ins_table = p.toks[p.i].text
+    p.i += 1
+    if !p_accept_kw(p, "values") { return false }
+    if !p_accept(p, .LP, "") { return false }
+    for p.toks[p.i].kind != .RP && p.toks[p.i].kind != .EOF {
+        if p.toks[p.i].kind == .INT {
+            append(&st.ins_vals, v_int(strconv.parse_int(p.toks[p.i].text, 10) or_else 0))
+            p.i += 1
+        } else if p.toks[p.i].kind == .STRING {
+            append(&st.ins_vals, v_text(p.toks[p.i].text))
+            p.i += 1
+        } else if p_accept_kw(p, "null") {
+            append(&st.ins_vals, v_null())
+        } else {
+            return false
+        }
+        if !p_accept(p, .COMMA, "") { break }
+    }
+    p_accept(p, .RP, "")
+    return true
+}
+
+parse_select :: proc(p: ^Parser, st: ^Stmt) -> bool {
+    st.is_select = true
+    if p_accept(p, .STAR, "") {
+        st.sel_star = true
+    } else {
+        for {
+            rc := ResultCol{star = false}
+            if p_accept(p, .STAR, "") {
+                rc.star = true
+            } else if p.toks[p.i].kind == .ID || p.toks[p.i].kind == .KW {
+                buf := p.toks[p.i].text
+                p.i += 1
+                if p.toks[p.i].kind == .DOT {
+                    p.i += 1
+                    if p_accept(p, .STAR, "") {
+                        rc.star = true
+                    } else {
+                        buf = fmt.tprintf("%s.%s", buf, p.toks[p.i].text)
+                        p.i += 1
+                        rc.col = buf
+                    }
+                } else {
+                    rc.col = buf
+                }
+            } else {
+                return false
+            }
+            append(&st.sel_cols, rc)
+            if !p_accept(p, .COMMA, "") { break }
+        }
+    }
+    if !p_accept_kw(p, "from") { return false }
+    if p.toks[p.i].kind != .ID { return false }
+    // first table
+    {
+        tr := TableRef{tname = p.toks[p.i].text}
+        p.i += 1
+        if p.toks[p.i].kind == .ID && !p_peek_kw(p, "on") && !p_peek_kw(p, "where") && !p_peek_kw(p, "order") && !p_peek_kw(p, "inner") && !p_peek_kw(p, "join") {
+            tr.alias = p.toks[p.i].text
+            p.i += 1
+        }
+        append(&st.sel_tables, tr)
+    }
+    // joins
+    for p_peek_kw(p, "inner") || p_peek_kw(p, "join") {
+        if p_accept_kw(p, "inner") {
+            if !p_accept_kw(p, "join") { return false }
+        } else {
+            p_accept_kw(p, "join")
+        }
+        if p.toks[p.i].kind != .ID { return false }
+        tr := TableRef{tname = p.toks[p.i].text}
+        p.i += 1
+        if p.toks[p.i].kind == .ID && !p_peek_kw(p, "on") && !p_peek_kw(p, "where") && !p_peek_kw(p, "order") {
+            tr.alias = p.toks[p.i].text
+            p.i += 1
+        }
+        append(&st.sel_tables, tr)
+        if p_accept_kw(p, "on") {
+            on := parse_expr(p)
+            if st.sel_join_on == nil {
+                st.sel_join_on = on
+            } else {
+                and := new_expr(.BINOP)
+                and.op = "AND"
+                and.l = st.sel_join_on
+                and.r = on
+                st.sel_join_on = and
+            }
+        }
+    }
+    if p_accept_kw(p, "where") {
+        st.sel_where = parse_expr(p)
+    }
+    if p_accept_kw(p, "order") {
+        if !p_accept_kw(p, "by") { return false }
+        if p.toks[p.i].kind != .ID && p.toks[p.i].kind != .KW { return false }
+        st.sel_order_col = p.toks[p.i].text
+        p.i += 1
+        if p_accept_kw(p, "desc") {
+            st.sel_order_desc = true
+        } else {
+            p_accept_kw(p, "asc")
+        }
+    }
+    return true
+}
+
+parse :: proc(p: ^Parser, st: ^Stmt) -> bool {
+    if p_peek_kw(p, "begin") {
+        st.is_begin = true
+        p.i += 1
+        p_accept_kw(p, "transaction")
+    } else if p_peek_kw(p, "commit") {
+        st.is_commit = true
+        p.i += 1
+        p_accept_kw(p, "transaction")
+    } else if p_accept_kw(p, "create") {
+        if p_accept_kw(p, "table") {
+            if !parse_create(p, st) { return false }
+        } else {
+            return false
+        }
+    } else if p_accept_kw(p, "insert") {
+        if !parse_insert(p, st) { return false }
+    } else if p_accept_kw(p, "select") {
+        if !parse_select(p, st) { return false }
+    } else {
+        return false
+    }
+    p_accept(p, .SEMI, "")
+    return true
+}
+
+// ---------- Database ----------
+DB :: struct {
+    schema: Schema,
+    stores: [dynamic]RowStore,
+    errmsg: string,
+    in_txn: bool,
+}
+
+// ---------- Expression eval ----------
+RowCtx :: struct {
+    refs: []TableRef,
+    tabs: []^Table,
+    rows: []Row,
+}
+
+rowctx_colindex :: proc(c: RowCtx, col: string) -> (int, int, bool) {
+    dot_pos := strings.index(col, ".")
+    if dot_pos >= 0 {
+        tname := col[:dot_pos]
+        cname := col[dot_pos+1:]
+        for i in 0..<len(c.refs) {
+            tn := c.refs[i].alias != "" ? c.refs[i].alias : c.refs[i].tname
+            if strings.equal_fold(tn, tname) {
+                ci := table_colindex(c.tabs[i], cname)
+                if ci >= 0 { return i, ci, true }
+            }
+        }
+        return 0, 0, false
+    }
+    for i in 0..<len(c.tabs) {
+        ci := table_colindex(c.tabs[i], col)
+        if ci >= 0 { return i, ci, true }
+    }
+    return 0, 0, false
+}
+
+eval_expr :: proc(e: ^Expr, c: RowCtx) -> Value {
+    if e == nil { return v_null() }
+    switch e.kind {
+    case .INT: return v_int(e.ival)
+    case .STR: return v_text(e.sval)
+    case .COL:
+        ti, ci, ok := rowctx_colindex(c, e.col)
+        if !ok { return v_null() }
+        return v_copy(c.rows[ti].vals[ci])
+    case .BINOP:
+        a := eval_expr(e.l, c)
+        b := eval_expr(e.r, c)
+        if strings.equal_fold(e.op, "AND") {
+            return v_int(v_truthy(a) && v_truthy(b) ? 1 : 0)
+        } else if strings.equal_fold(e.op, "OR") {
+            return v_int(v_truthy(a) || v_truthy(b) ? 1 : 0)
+        }
+        cmp := v_cmp(a, b)
+        switch e.op {
+        case "=": return v_int(cmp == 0 ? 1 : 0)
+        case "<>": return v_int(cmp != 0 ? 1 : 0)
+        case "<": return v_int(cmp < 0 ? 1 : 0)
+        case ">": return v_int(cmp > 0 ? 1 : 0)
+        case "<=": return v_int(cmp <= 0 ? 1 : 0)
+        case ">=": return v_int(cmp >= 0 ? 1 : 0)
+        case: return v_null()
+        }
+    }
+    return v_null()
+}
+
+row_match :: proc(where: ^Expr, c: RowCtx) -> bool {
+    if where == nil { return true }
+    v := eval_expr(where, c)
+    return v_truthy(v)
+}
+
+// ---------- Prepared statement ----------
+Stmt_Handle :: struct {
+    db: ^DB,
+    st: Stmt,
+    started: bool,
+    sorted: [dynamic]Row,
+    cur_sorted: int,
+    outrow: [dynamic]Value,
+    nout: int,
+}
+
+collect_matching :: proc(s: ^Stmt_Handle) {
+    db := s.db
+    n := len(s.st.sel_tables)
+    idx: [dynamic]int
+    for i in 0..<n {
+        append(&idx, schema_index(&db.schema, s.st.sel_tables[i].tname))
+    }
+    tabs: [dynamic]^Table
+    for i in 0..<n {
+        if idx[i] >= 0 {
+            append(&tabs, &db.schema.tables[idx[i]])
+        } else {
+            append(&tabs, nil)
+        }
+    }
+    cur: [dynamic]int
+    for i in 0..<n {
+        append(&cur, 0)
+    }
+    
+    for {
+        ok := true
+        for i in 0..<n {
+            if idx[i] < 0 || cur[i] >= len(db.stores[idx[i]].rows) {
+                ok = false
+                break
+            }
+        }
+        if !ok { break }
+        
+        rows: [dynamic]Row
+        for i in 0..<n {
+            append(&rows, db.stores[idx[i]].rows[cur[i]])
+        }
+        c := RowCtx{refs = s.st.sel_tables[:], tabs = tabs[:], rows = rows[:]}
+        
+        if row_match(s.st.sel_where, c) && (s.st.sel_join_on == nil || row_match(s.st.sel_join_on, c)) {
+            r: Row
+            for i in 0..<n {
+                for j in 0..<len(rows[i].vals) {
+                    append(&r.vals, v_copy(rows[i].vals[j]))
+                }
+            }
+            append(&s.sorted, r)
+        }
+        
+        delete(rows)
+        
+        // advance innermost
+        k := n - 1
+        for k >= 0 {
+            cur[k] += 1
+            if idx[k] >= 0 && cur[k] < len(db.stores[idx[k]].rows) {
+                break
+            }
+            if k > 0 {
+                cur[k] = 0
+            }
+            k -= 1
+        }
+        if k < 0 { break }
+    }
+    
+    delete(&idx)
+    delete(&tabs)
+    delete(&cur)
+    
+    // ORDER BY (single table only)
+    if s.st.sel_order_col != "" && len(s.st.sel_tables) == 1 {
+        t := schema_find(&db.schema, s.st.sel_tables[0].tname)
+        if t != nil {
+            cidx := table_colindex(t, s.st.sel_order_col)
+            if cidx >= 0 {
+                for i in 1..<len(s.sorted) {
+                    for j in i; j > 0; j -= 1 {
+                        a := s.sorted[j-1].vals[cidx]
+                        b := s.sorted[j].vals[cidx]
+                        cmp := v_cmp(a, b)
+                        if (s.st.sel_order_desc && cmp < 0) || (!s.st.sel_order_desc && cmp > 0) {
+                            tmp := s.sorted[j-1]
+                            s.sorted[j-1] = s.sorted[j]
+                            s.sorted[j] = tmp
+                        } else {
+                            break
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+stmt_step_select :: proc(s: ^Stmt_Handle) -> int {
+    if !s.started {
+        s.started = true
+        collect_matching(s)
+    }
+    if s.cur_sorted >= len(s.sorted) { return 101 }
+    r := s.sorted[s.cur_sorted]
+    s.cur_sorted += 1
+    n := len(s.st.sel_tables)
+    tabs: [dynamic]^Table
+    for i in 0..<n {
+        append(&tabs, schema_find(&s.db.schema, s.st.sel_tables[i].tname))
+    }
+    offsets: [dynamic]int
+    off := 0
+    for i in 0..<n {
+        append(&offsets, off)
+        off += len(tabs[i].cols)
+    }
+    clear(&s.outrow)
+    if s.st.sel_star {
+        for i in 0..<n {
+            for j in 0..<len(tabs[i].cols) {
+                append(&s.outrow, v_copy(r.vals[offsets[i]+j]))
+            }
+        }
+    } else {
+        for k in 0..<len(s.st.sel_cols) {
+            rc := s.st.sel_cols[k]
+            if rc.star {
+                for i in 0..<n {
+                    for j in 0..<len(tabs[i].cols) {
+                        append(&s.outrow, v_copy(r.vals[offsets[i]+j]))
+                    }
+                }
+            } else {
+                dot_pos := strings.index(rc.col, ".")
+                ti := 0
+                ci := -1
+                if dot_pos >= 0 {
+                    tname := rc.col[:dot_pos]
+                    cname := rc.col[dot_pos+1:]
+                    for i in 0..<n {
+                        tn := s.st.sel_tables[i].alias != "" ? s.st.sel_tables[i].alias : s.st.sel_tables[i].tname
+                        if strings.equal_fold(tn, tname) {
+                            ci = table_colindex(tabs[i], cname)
+                            ti = i
+                            break
+                        }
+                    }
+                } else {
+                    for i in 0..<n {
+                        ci = table_colindex(tabs[i], rc.col)
+                        if ci >= 0 { ti = i; break }
+                    }
+                }
+                if ci < 0 {
+                    append(&s.outrow, v_null())
+                } else {
+                    append(&s.outrow, v_copy(r.vals[offsets[ti]+ci]))
+                }
+            }
+        }
+    }
+    s.nout = len(s.outrow)
+    delete(&tabs)
+    delete(&offsets)
+    return 100
+}
+
+// ---------- Public API ----------
+sqlite3_open :: proc(name: string) -> (^DB, int) {
+    db := new(DB)
+    return db, 0
+}
+
+sqlite3_close :: proc(db: ^DB) -> int {
+    if db == nil { return 0 }
+    for i in 0..<len(db.schema.tables) {
+        delete(db.schema.tables[i].cols)
+    }
+    delete(db.schema.tables)
+    for i in 0..<len(db.stores) {
+        for j in 0..<len(db.stores[i].rows) {
+            delete(db.stores[i].rows[j].vals)
+        }
+        delete(db.stores[i].rows)
+    }
+    delete(db.stores)
+    free(db)
+    return 0
+}
+
+sqlite3_errmsg :: proc(db: ^DB) -> string {
+    if db == nil { return "" }
+    return db.errmsg
+}
+
+Exec_Callback :: proc(arg: rawptr, n: int, vals: []string, cols: []string)
+
+sqlite3_exec :: proc(db: ^DB, sql: string, cb: Exec_Callback, arg: rawptr) -> (int, string) {
+    toks := lex(sql)
+    defer delete(toks)
+    p := Parser{toks = toks[:]}
+    rc := 0
+    err_msg := ""
+    for p.toks[p.i].kind != .EOF {
+        st: Stmt
+        if !parse(&p, &st) {
+            return 1, "parse error"
+        }
+        if st.is_begin {
+            db.in_txn = true
+        } else if st.is_commit {
+            db.in_txn = false
+        } else if st.is_create {
+            if !schema_add(&db.schema, st.ct_name, st.ct_cols) {
+                err_msg = fmt.tprintf("table already exists: %s", st.ct_name)
+                rc = 1
+                break
+            }
+            append(&db.stores, RowStore{})
+            continue
+        } else if st.is_insert {
+            idx := schema_index(&db.schema, st.ins_table)
+            if idx < 0 {
+                err_msg = fmt.tprintf("no such table: %s", st.ins_table)
+                rc = 1
+                break
+            }
+            row: Row
+            for v in st.ins_vals {
+                append(&row.vals, v_copy(v))
+            }
+            append(&db.stores[idx].rows, row)
+            delete(st.ins_vals)
+        } else if st.is_select {
+            s := new(Stmt_Handle)
+            s.db = db
+            s.st = st

@@ -1,3 +1,5 @@
 [2026-06-20T17:34:47Z] loop start: 1 languages, orig_tokens=8805
 [2026-06-20T17:34:47Z]   >>> porting odin (Odin)
 [2026-06-20T17:37:17Z]       porter length-capped (16000 tok); retry high effort
+[2026-06-20T17:39:51Z]       porter done: 478 bytes, 136 tokens, 304.0s
+[2026-06-20T17:39:53Z]       judge: completeness=15 notes=Port is severely incomplete: only two small cleanup procedures shown (free_stmt,

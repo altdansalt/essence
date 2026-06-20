@@ -1,0 +1,9 @@
+```json
+{
+  "completeness": 15,
+  "api_surface": 5,
+  "sql_features": 10,
+  "architecture": 20,
+  "notes": "Port is severely incomplete: only two small cleanup procedures shown (free_stmt, free_expr); missing ~95% of implementation including lexer, parser, value types, schema, row storage, expression evaluation, all statement execution logic, and public API functions. No SQL execution capability present."
+}
+```

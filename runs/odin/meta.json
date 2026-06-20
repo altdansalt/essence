@@ -1,0 +1,40 @@
+{
+  "language": "Odin",
+  "slug": "odin",
+  "timestamp_utc": "2026-06-20T17:39:53Z",
+  "elapsed_seconds": 304.0,
+  "porter_finish_reason": "length",
+  "original_tokens": 8805,
+  "ported_tokens": 136,
+  "token_ratio": 0.0154,
+  "reduction_factor": 64.74,
+  "porter_model": "accounts/fireworks/models/glm-5p2",
+  "judge_model": "claude-haiku-4-5",
+  "porter_usage": {
+    "prompt_tokens": 12889,
+    "total_tokens": 28889,
+    "completion_tokens": 16000,
+    "prompt_tokens_details": {
+      "cached_tokens": 12888
+    }
+  },
+  "judge_usage": {
+    "input_tokens": 11945,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "cache_creation": {
+      "ephemeral_5m_input_tokens": 0,
+      "ephemeral_1h_input_tokens": 0
+    },
+    "output_tokens": 113,
+    "service_tier": "standard",
+    "inference_geo": "not_available"
+  },
+  "judge_score": {
+    "completeness": 15,
+    "api_surface": 5,
+    "sql_features": 10,
+    "architecture": 20,
+    "notes": "Port is severely incomplete: only two small cleanup procedures shown (free_stmt, free_expr); missing ~95% of implementation including lexer, parser, value types, schema, row storage, expression evaluation, all statement execution logic, and public API functions. No SQL execution capability present."
+  }
+}
