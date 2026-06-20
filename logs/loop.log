@@ -38,3 +38,4 @@
 [2026-06-20T17:18:11Z]   >>> porting rust (Rust)
 [2026-06-20T17:19:16Z]       porter done: 29398 bytes, 6805 tokens, 64.7s
 [2026-06-20T17:19:19Z]       judge: completeness=72 notes=The Rust port successfully translates the core architecture (lexer, parser, exec
+[2026-06-20T17:19:20Z] loop done: 8 runs

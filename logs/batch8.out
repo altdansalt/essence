@@ -80,3 +80,12 @@ To https://github.com/altdansalt/essence.git
 [2026-06-20T17:18:11Z]   >>> porting rust (Rust)
 [2026-06-20T17:19:16Z]       porter done: 29398 bytes, 6805 tokens, 64.7s
 [2026-06-20T17:19:19Z]       judge: completeness=72 notes=The Rust port successfully translates the core architecture (lexer, parser, exec
+[main 894aab2] port: rust (Rust) completeness=72
+ 6 files changed, 1938 insertions(+)
+ create mode 100644 runs/rust/judge_raw.txt
+ create mode 100644 runs/rust/meta.json
+ create mode 100644 runs/rust/porter_raw.txt
+ create mode 100644 runs/rust/sqlite_core.rs
+To https://github.com/altdansalt/essence.git
+   9ae955f..894aab2  main -> main
+[2026-06-20T17:19:20Z] loop done: 8 runs
