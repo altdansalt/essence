@@ -66,3 +66,40 @@ learnxinyminutes-docs repo after filtering out tools, frameworks, data
 formats, and uppercase meta-files (README/CONTRIBUTING). Categories in the
 frontmatter are sparse (only ~40 of 199 files declare one), so the filter is
 mostly an explicit slug denylist plus an uppercase-slug rule.
+
+## F7 — First batch (top 8 by promise_score)
+
+| language | completeness | reduction | port_tok | finish |
+|----------|-------------|-----------|----------|--------|
+| Python   | 78 | 1.69x | 5200 | stop |
+| Java     | 78 | 1.43x | 6175 | (n/a) |
+| Rust     | 72 | 1.29x | 6805 | (n/a) |
+| C#       | 72 | 1.27x | 6931 | (n/a) |
+| Haxe     | 72 | 1.23x | 7182 | (n/a) |
+| Nostos   | 42 | 1.35x | 6506 | stop |
+| F#       | 32 | 1.4x  | 6298 | stop |
+| Odin     | 15 | n/a   | 136  | length (capped even at 32k + high retry) |
+| Vim9     |  8 | n/a   | 132  | length (capped) |
+
+Observations:
+- The mainstream object-oriented / systems languages (Python, Java, Rust, C#,
+  Haxe) all produced complete ports (72–78) with modest reductions (1.2–1.7x).
+  The C reference is already fairly tight, so reductions are bounded.
+- GLM-5.2 is **non-deterministic**: the first F# run (16k cap) gave stubs;
+  re-run at 32k gave completeness 72, then a third run gave 32. Same prompt,
+  same params. We should treat single-shot scores as noisy and consider
+  multiple samples for the languages that matter.
+- Some languages defeat the porter entirely: Odin and Vim9 script hit
+  `finish_reason=length` even at `max_tokens=32000` with `reasoning_effort=high`,
+  producing ~130-token stubs. These are signals that the language is either
+  unfamiliar to GLM-5.2 or a poor fit for one-shot porting of a structured
+  engine. The leaderboard marks these `n/a` rather than reporting a bogus 64x
+  reduction.
+- `reasoning_effort=low` + `max_tokens=32000` + length-cap retry is the
+  working configuration. Most languages finish with `stop` in 60–170s.
+
+## F8 — The leaderboard's "reduction" must be read with completeness
+
+A 130-token stub is a 66x "reduction" but is useless. The leaderboard now
+flags `finish_reason=length` or `completeness<30` as `n/a` with a ⚠️. The
+ranking sorts by completeness first, so stubs sink to the bottom.
