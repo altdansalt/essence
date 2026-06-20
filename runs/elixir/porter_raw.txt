@@ -1,0 +1,1452 @@
+Let me port the C SQLite-style SQL engine to Elixir faithfully.
+
+Key design decisions:
+- Use a module `Sqlite3` with functions matching the API
+- Values: `nil` for NULL, `{:int, n}` for integers, `{:text, s}` for text. Actually, let me think about what's most idiomatic. I could use `nil`, integers directly, and strings directly. But the C code distinguishes V_INT, V_TEXT, V_NULL types for comparison purposes. Let me use `{:null}`, `{:int, n}`, `{:text, s}` tuples or simpler: `nil`, `{:i, n}`, `{:t, s}`. Actually, let me just use `nil`, integers, and binary strings. For comparison, I need to handle type ordering: V_NULL < V_INT < V_TEXT (by enum value). So I need to distinguish int from text. Let me use `nil`, `{:int, n}`, `{:text, s}`.
+
+Actually, to keep it concise, let me use:
+- `nil` for NULL
+- `{:i, n}` for int
+- `{:t, s}` for text
+
+Or even simpler, just use the values directly and infer type. But text could be confused... no, integers and strings are distinguishable in Elixir. `is_integer` and `is_binary`. So I can use `nil`, integers, and strings directly. That's more idiomatic.
+
+For comparison `v_cmp`: if types differ, compare by type enum order (V_NULL=0, V_INT=1, V_TEXT=2). If same type, compare values.
+
+Let me structure the code:
+
+1. Value helpers
+2. Lexer
+3. Parser (AST as maps/tuples)
+4. Executor
+5. Public API
+
+Let me think about the AST representation. I'll use maps or tuples.
+
+Expr: `{:col, name}`, `{:int, val}`, `{:str, val}`, `{:binop, op, left, right}`
+
+Stmt: a map with fields like `%{type: :create, name: ..., cols: [...]}`, etc.
+
+For the database state, I'll use a struct or map: `%{schema: %{tables => %{cols: [...], rows: [[...], ...]}}, errmsg: ""}`
+
+For prepared statements: `%{db: ..., stmt: ..., sorted: [...], cur: 0, outrow: [...], nout: ...}`
+
+Let me write this out.
+
+For the lexer, I'll tokenize into a list of `{kind, text}` tuples.
+
+Keywords list from C code.
+
+Let me write the full implementation.
+
+```elixir
+defmodule Sqlite3 do
+  # Value helpers
+  # nil = NULL, integer = int, binary = text
+  
+  def v_cmp(nil, nil), do: 0
+  def v_cmp(nil, _), do: -1
+  def v_cmp(_, nil), do: 1
+  def v_cmp(a, b) when is_integer(a) and is_integer(b), do: cond do: a < b -> -1; a > b -> 1; true -> 0
+  def v_cmp(a, b) when is_binary(a) and is_binary(b), do: cond do: a < b -> -1; a > b -> 1; true -> 0
+  def v_cmp(a, b) when is_integer(a) and is_binary(b), do: -1  # V_INT < V_TEXT
+  def v_cmp(a, b) when is_binary(a) and is_integer(b), do: 1
+```
+
+Wait, the C code says: `if (a->type!=b->type) return (int)a->type-(int)b->type;` where V_NULL=0, V_INT=1, V_TEXT=2. So NULL < INT < TEXT.
+
+Let me write v_cmp properly.
+
+For truthy: `v_cmp(v, 0) != 0` where 0 is V_INT. So nil compared to 0: types differ, V_NULL - V_INT = -1, so != 0, truthy. Wait, that means NULL is truthy? Let me check: `v_truthy` creates `v_int(0)` and checks `v_cmp(v, &z) != 0`. If v is NULL, v_cmp(NULL, INT(0)) = V_NULL - V_INT = 0 - 1 = -1, which is != 0, so NULL is truthy. That's the C behavior, so I need to match it.
+
+Actually wait, let me re-read: `static int v_truthy(const Value *v){ Value z=v_int(0); return v_cmp(v,&z)!=0; }`. Yes, NULL is truthy in this engine. I'll match that.
+
+Let me now write the full code.
+
+For the lexer, I need to handle:
+- whitespace
+- comments (-- to end of line)
+- identifiers/keywords (alpha or _ start, alnum or _ continue)
+- numbers (digits)
+- strings ('...')
+- quoted identifiers ("...")
+- operators (*, ,, (, ), ;, ., =, <>, <, >, <=, >=, !=)
+
+Token kinds: :eof, :id, :int, :string, :kw, :punct, :star, :comma, :lp, :rp, :semi, :op, :dot
+
+Let me write the lexer as a function that returns a list of tokens.
+
+For the parser, I'll use a recursive descent approach with a list of tokens and an index (or just consume from the front of the list).
+
+Let me think about how to structure the parser. I'll use a simple approach with a list and pattern matching.
+
+Actually, let me use a struct for the parser state or just pass around the token list and return remaining tokens.
+
+Let me use a simpler approach: parse functions take `[token]` and return `{result, remaining_tokens}`.
+
+Let me write this out now.
+
+For the executor:
+- CREATE TABLE: add to schema
+- INSERT: add row to table's rows
+- SELECT: nested loop join, WHERE filter, ORDER BY, projections
+
+For the prepared statement (SELECT), I need to materialize matching rows, sort if ORDER BY, then step through them.
+
+Let me write the complete code now.
+
+For the demo, I'll replicate the C main function.
+
+Let me think about the API:
+- `open(name)` -> `{:ok, db}` or db
+- `exec(db, sql, callback)` -> rc
+- `prepare_v2(db, sql)` -> `{:ok, stmt}` or `{:error, msg}`
+- `step(stmt)` -> 100 (ROW) or 101 (DONE)
+- `finalize(stmt)` -> 0
+- `close(db)` -> 0
+- `column_count(stmt)` -> n
+- `column_text(stmt, i)` -> text
+- `column_int64(stmt, i)` -> int
+- `errmsg(db)` -> string
+
+Let me use a map for db state: `%{schema: %{}, errmsg: ""}` where schema maps table_name (lowercase) to `%{name: original, cols: [...], rows: [...]}`.
+
+Actually, let me keep it simple. The schema is a map from lowercase table name to `%{name: name, cols: [col_names], rows: [list of rows]}`.
+
+For case-insensitivity, I'll store and look up by lowercase name.
+
+Let me write the code now.
+
+```elixir
+defmodule Sqlite3 do
+  @keywords ~w(create table insert into values select from where order by asc desc and or not null begin commit inner join on int integer text primary key transaction)
+  
+  defmodule DB do
+    defstruct schema: %{}, errmsg: ""
+  end
+  
+  defmodule Stmt do
+    defstruct db: nil, ast: nil, sorted: [], cur: 0, outrow: [], nout: 0, started: false
+  end
+  
+  # ... 
+end
+```
+
+Actually, let me think about whether to use defstruct or plain maps. Plain maps are more concise. Let me use plain maps.
+
+DB: `%{schema: %{}, errmsg: ""}`
+Stmt: `%{db: db, ast: ast, sorted: [], cur: 0, outrow: [], nout: 0, started: false}`
+
+Let me write the full implementation now.
+
+For the lexer, let me write it as a recursive function or use regex. Actually, let me write a manual lexer.
+
+```elixir
+defp lex(src) do
+  lex_loop(String.to_charlist(src), [])
+end
+```
+
+Hmm, working with charlists might be easier for the character-by-character approach. Or I could use binary pattern matching. Let me use binary pattern matching for conciseness.
+
+Actually, let me just use a simple approach with String.graphemes or binary matching.
+
+Let me think about this more carefully. The C code does character-by-character scanning. In Elixir, I can do this with binary pattern matching or by converting to a charlist and using recursion.
+
+Let me use a charlist approach since it maps more directly to the C code.
+
+Actually, let me use a simpler approach with Regex or String functions where possible, but for the operator handling, I'll need more control.
+
+Let me write a lexer that works on a charlist:
+
+```elixir
+defp lex(src) do
+  chars = String.to_charlist(src)
+  do_lex(chars, [])
+  |> Enum.reverse()
+  |> Kernel.++([{:eof, ""}])
+end
+
+defp do_lex([], acc), do: acc
+defp do_lex([c | rest], acc) do
+  cond do
+    c in ~c' \t\n\r' -> do_lex(rest, acc)
+    c == ?- and hd(rest) == ?- -> 
+      # comment, skip to newline
+      do_lex(skip_to_newline(rest), acc)
+    ...
+  end
+end
+```
+
+Hmm, this is getting complex. Let me try a different approach using binary matching with `String.next_grapheme/1` or just working with the string directly.
+
+Actually, let me use a simpler approach. I'll use Regex.scan for most tokens and handle the rest manually. But that might not be faithful.
+
+Let me just write a straightforward recursive lexer on charlists. It'll be a bit verbose but clear.
+
+Actually, let me try to be more concise. I can use `String.trim_leading` and pattern matching.
+
+Let me think about this differently. I'll write the lexer using binary pattern matching:
+
+```elixir
+defp lex(s), do: lex(s, [])
+
+defp lex(<<>>, acc), do: Enum.reverse([{:eof, ""} | acc])
+defp lex(<<c, rest::binary>> = s, acc) when c in [?\s, ?\t, ?\n, ?\r] do
+  lex(rest, acc)
+end
+defp lex(<<?-, ?-, rest::binary>>, acc) do
+  # comment
+  case String.split(rest, "\n", parts: 2) do
+    [_, after_nl] -> lex(after_nl, acc)
+    [_] -> lex(<<>>, acc)
+  end
+end
+defp lex(<<c, _::binary>> = s, acc) when c in ?a..?z or c in ?A..?Z or c == ?_ do
+  # identifier or keyword
+  {word, rest} = take_while(s, &is_id_char/1)
+  kind = if String.downcase(word) in @keywords, do: :kw, else: :id
+  lex(rest, [{kind, word} | acc])
+end
+defp lex(<<c, _::binary>> = s, acc) when c in ?0..?9 do
+  {num, rest} = take_while(s, &is_digit/1)
+  lex(rest, [{:int, num} | acc])
+end
+defp lex(<<?', rest::binary>>, acc) do
+  {str, rest2} = take_until_quote(rest)
+  lex(rest2, [{:string, str} | acc])
+end
+defp lex(<<?", rest::binary>>, acc) do
+  {str, rest2} = take_until_dquote(rest)
+  lex(rest2, [{:id, str} | acc])
+end
+defp lex(<<?*, rest::binary>>, acc), do: lex(rest, [{:star, "*"} | acc])
+defp lex(<<?,, rest::binary>>, acc), do: lex(rest, [{:comma, ","} | acc])
+defp lex(<<?(, rest::binary>>, acc), do: lex(rest, [{:lp, "("} | acc])
+defp lex(<<?), rest::binary>>, acc), do: lex(rest, [{:rp, ")"} | acc])
+defp lex(<<?;, rest::binary>>, acc), do: lex(rest, [{:semi, ";"} | acc])
+defp lex(<<?., rest::binary>>, acc), do: lex(rest, [{:dot, "."} | acc])
+defp lex(<<c, rest::binary>> = s, acc) when c in '=<>!' do
+  # operators
+  {op, rest2} = take_op(s)
+  lex(rest2, [{:op, op} | acc])
+end
+defp lex(<<c, rest::binary>>, acc), do: lex(rest, [{:punct, <<c>>} | acc])
+```
+
+This is cleaner. Let me define the helper functions.
+
+For `take_while`:
+```elixir
+defp take_while(s, pred) do
+  do_take_while(s, pred, "")
+end
+defp do_take_while(<<c, rest::binary>> = s, pred, acc) do
+  if pred.(c) do
+    do_take_while(rest, pred, acc <> <<c>>)
+  else
+    {acc, s}
+  end
+end
+defp do_take_while(<<>>, _, acc), do: {acc, <<>>}
+
+defp is_id_char(c), do: c in ?a..?z or c in ?A..?Z or c in ?0..?9 or c == ?_
+defp is_digit(c), do: c in ?0..?9
+```
+
+For `take_until_quote`:
+```elixir
+defp take_until_quote(s), do: do_take_until(s, ?', "")
+defp take_until_dquote(s), do: do_take_until(s, ?", "")
+defp do_take_until(<<c, rest::binary>>, q, acc) when c != q do
+  do_take_until(rest, q, acc <> <<c>>)
+end
+defp do_take_until(<<q, rest::binary>>, q, acc), do: {acc, rest}
+defp do_take_until(<<>>, _, acc), do: {acc, <<>>}
+```
+
+For `take_op`:
+```elixir
+defp take_op(<<c, ?=, rest::binary>>), do: {<<c, ?=>>, rest}
+defp take_op(<<?<, ?>, rest::binary>>), do: {"<>", rest}
+defp take_op(<<c, rest::binary>>), do: {<<c>>, rest}
+```
+
+Wait, the C code handles operators like this:
+- If next char is '=', advance (so `<=`, `>=`, `!=`)
+- If c=='<' and next is '>', advance (so `<>`)
+- If c=='!' and next is '=', advance (so `!=`)
+- Then advance one more
+
+So the operators are: `=`, `<>`, `<`, `>`, `<=`, `>=`, `!=`
+
+Let me trace through:
+- `=`: c='=', next is not '=', so just `=`. But wait, `==` would be `=` then `=`? No, the C code says `if (L->src[L->pos+1]=='=') L->pos++;` which advances for the second `=`. So `==` becomes `==`? But that's not a valid operator in the comparison logic. Let me re-read...
+
+Actually, looking at the C code more carefully:
+```c
+if (strchr("=<>!",c)){
+    size_t st=L->pos;
+    if (L->src[L->pos+1]=='=') L->pos++;
+    if (c=='<' && L->src[L->pos+1]=='>') L->pos++;
+    if (c=='!' && L->src[L->pos+1]=='=') L->pos++;
+    L->pos++;
+    lex_push(L,TK_OP,L->src+st,L->pos-st);
+}
+```
+
+So for `=`: next char is checked for `=`. If `==`, it becomes `==`. But `==` is not handled in the comparison logic (only `=`, `<>`, `<`, `>`, `<=`, `>=`). So `==` would fall through and result would be v_null(). But in practice, SQL uses `=` not `==`.
+
+For `<`: if next is `=`, becomes `<=`. Then if c=='<' and next (after possible = advance) is `>`, becomes `<>`. So `<>=` would be... let me trace: c='<', pos+1 is '=', so pos++ (now at '='). Then c=='<' and pos+1 is '>', but pos is now at '=', so pos+1 is whatever comes after '='. So this doesn't match. Actually, the `<>` check happens after the `=` check, so `<=` is handled first. If input is `<>`, then: c='<', pos+1 is '>', not '=', so no advance. Then c=='<' and pos+1 is '>', so pos++ (now at '>'). Then pos++ (past '>'). Result: `<>`.
+
+If input is `<=`: c='<', pos+1 is '=', so pos++ (now at '='). Then c=='<' and pos+1 is whatever after '=', not '>', so no advance. Then pos++. Result: `<=`.
+
+If input is `<`: c='<', pos+1 is not '=' or '>', so no advances. pos++. Result: `<`.
+
+For `!`: if next is `=`, becomes `!=`. The second check for `!` and `=` is redundant since the first check already handles it. Actually wait: `if (c=='!' && L->src[L->pos+1]=='=')` - after the first `if (L->src[L->pos+1]=='=') L->pos++;`, if c=='!' and next was '=', pos is now at '='. Then `L->src[L->pos+1]` is the char after '='. So this check is for `!=` followed by another `=`? That would make `!==`. But that's weird. Actually, I think the second `!` check is just redundant/safety. Let me just handle the common cases.
+
+Let me simplify my take_op:
+```elixir
+defp take_op(<<?<, ?>, rest::binary>>), do: {"<>", rest}
+defp take_op(<<?<, ?=, rest::binary>>), do: {"<=", rest}
+defp take_op(<<?>, ?=, rest::binary>>), do: {">=", rest}
+defp take_op(<<?!, ?=, rest::binary>>), do: {"!=", rest}
+defp take_op(<<c, ?=, rest::binary>>), do: {<<c, ?=>>, rest}  # handles ==, but also = followed by =
+defp take_op(<<c, rest::binary>>), do: {<<c>>, rest}
+```
+
+Wait, but `=` alone should be just `=`. With my code, `= ` would match the last clause since there's no `=` after it. But `==` would match the second-to-last clause and produce `==`. That matches the C behavior. But `==` isn't a valid comparison operator in the eval. That's fine, it matches the C behavior.
+
+Actually, let me re-examine. For `=` followed by something that's not `=`: the C code checks `if (L->src[L->pos+1]=='=')` - if it's not `=`, no advance. Then the other checks don't apply (c is `=`, not `<` or `!`). Then `L->pos++` advances past the `=`. Result is just `=`.
+
+With my Elixir code: `take_op(<<c, rest::binary>>)` where c is `=` and rest doesn't start with `=`. But wait, my clauses are checked in order. `<<?=, rest>>` where rest doesn't start with `=`... none of the specific clauses match, so it falls to `take_op(<<c, rest::binary>>)` which gives `{<<c>>, rest}` = `{"=", rest}`. Good.
+
+But `==` would match `take_op(<<c, ?=, rest::binary>>)` giving `{"==", rest}`. That matches C behavior.
+
+OK, this is fine. Let me move on.
+
+Now for the parser. I'll use a simple approach where I pass the token list and return `{ast, remaining}`.
+
+Let me define the AST:
+- Expr: `{:col, name}`, `{:int, val}`, `{:str, val}`, `{:binop, op, left, right}`
+- Stmt: map with type and fields
+
+For the parser, I'll use a module attribute or helper functions.
+
+Let me think about the parser structure:
+
+```elixir
+defp parse(tokens) do
+  case parse_stmt(tokens) do
+    {:ok, stmt, rest} -> {:ok, stmt, rest}
+    :error -> :error
+  end
+end
+```
+
+For `parse_stmt`:
+```elixir
+defp parse_stmt([{:kw, "begin"} | rest]) do
+  rest = skip_kw(rest, "transaction")
+  rest = skip_semi(rest)
+  {:ok, %{type: :begin}, rest}
+end
+defp parse_stmt([{:kw, "commit"} | rest]) do
+  rest = skip_kw(rest, "transaction")
+  rest = skip_semi(rest)
+  {:ok, %{type: :commit}, rest}
+end
+defp parse_stmt([{:kw, "create"}, {:kw, "table"} | rest]) do
+  parse_create(rest)
+end
+defp parse_stmt([{:kw, "insert"} | rest]) do
+  parse_insert(rest)
+end
+defp parse_stmt([{:kw, "select"} | rest]) do
+  parse_select(rest)
+end
+defp parse_stmt(_), do: :error
+```
+
+Let me write each parse function.
+
+For `parse_create`:
+```elixir
+defp parse_create([{:id, name} | rest]) or [{:kw, name} | rest]) -> ...
+```
+
+Hmm, I need to handle both :id and :kw for table names and column names. Let me use a helper:
+
+```elixir
+defp take_name([{:id, name} | rest]), do: {:ok, name, rest}
+defp take_name([{:kw, name} | rest]), do: {:ok, name, rest}
+defp take_name(_), do: :error
+```
+
+For `parse_create`:
+```elixir
+defp parse_create(tokens) do
+  with {:ok, name, rest} <- take_name(tokens),
+       {:ok, rest} <- expect(:lp, rest),
+       {:ok, cols, rest} <- parse_col_list(rest) do
+    rest = skip_semi(rest)
+    {:ok, %{type: :create, name: name, cols: cols}, rest}
+  else
+    _ -> :error
+  end
+end
+```
+
+For `parse_col_list`:
+```elixir
+defp parse_col_list([{:rp, _} | rest]), do: {:ok, [], rest}
+defp parse_col_list(tokens) do
+  parse_col_list_loop(tokens, [])
+end
+
+defp parse_col_list_loop([{:rp, _} | rest], acc), do: {:ok, Enum.reverse(acc), rest}
+defp parse_col_list_loop([{:eof, _} | _], _), do: :error
+defp parse_col_list_loop(tokens, acc) do
+  with {:ok, name, rest} <- take_name(tokens) do
+    # skip until comma or rp
+    rest = skip_until_comma_or_rp(rest)
+    case rest do
+      [{:comma, _} | rest2] -> parse_col_list_loop(rest2, [name | acc])
+      [{:rp, _} | _] -> {:ok, Enum.reverse([name | acc]), rest}
+      _ -> :error
+    end
+  else
+    _ -> :error
+  end
+end
+```
+
+Wait, the C code skips column type definitions: `while (P->t[P->i].kind!=TK_COMMA && P->t[P->i].kind!=TK_RP && P->t[P->i].kind!=TK_EOF) P->i++;`. So after taking a column name, it skips everything until comma, rp, or eof.
+
+```elixir
+defp skip_until_comma_or_rp([{:comma, _} | _] = tokens), do: tokens
+defp skip_until_comma_or_rp([{:rp, _} | _] = tokens), do: tokens
+defp skip_until_comma_or_rp([{:eof, _} | _] = tokens), do: tokens
+defp skip_until_comma_or_rp([_ | rest]), do: skip_until_comma_or_rp(rest)
+```
+
+For `parse_insert`:
+```elixir
+defp parse_insert(tokens) do
+  with {:ok, rest} <- expect_kw(tokens, "into"),
+       {:ok, table, rest} <- take_name(rest),
+       {:ok, rest} <- expect_kw(rest, "values"),
+       {:ok, rest} <- expect(:lp, rest),
+       {:ok, vals, rest} <- parse_value_list(rest),
+       {:ok, rest} <- expect(:rp, rest) do
+    rest = skip_semi(rest)
+    {:ok, %{type: :insert, table: table, vals: vals}, rest}
+  else
+    _ -> :error
+  end
+end
+```
+
+For `parse_value_list`:
+```elixir
+defp parse_value_list([{:rp, _} | _] = tokens), do: {:ok, [], tokens}
+defp parse_value_list(tokens, acc \\ [])
+defp parse_value_list([{:rp, _} | _] = tokens, acc), do: {:ok, Enum.reverse(acc), tokens}
+defp parse_value_list([{:int, s} | rest], acc) do
+  parse_value_list_continue(rest, [String.to_integer(s) | acc])
+end
+defp parse_value_list([{:string, s} | rest], acc) do
+  parse_value_list_continue(rest, [s | acc])
+end
+defp parse_value_list([{:kw, "null"} | rest], acc) do
+  parse_value_list_continue(rest, [nil | acc])
+end
+defp parse_value_list(_, _), do: :error
+
+defp parse_value_list_continue([{:comma, _} | rest], acc), do: parse_value_list(rest, acc)
+defp parse_value_list_continue(rest, acc), do: {:ok, Enum.reverse(acc), rest}
+```
+
+Wait, I need to be careful with default args and pattern matching. Let me restructure:
+
+```elixir
+defp parse_value_list(tokens), do: parse_value_list(tokens, [])
+defp parse_value_list([{:rp, _} | _] = tokens, acc), do: {:ok, Enum.reverse(acc), tokens}
+defp parse_value_list([{:int, s} | rest], acc), do: parse_value_list_continue(rest, [String.to_integer(s) | acc])
+defp parse_value_list([{:string, s} | rest], acc), do: parse_value_list_continue(rest, [s | acc])
+defp parse_value_list([{:kw, "null"} | rest], acc), do: parse_value_list_continue(rest, [nil | acc])
+defp parse_value_list(_, _), do: :error
+
+defp parse_value_list_continue([{:comma, _} | rest], acc), do: parse_value_list(rest, acc)
+defp parse_value_list_continue(rest, acc), do: {:ok, Enum.reverse(acc), rest}
+```
+
+For `parse_select`:
+This is more complex. Let me handle:
+1. Projections (SELECT * or SELECT col1, col2, table.*)
+2. FROM table [alias]
+3. [INNER JOIN table [alias] ON cond]*
+4. [WHERE cond]
+5. [ORDER BY col [DESC|ASC]]
+
+```elixir
+defp parse_select(tokens) do
+  with {:ok, {star, cols}, rest} <- parse_projections(tokens),
+       {:ok, rest} <- expect_kw(rest, "from"),
+       {:ok, tables, join_on, rest} <- parse_tables(rest),
+       {:ok, where, rest} <- parse_optional_where(rest),
+       {:ok, order_col, order_desc, rest} <- parse_optional_order(rest) do
+    rest = skip_semi(rest)
+    {:ok, %{type: :select, star: star, cols: cols, tables: tables, 
+            where: where, order_col: order_col, order_desc: order_desc, 
+            join_on: join_on}, rest}
+  else
+    _ -> :error
+  end
+end
+```
+
+For `parse_projections`:
+```elixir
+defp parse_projections([{:star, _} | rest]), do: {:ok, {true, []}, rest}
+defp parse_projections(tokens), do: parse_proj_list(tokens, [])
+
+defp parse_proj_list(tokens, acc) do
+  case parse_proj_item(tokens) do
+    {:ok, item, rest} ->
+      case rest do
+        [{:comma, _} | rest2] -> parse_proj_list(rest2, [item | acc])
+        _ -> {:ok, {false, Enum.reverse([item | acc])}, rest}
+      end
+    :error -> :error
+  end
+end
+
+defp parse_proj_item([{:star, _} | rest]), do: {:ok, %{star: true, col: nil}, rest}
+defp parse_proj_item(tokens) do
+  with {:ok, name, rest} <- take_name(tokens) do
+    case rest do
+      [{:dot, _} | rest2] ->
+        case rest2 do
+          [{:star, _} | rest3] -> {:ok, %{star: true, col: nil}, rest3}
+          _ ->
+            with {:ok, name2, rest3} <- take_name(rest2) do
+              {:ok, %{star: false, col: name <> "." <> name2}, rest3}
+            else
+              _ -> :error
+            end
+        end
+      _ -> {:ok, %{star: false, col: name}, rest}
+    end
+  else
+    _ -> :error
+  end
+end
+```
+
+For `parse_tables`:
+```elixir
+defp parse_tables(tokens) do
+  with {:ok, tname, rest} <- take_name(tokens) do
+    {alias, rest} = parse_optional_alias(rest)
+    parse_joins(rest, [%{tname: tname, alias: alias}], nil)
+  else
+    _ -> :error
+  end
+end
+
+defp parse_optional_alias([{:id, a} | rest]) do
+  # Check it's not a keyword that would follow
+  # In C: if ID and not on/where/order/inner/join
+  {a, rest}
+end
+defp parse_optional_alias(rest), do: {nil, rest}
+```
+
+Wait, but in the C code, the alias check is: `if (P->t[P->i].kind==TK_ID && !p_peek_kw(P,"on") && ...)`. So it only takes an alias if the next token is TK_ID (not TK_KW). In my lexer, keywords are :kw and identifiers are :id. So an alias would only be :id. But what if someone uses a keyword as an alias? The C code wouldn't accept it. Let me match that: only :id tokens can be aliases.
+
+```elixir
+defp parse_optional_alias([{:id, a} | rest]), do: {a, rest}
+defp parse_optional_alias(rest), do: {nil, rest}
+```
+
+For `parse_joins`:
+```elixir
+defp parse_joins([{:kw, "inner"}, {:kw, "join"} | rest], tables, join_on) do
+  do_join(rest, tables, join_on)
+end
+defp parse_joins([{:kw, "join"} | rest], tables, join_on) do
+  do_join(rest, tables, join_on)
+end
+defp parse_joins(rest, tables, join_on), do: {:ok, tables, join_on, rest}
+
+defp do_join(rest, tables, join_on) do
+  with {:ok, tname, rest} <- take_name(rest) do
+    {alias, rest} = parse_optional_alias(rest)
+    table = %{tname: tname, alias: alias}
+    {join_on, rest} = case rest do
+      [{:kw, "on"} | rest2] ->
+        case parse_expr(rest2) do
+          {:ok, expr, rest3} ->
+            new_on = if join_on, do: {:binop, "AND", join_on, expr}, else: expr
+            {new_on, rest3}
+          :error -> {join_on, rest}
+        end
+      _ -> {join_on, rest}
+    end
+    parse_joins(rest, tables ++ [table], join_on)
+  else
+    _ -> :error
+  end
+end
+```
+
+For `parse_optional_where`:
+```elixir
+defp parse_optional_where([{:kw, "where"} | rest]) do
+  case parse_expr(rest) do
+    {:ok, expr, rest2} -> {:ok, expr, rest2}
+    :error -> :error
+  end
+end
+defp parse_optional_where(rest), do: {:ok, nil, rest}
+```
+
+For `parse_optional_order`:
+```elixir
+defp parse_optional_order([{:kw, "order"}, {:kw, "by"} | rest]) do
+  with {:ok, col, rest} <- take_name(rest) do
+    {desc, rest} = case rest do
+      [{:kw, "desc"} | rest2] -> {true, rest2}
+      [{:kw, "asc"} | rest2] -> {false, rest2}
+      _ -> {false, rest}
+    end
+    {:ok, col, desc, rest}
+  else
+    _ -> :error
+  end
+end
+defp parse_optional_order(rest), do: {:ok, nil, false, rest}
+```
+
+Now for `parse_expr`:
+```elixir
+defp parse_expr(tokens) do
+  with {:ok, left, rest} <- parse_cmp(tokens) do
+    case rest do
+      [{:kw, "and"} | rest2] ->
+        case parse_expr(rest2) do
+          {:ok, right, rest3} -> {:ok, {:binop, "AND", left, right}, rest3}
+          :error -> :error
+        end
+      [{:kw, "or"} | rest2] ->
+        case parse_expr(rest2) do
+          {:ok, right, rest3} -> {:ok, {:binop, "OR", left, right}, rest3}
+          :error -> :error
+        end
+      _ -> {:ok, left, rest}
+    end
+  else
+    _ -> :error
+  end
+end
+```
+
+For `parse_cmp`:
+```elixir
+defp parse_cmp(tokens) do
+  with {:ok, left, rest} <- parse_primary(tokens) do
+    case rest do
+      [{:op, op} | rest2] ->
+        case parse_primary(rest2) do
+          {:ok, right, rest3} -> {:ok, {:binop, op, left, right}, rest3}
+          :error -> :error
+        end
+      _ -> {:ok, left, rest}
+    end
+  else
+    _ -> :error
+  end
+end
+```
+
+For `parse_primary`:
+```elixir
+defp parse_primary([{:int, s} | rest]), do: {:ok, {:int, String.to_integer(s)}, rest}
+defp parse_primary([{:string, s} | rest]), do: {:ok, {:str, s}, rest}
+defp parse_primary([{:lp, _} | rest]) do
+  with {:ok, expr, rest} <- parse_expr(rest) do
+    case rest do
+      [{:rp, _} | rest2] -> {:ok, expr, rest2}
+      _ -> {:ok, expr, rest}  # C code: p_accept(P,TK_RP,NULL) - doesn't fail if missing
+    end
+  else
+    _ -> :error
+  end
+end
+defp parse_primary(tokens) do
+  with {:ok, name, rest} <- take_name(tokens) do
+    case rest do
+      [{:dot, _} | rest2] ->
+        with {:ok, name2, rest3} <- take_name(rest2) do
+          {:ok, {:col, name <> "." <> name2}, rest3}
+        else
+          _ -> :error
+        end
+      _ -> {:ok, {:col, name}, rest}
+    end
+  else
+    _ -> :error
+  end
+end
+```
+
+Now for the executor.
+
+The DB state: `%{schema: %{}, errmsg: ""}`
+Schema: map from lowercase table name to `%{name: name, cols: [col_names], rows: [rows]}`
+Each row is a list of values (nil, integer, or string).
+
+For `exec`:
+```elixir
+def exec(db, sql, callback) do
+  tokens = lex(sql)
+  exec_tokens(db, tokens, callback)
+end
+
+defp exec_tokens(db, [{:eof, _} | _], _callback), do: {0, db}
+defp exec_tokens(db, tokens, callback) do
+  case parse_stmt(tokens) do
+    {:ok, stmt, rest} ->
+      {rc, db} = exec_stmt(db, stmt, callback)
+      if rc != 0 do
+        {rc, db}
+      else
+        exec_tokens(db, rest, callback)
+      end
+    :error ->
+      {1, %{db | errmsg: "parse error"}}
+  end
+end
+```
+
+Wait, but the C code uses a mutable db. In Elixir, I need to thread the db state through. Let me return `{rc, db}` from exec.
+
+Actually, looking at the API more carefully, the C API has `sqlite3*` as a pointer, so it's mutable. In Elixir, I'll need to either use a process (Agent) or return the updated db. Let me use an Agent or just pass/return the db. For faithfulness and simplicity, let me use a process-based approach with Agent or just use ETS. Actually, let me use a simple Agent to hold the db state, which makes the API closer to the C version.
+
+Hmm, but that adds complexity. Let me think about what's most idiomatic while preserving behavior.
+
+Actually, for the prepared statement API (prepare/step/finalize), I need shared mutable state between calls. Using a process makes sense. Let me use Agent for the db and for prepared statements.
+
+Wait, but the callback in exec needs to be called for each row. With Agent, I can do this.
+
+Let me reconsider. The simplest approach that preserves behavior:
+
+1. `open/1` returns `{:ok, pid}` where pid is an Agent holding the db state
+2. `exec/3` takes the pid, sql, and callback, executes statements, calls callback for each SELECT row
+3. `prepare_v2/2` takes the pid and sql, returns `{:ok, stmt_pid}` where stmt_pid is an Agent holding the stmt state
+4. `step/1` takes the stmt_pid, executes one step, returns 100 or 101
+5. `column_count/1`, `column_text/2`, `column_int64/2` read from the stmt_pid
+6. `finalize/1` stops the stmt_pid
+7. `close/1` stops the db pid
+8. `errmsg/1` reads from the db pid
+
+This is actually quite clean and matches the C API's pointer-based approach.
+
+Let me implement this.
+
+```elixir
+defmodule Sqlite3 do
+  @keywords ~w(create table insert into values select from where order by asc desc and or not null begin commit inner join on int integer text primary key transaction)
+  
+  def open(_name) do
+    {:ok, Agent.start_link(fn -> %{schema: %{}, errmsg: ""} end)}
+  end
+  
+  def close(pid) do
+    Agent.stop(pid)
+    0
+  end
+  
+  def errmsg(pid) do
+    Agent.get(pid, & &1.errmsg)
+  end
+  
+  def exec(pid, sql, callback \\ nil) do
+    tokens = lex(sql)
+    {rc, db} = exec_tokens(Agent.get(pid, & &1), tokens, callback)
+    Agent.update(pid, fn _ -> db end)
+    rc
+  end
+  
+  # ... etc
+end
+```
+
+Actually, for exec with callback, I need to handle the callback being called during execution. Since I'm using Agent.get to get the state and then working with it locally, I can call the callback during processing and then update the state at the end. That works.
+
+But wait, for SELECT in exec, the C code creates a prepared statement, steps through it, calls the callback for each row, then frees it. I can do the same: collect matching rows, call callback for each.
+
+Let me restructure. The exec function gets the db state, processes all statements, calling callbacks as needed, and returns the updated state.
+
+For prepare_v2, I need to create a stmt that holds a reference to the db. Since the db is an Agent, I can store the pid in the stmt.
+
+```elixir
+def prepare_v2(db_pid, sql) do
+  db = Agent.get(db_pid, & &1)
+  tokens = lex(sql)
+  case parse_stmt(tokens) do
+    {:ok, ast, _rest} ->
+      stmt = %{db_pid: db_pid, ast: ast, sorted: [], cur: 0, outrow: [], nout: 0, started: false}
+      {:ok, Agent.start_link(fn -> stmt end)}
+    :error ->
+      {:error, "parse error"}
+  end
+end
+```
+
+For step:
+```elixir
+def step(stmt_pid) do
+  Agent.get_and_update(stmt_pid, fn stmt ->
+    if stmt.ast.type == :select do
+      step_select(stmt)
+    else
+      {101, stmt}
+    end
+  end)
+end
+```
+
+For `step_select`:
+```elixir
+defp step_select(stmt) do
+  stmt = if not stmt.started do
+    db = Agent.get(stmt.db_pid, & &1)
+    sorted = collect_matching(db, stmt.ast)
+    %{stmt | started: true, sorted: sorted}
+  else
+    stmt
+  end
+  
+  if stmt.cur >= length(stmt.sorted) do
+    {101, stmt}
+  else
+    row = Enum.at(stmt.sorted, stmt.cur)
+    db = Agent.get(stmt.db_pid, & &1)
+    {outrow, nout} = build_output_row(db, stmt.ast, row)
+    {100, %{stmt | cur: stmt.cur + 1, outrow: outrow, nout: nout}}
+  end
+end
+```
+
+Hmm, this is getting complex with the Agent calls inside. Let me simplify by getting the db state once.
+
+Actually, let me reconsider the architecture. Instead of using Agents, let me use a simpler approach where the db and stmt are just maps, and functions return updated maps. The caller is responsible for threading the state. This is more functional and idiomatic for Elixir.
+
+But the C API is imperative (prepare returns a handle, step is called multiple times on the handle). To match this, I need some form of mutable state. Agent is the cleanest way.
+
+Let me go with Agent but try to minimize the complexity.
+
+Actually, let me use a different approach: use ETS or just use process dictionaries. No, let me stick with Agent but be smart about it.
+
+For `step`, I can get the db state inside the agent update:
+
+```elixir
+def step(stmt_pid) do
+  stmt = Agent.get(stmt_pid, & &1)
+  if stmt.ast.type == :select do
+    stmt = if not stmt.started do
+      db = Agent.get(stmt.db_pid, & &1)
+      sorted = collect_matching(db, stmt.ast)
+      %{stmt | started: true, sorted: sorted}
+    else
+      stmt
+    end
+    
+    if stmt.cur >= length(stmt.sorted) do
+      Agent.update(stmt_pid, fn _ -> %{stmt | outrow: [], nout: 0} end)
+      101
+    else
+      row = Enum.at(stmt.sorted, stmt.cur)
+      db = Agent.get(stmt.db_pid, & &1)
+      {outrow, nout} = build_output_row(db, stmt.ast, row)
+      Agent.update(stmt_pid, fn _ -> %{stmt | cur: stmt.cur + 1, outrow: outrow, nout: nout} end)
+      100
+    end
+  else
+    101
+  end
+end
+```
+
+OK this works. Let me now write the full implementation.
+
+For `collect_matching`, I need to implement the nested loop join:
+
+```elixir
+defp collect_matching(db, ast) do
+  tables = ast.tables
+  n = length(tables)
+  
+  # Get table info and rows
+  table_infos = Enum.map(tables, fn t ->
+    case Map.get(db.schema, String.downcase(t.tname)) do
+      nil -> %{cols: [], rows: []}
+      info -> info
+    end
+  end)
+  
+  # Generate all combinations using nested loops
+  all_rows = Enum.map(table_infos, & &1.rows)
+  
+  # Cartesian product with filter
+  combos = cartesian(all_rows)
+  
+  # Filter by WHERE and JOIN ON
+  matching = Enum.filter(combos, fn rows ->
+    ctx = make_ctx(tables, table_infos, rows)
+    row_match(ast.where, ctx) and (ast.join_on == nil or row_match(ast.join_on, ctx))
+  end)
+  
+  # Combine rows
+  combined = Enum.map(matching, &List.flatten/1)
+  
+  # ORDER BY
+  sorted = if ast.order_col do
+    sort_rows(combined, table_infos, ast.order_col, ast.order_desc)
+  else
+    combined
+  end
+  
+  sorted
+end
+```
+
+Wait, I need to be careful. The C code combines rows by concatenating all table rows. Let me match that.
+
+For the context (RowCtx), I need:
+- table refs (with aliases)
+- table schemas (cols)
+- current rows
+
+```elixir
+defp make_ctx(tables, table_infos, rows) do
+  %{tables: tables, infos: table_infos, rows: rows}
+end
+```
+
+For `rowctx_colindex`:
+```elixir
+defp colindex(ctx, col) do
+  if String.contains?(col, ".") do
+    [tname, cname] = String.split(col, ".", parts: 2)
+    Enum.find_value(0..(length(ctx.tables)-1), fn i ->
+      tn = ctx.tables[i].alias || ctx.tables[i].tname
+      if String.downcase(tn) == String.downcase(tname) do
+        ci = col_index_in_table(ctx.infos[i], cname)
+        if ci >= 0, do: {i, ci}, else: nil
+      else
+        nil
+      end
+    end)
+  else
+    Enum.find_value(0..(length(ctx.tables)-1), fn i ->
+      ci = col_index_in_table(ctx.infos[i], col)
+      if ci >= 0, do: {i, ci}, else: nil
+    end)
+  end
+end
+
+defp col_index_in_table(info, col) do
+  Enum.find_index(info.cols, fn c -> String.downcase(c) == String.downcase(col) end) || -1
+end
+```
+
+For `eval_expr`:
+```elixir
+defp eval_expr(nil, _ctx), do: nil
+defp eval_expr({:int, v}, _ctx), do: v
+defp eval_expr({:str, v}, _ctx), do: v
+defp eval_expr({:col, name}, ctx) do
+  case colindex(ctx, name) do
+    {ti, ci} -> Enum.at(ctx.rows[ti], ci)
+    nil -> nil
+  end
+end
+defp eval_expr({:binop, op, l, r}, ctx) do
+  a = eval_expr(l, ctx)
+  b = eval_expr(r, ctx)
+  case String.downcase(op) do
+    "and" -> if truthy?(a) and truthy?(b), do: 1, else: 0
+    "or" -> if truthy?(a) or truthy?(b), do: 1, else: 0
+    "=" -> if v_cmp(a, b) == 0, do: 1, else: 0
+    "<>" -> if v_cmp(a, b) != 0, do: 1, else: 0
+    "<" -> if v_cmp(a, b) < 0, do: 1, else: 0
+    ">" -> if v_cmp(a, b) > 0, do: 1, else: 0
+    "<=" -> if v_cmp(a, b) <= 0, do: 1, else: 0
+    ">=" -> if v_cmp(a, b) >= 0, do: 1, else: 0
+    "!=" -> if v_cmp(a, b) != 0, do: 1, else: 0
+    _ -> nil
+  end
+end
+```
+
+Wait, the C code doesn't handle `!=` in the comparison logic. Let me check:
+```c
+if (!strcmp(e->op,"=")) res=v_int(cmp==0);
+else if (!strcmp(e->op,"<>")) res=v_int(cmp!=0);
+else if (!strcmp(e->op,"<")) res=v_int(cmp<0);
+else if (!strcmp(e->op,">")) res=v_int(cmp>0);
+else if (!strcmp(e->op,"<=")) res=v_int(cmp<=0);
+else if (!strcmp(e->op,">=")) res=v_int(cmp>=0);
+```
+
+No `!=` handling. So `!=` would fall through and result would be v_null(). But `!=` is tokenized as an operator. Let me match the C behavior and not handle `!=`.
+
+Actually, `!=` is lexed as an OP token, but in the eval, it's not handled, so the result is v_null(). Let me match that.
+
+```elixir
+defp eval_expr({:binop, op, l, r}, ctx) do
+  a = eval_expr(l, ctx)
+  b = eval_expr(r, ctx)
+  case op do
+    "AND" -> if truthy?(a) and truthy?(b), do: 1, else: 0
+    "OR" -> if truthy?(a) or truthy?(b), do: 1, else: 0
+    "=" -> if v_cmp(a, b) == 0, do: 1, else: 0
+    "<>" -> if v_cmp(a, b) != 0, do: 1, else: 0
+    "<" -> if v_cmp(a, b) < 0, do: 1, else: 0
+    ">" -> if v_cmp(a, b) > 0, do: 1, else: 0
+    "<=" -> if v_cmp(a, b) <= 0, do: 1, else: 0
+    ">=" -> if v_cmp(a, b) >= 0, do: 1, else: 0
+    _ -> nil
+  end
+end
+```
+
+Wait, the C code uses `strcasecmp` for AND/OR, so case-insensitive. But for the comparison operators, it uses `strcmp`, so case-sensitive. Since the lexer always produces lowercase operators (they come from the source text), and the C code stores them as-is... Actually, the operators are single/double character sequences from the source, so they'll always be `=`, `<>`, `<`, `>`, `<=`, `>=`. The AND/OR come from keywords which are always lowercase in the AST (since the parser copies the text). Wait, no - the parser copies the text as-is from the source. So if someone writes `AND` in uppercase, the op would be `AND`. The C code uses `strcasecmp` for AND/OR, so it's case-insensitive. For comparison ops, it uses `strcmp`, so case-sensitive - but these are always lowercase since they're symbols.
+
+In my Elixir code, the AND/OR ops come from the parser which uses the keyword text. Keywords in my lexer are stored as-is from the source. So I need case-insensitive comparison for AND/OR. Let me use `String.downcase(op)` for AND/OR and exact match for the rest. Actually, let me just use String.downcase for all of them since the symbol operators are already lowercase.
+
+Wait, but the C code uses `strcmp` (case-sensitive) for `=`, `<>`, etc. These are always lowercase since they're symbols. And `strcasecmp` for AND/OR. So I should use case-insensitive for AND/OR and case-sensitive for the rest. But since the symbols are always lowercase, it doesn't matter. Let me just use String.downcase for everything to be safe.
+
+Actually, looking at my parser, I store "AND" and "OR" in uppercase in the AST:
+```elixir
+{:ok, {:binop, "AND", left, right}, rest3}
+{:ok, {:binop, "OR", left, right}, rest3}
+```
+
+And the comparison operators are stored as-is from the lexer, which are always lowercase symbols. So I can just match directly:
+
+```elixir
+case op do
+  "AND" -> ...
+  "OR" -> ...
+  "=" -> ...
+  ...
+end
+```
+
+But wait, what if someone writes `and` in lowercase? The lexer would produce `{:kw, "and"}`, and the parser would create `{:binop, "AND", ...}`. So the op is always "AND" regardless of case. Good.
+
+For `v_cmp`:
+```elixir
+defp v_cmp(nil, nil), do: 0
+defp v_cmp(nil, _), do: -1
+defp v_cmp(_, nil), do: 1
+defp v_cmp(a, b) when is_integer(a) and is_integer(b) do
+  cond do
+    a < b -> -1
+    a > b -> 1
+    true -> 0
+  end
+end
+defp v_cmp(a, b) when is_binary(a) and is_binary(b) do
+  cond do
+    a < b -> -1
+    a > b -> 1
+    true -> 0
+  end
+end
+defp v_cmp(a, b) when is_integer(a) and is_binary(b), do: -1  # V_INT < V_TEXT
+defp v_cmp(a, b) when is_binary(a) and is_integer(b), do: 1
+```
+
+For `truthy?`:
+```elixir
+defp truthy?(v), do: v_cmp(v, 0) != 0
+```
+
+For `row_match`:
+```elixir
+defp row_match(nil, _ctx), do: true
+defp row_match(expr, ctx), do: truthy?(eval_expr(expr, ctx))
+```
+
+For `cartesian`:
+```elixir
+defp cartesian([]), do: [[]]
+defp cartesian([h | t]) do
+  for item <- h, rest <- cartesian(t), do: [item | rest]
+end
+```
+
+For `sort_rows` (ORDER BY):
+The C code only handles single-table ORDER BY. Let me match that.
+
+```elixir
+defp sort_rows(rows, table_infos, order_col, desc) do
+  if length(table_infos) == 1 do
+    cidx = col_index_in_table(hd(table_infos), order_col)
+    if cidx >= 0 do
+      Enum.sort(rows, fn a, b ->
+        cmp = v_cmp(Enum.at(a, cidx), Enum.at(b, cidx))
+        if desc, do: cmp > 0, else: cmp < 0
+      end)
+    else
+      rows
+    end
+  else
+    rows
+  end
+end
+```
+
+Wait, the C code uses insertion sort, which is stable. `Enum.sort` in Elixir is also stable. But the comparison function needs to return true if a should come before b. For ascending, a before b if cmp < 0. For descending, a before b if cmp > 0. That's what I have.
+
+For `build_output_row`:
+```elixir
+defp build_output_row(db, ast, row) do
+  tables = ast.tables
+  infos = Enum.map(tables, fn t ->
+    Map.get(db.schema, String.downcase(t.tname), %{cols: [], rows: []})
+  end)
+  
+  # Compute offsets
+  offsets = compute_offsets(infos)
+  
+  if ast.star do
+    outrow = Enum.flat_map(0..(length(tables)-1), fn i ->
+      Enum.map(0..(length(infos[i].cols)-1), fn j -> Enum.at(row, offsets[i] + j) end)
+    end)
+    {outrow, length(outrow)}
+  else
+    outrow = Enum.flat_map(ast.cols, fn rc ->
+      if rc.star do
+        Enum.flat_map(0..(length(tables)-1), fn i ->
+          Enum.map(0..(length(infos[i].cols)-1), fn j -> Enum.at(row, offsets[i] + j) end)
+        end)
+      else
+        {ti, ci} = resolve_col(tables, infos, rc.col) || {-1, -1}
+        if ti >= 0, do: [Enum.at(row, offsets[ti] + ci)], else: [nil]
+      end
+    end)
+    {outrow, length(outrow)}
+  end
+end
+
+defp compute_offsets(infos) do
+  {offsets, _} = Enum.reduce(infos, {[], 0}, fn info, {acc, off} ->
+    {acc ++ [off], off + length(info.cols)}
+  end)
+  offsets
+end
+
+defp resolve_col(tables, infos, col) do
+  if String.contains?(col, ".") do
+    [tname, cname] = String.split(col, ".", parts: 2)
+    Enum.find_value(0..(length(tables)-1), fn i ->
+      tn = tables[i].alias || tables[i].tname
+      if String.downcase(tn) == String.downcase(tname) do
+        ci = col_index_in_table(infos[i], cname)
+        if ci >= 0, do: {i, ci}, else: nil
+      else
+        nil
+      end
+    end)
+  else
+    Enum.find_value(0..(length(tables)-1), fn i ->
+      ci = col_index_in_table(infos[i], col)
+      if ci >= 0, do: {i, ci}, else: nil
+    end)
+  end
+end
+```
+
+For `column_text`:
+```elixir
+def column_text(stmt_pid, i) do
+  stmt = Agent.get(stmt_pid, & &1)
+  if i < 0 or i >= stmt.nout, do: nil, else: v_to_text(Enum.at(stmt.outrow, i))
+end
+
+defp v_to_text(nil), do: "NULL"
+defp v_to_text(v) when is_integer(v), do: Integer.to_string(v)
+defp v_to_text(v) when is_binary(v), do: v
+```
+
+For `column_int64`:
+```elixir
+def column_int64(stmt_pid, i) do
+  stmt = Agent.get(stmt_pid, & &1)
+  if i < 0 or i >= stmt.nout, do: 0, else: v_to_int(Enum.at(stmt.outrow, i))
+end
+
+defp v_to_int(nil), do: 0
+defp v_to_int(v) when is_integer(v), do: v
+defp v_to_int(v) when is_binary(v), do: 0
+```
+
+For `column_count`:
+```elixir
+def column_count(stmt_pid) do
+  Agent.get(stmt_pid, & &1.nout)
+end
+```
+
+For `finalize`:
+```elixir
+def finalize(stmt_pid) do
+  Agent.stop(stmt_pid)
+  0
+end
+```
+
+Now for the exec function with callback:
+```elixir
+def exec(pid, sql, callback \\ nil) do
+  tokens = lex(sql)
+  db = Agent.get(pid, & &1)
+  {rc, db} = exec_tokens(db, tokens, callback)
+  Agent.update(pid, fn _ -> db end)
+  rc
+end
+
+defp exec_tokens(db, [{:eof, _} | _], _callback), do: {0, db}
+defp exec_tokens(db, tokens, callback) do
+  case parse_stmt(tokens) do
+    {:ok, stmt, rest} ->
+      {rc, db} = exec_stmt(db, stmt, callback)
+      if rc != 0 do
+        {rc, db}
+      else
+        exec_tokens(db, rest, callback)
+      end
+    :error ->
+      {1, %{db | errmsg: "parse error"}}
+  end
+end
+
+defp exec_stmt(db, %{type: :begin}, _callback), do: {0, db}
+defp exec_stmt(db, %{type: :commit}, _callback), do: {0, db}
+defp exec_stmt(db, %{type: :create, name: name, cols: cols}, _callback) do
+  key = String.downcase(name)
+  if Map.has_key?(db.schema, key) do
+    {-1, %{db | errmsg: "table already exists: #{name}"}}
+  else
+    {0, %{db | schema: Map.put(db.schema, key, %{name: name, cols: cols, rows: []})}}
+  end
+end
+defp exec_stmt(db, %{type: :insert, table: table, vals: vals}, _callback) do
+  key = String.downcase(table)
+  case Map.get(db.schema, key) do
+    nil -> {-1, %{db | errmsg: "no such table: #{table}"}}
+    info -> {0, %{db | schema: Map.put(db.schema, key, %{info | rows: info.rows ++ [vals]})}}
+  end
+end
+defp exec_stmt(db, %{type: :select} = ast, callback) do
+  sorted = collect_matching(db, ast)
+  if callback do
+    Enum.each(sorted, fn row ->
+      {outrow, nout} = build_output_row(db, ast, row)
+      vals = Enum.map(outrow, &v_to_text/1)
+      callback.(nout, vals)
+    end)
+  end
+  {0, db}
+end
+```
+
+Wait, the C exec callback signature is `void (*cb)(void*,int,char**,char**)`. The callback receives (arg, n, vals, cols). In my Elixir version, I'll call `callback.(nout, vals)` or include more args. Let me match the C demo's `print_row` which uses `(void *arg, int n, char **vals, char **cols)` and only uses n and vals. I'll make the callback take `(n, vals)`.
+
+Now let me also handle the `exec` return value. The C code returns rc (0 for success, 1 for parse error, -1 for exec error). Let me match that.
+
+Wait, looking at the C code more carefully:
+```c
+int sqlite3_exec(sqlite3 *db, const char *sql, ...) {
+    ...
+    while (P.t[P.i].kind!=TK_EOF){
+        Stmt st;
+        if (parse(&P,&st)<0){ if(err)*err=strdup("parse error"); rc=1; break; }
+        if (st.is_begin){ db->in_txn=1; }
+        else if (st.is_commit){ db->in_txn=0; }
+        else if (st.is_create){ rc=db_exec_create(db,&st); }
+        else if (st.is_insert){ rc=db_exec_insert(db,&st); }
+        else if (st.is_select){ ... }
+        free_stmt(&st);
+        if (rc) break;  // Wait, there's no explicit break here...
+    }
+    ...
+    return rc;
+}
+```
+
+Actually, looking again, there's no `if (rc) break;` in the C code. It continues even after an error. Wait, let me re-read:
+
+```c
+while (P.t[P.i].kind!=TK_EOF){
+    Stmt st;
+    if (parse(&P,&st)<0){ if(err)*err=strdup("parse error"); rc=1; break; }
+    if (st.is_begin){ db->in_txn=1; }
+    else if (st.is_commit){ db->in_txn=0; }
+    else if (st.is_create){ rc=db_exec_create(db,&st); }
+    else if (st.is_insert){ rc=db_exec_insert(db,&st); }
+    else if (st.is_select){
+        ...
+        (void)arg;
+    }
+    free_stmt(&st);
+}
+```
+
+There's no break after rc is set from create/insert. So it continues to the next statement. But if parse fails, it breaks. Let me match this: only break on parse error, continue on exec errors.
+
+Actually wait, but if create fails (rc=-1), the next iteration will try to parse the next statement. If it succeeds, rc will be overwritten. Hmm, that seems like a bug in the C code, but let me match it.
+
+Actually, looking more carefully, after `db_exec_create` returns -1, rc is -1. Then the loop continues. If the next statement is an INSERT that succeeds, rc becomes 0. So the error is "forgotten". That's the C behavior. Let me match it.
+
+Wait, but actually `db_exec_insert` returns 0 on success, so rc would be reset to 0. And `db_exec_create` returns -1 on failure. So the final rc depends on the last statement that sets rc. For SELECT, rc is not set (remains whatever it was). Let me trace through the demo:
+
+1. CREATE TABLE users -> rc = 0
+2. INSERT INTO users VALUES (1, 'ada') -> rc = 0
+3. INSERT INTO users VALUES (2, 'grace') -> rc = 0
+4. INSERT INTO users VALUES (3, 'linus') -> rc = 0
+5. SELECT * FROM users WHERE id > 1 ORDER BY id DESC -> rc unchanged (0)
+
+So rc = 0. Good.
+
+Let me match this behavior: don't break on exec errors, only on parse errors.
+
+```elixir
+defp exec_tokens(db, [{:eof, _} | _], _callback), do: {0, db}
+defp exec_tokens(db, tokens, callback) do
+  case parse_stmt(tokens) do
+    {:ok, stmt, rest} ->
+      {rc, db} = exec_stmt(db, stmt, callback)
+      exec_tokens_with_rc(rc, db, rest, callback)
+    :error ->
+      {1, %{db | errmsg: "parse error"}}
+  end
+end
+
+defp exec_tokens_with_rc(_rc, db, rest, callback) do
+  # Continue regardless of rc (matching C behavior)
+  {final_rc, final_db} = exec_tokens(db, rest, callback)
+  # But we need to preserve the parse error rc... 
+  # Actually, the C code just continues and rc gets overwritten by the next statement
+  {final_rc, final_db}
+end
+```
+
+Hmm, but this loses the rc from the current statement. In the C code, rc is a local variable that gets overwritten by each statement. So if create fails (rc=-1) and the next statement is a select (rc unchanged), the final rc is -1. But if the next statement is an insert (rc=0), the final rc is 0.
+
+Let me simplify: just thread rc through like the C code does:
+
+```elixir
+defp exec_tokens(db, [{:eof, _} | _], _callback), do: {0, db}
+defp exec_tokens(db, tokens, callback) do
+  case parse_stmt(tokens) do
+    {:ok, stmt, rest} ->
+      {rc, db} = exec_stmt(db, stmt, callback)
+      {final_rc, final_db} = exec_tokens(db, rest, callback)
+      # The C code overwrites rc with each statement, so the last rc wins
+      # But if the last statement is SELECT, rc is not overwritten
+      # Actually, in the C code, rc is set by create/insert, and not by select
+      # So rc persists from the last create/insert
+      # But in my code, exec_stmt always returns rc
+      # For SELECT, I return {0, db}, which overwrites any previous error
+      # That matches the C behavior where SELECT doesn't change rc
+      # Wait, no - in C, SELECT doesn't set rc, so rc keeps its previous value
+      # In my code, SELECT returns {0, db}, which would overwrite a previous -1
+      # That's different!
+      {final_rc, final_db}
+    :error ->
+      {1, %{db | errmsg: "parse error"}}
+  end
+end
+```
+
+Hmm, this is getting complicated. Let me think about this differently. In the C code:
+- rc starts at 0
+- Each statement may or may not set rc
+- CREATE sets rc to 0 or -1
+- INSERT sets rc to 0 or -1
+- SELECT doesn't set rc (it stays whatever it was)
+- BEGIN/COMMIT don't set rc
+
+So the final rc is the rc from the last CREATE or INSERT (or 0 if none failed).
+
+In my Elixir code, I need to track this. Let me have exec_stmt return `{:ok, db}` or `{:error, db}` for CREATE/INSERT, and `{:noop, db}` for SELECT/BEGIN/COMMIT (meaning rc unchanged).
+
+Actually, let me just match the C behavior more directly:
+
+```elixir
+defp exec_tokens(db, [{:eof, _} | _], _callback), do: {0, db}
+defp exec_tokens(db, tokens, callback) do
+  case parse_stmt(tokens) do
+    {:ok, stmt, rest} ->
+      {rc, db} = exec_stmt(db, stmt, callback)
+      {final_rc, final_db} = exec_tokens(db, rest, callback)
+      # If this statement set rc (create/insert), use it; otherwise use final_rc
+      # But actually, the C code just overwrites rc each time for create/insert
+      # and doesn't touch it for select/begin/commit
+      # So the last create/insert rc wins, or 0 if no create/insert after it
+      {rc_or_final, _} = case stmt.type do
+        :create -> {rc, db}
+        :insert -> {rc, db}
+        _ -> {final_rc, final_db}
+      end
+      # Hmm, this is still not right...
+  end
+end
+```
+
+Actually, I'm overcomplicating this. Let me just track rc like the C code does:
+
+```elixir
+defp exec_tokens(db, tokens, callback, rc) do
+  case tokens do
+    [{:eof, _} | _] -> {rc, db}
+    _ ->
+      case parse_stmt(tokens) do
+        {:ok, stmt, rest} ->
+          {new_rc, db} = exec_stmt_rc(db, stmt, callback, rc)
+          exec_tokens(db, rest, callback, new_rc)
+        :error ->
+          {1, %{db | errmsg: "parse error"}}
+      end
+  end
+end
+
+defp exec_stmt_rc(db, %{type: :begin}, _callback, rc), do: {rc, db}
+defp exec_stmt_rc(db, %{type: :commit}, _callback, rc), do: {rc, db}
+defp exec_stmt_rc(db, %{type: :create, name: name, cols: cols}, _callback, _rc) do
+  key = String.downcase(name)
+  if Map.has_key?(db.schema, key) do
+    {-1, %{db | errmsg: "table already exists: #{name}"}}
+  else
+    {0, %{db | schema: Map.put(db.schema, key, %{name: name, cols: cols, rows: []})}}
+  end
+end
+defp exec_stmt_rc(db, %{type: :insert, table: table, vals: vals}, _callback, _rc) do
+  key = String.downcase(table)
+  case Map.get(db.schema, key) do
+    nil -> {-1, %{db | errmsg: "no such table: #{table}"}}
+    info -> {0, %{db | schema: Map.put(db.schema, key, %{info | rows: info.rows ++ [vals]})}}
+  end
+end
+defp exec_stmt_rc(db, %{type: :select} = ast, callback, rc) do
+  sorted = collect_matching(db, ast)
+  if callback do

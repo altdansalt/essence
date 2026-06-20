@@ -1,0 +1,9 @@
+```json
+{
+  "completeness": 24,
+  "api_surface": 15,
+  "sql_features": 35,
+  "architecture": 20,
+  "notes": "Port is severely incomplete. Only partial lexer/parser stubs present; entirely missing: executor logic, table storage, row iteration, expression evaluation, ORDER BY sorting, JOIN implementation, statement stepping, and all public API functions. The single visible function (exec_tokens) is a skeleton with unfinished control flow."
+}
+```

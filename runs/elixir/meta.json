@@ -1,0 +1,40 @@
+{
+  "language": "Elixir",
+  "slug": "elixir",
+  "timestamp_utc": "2026-06-20T17:49:49Z",
+  "elapsed_seconds": 405.1,
+  "porter_finish_reason": "length",
+  "original_tokens": 8805,
+  "ported_tokens": 221,
+  "token_ratio": 0.0251,
+  "reduction_factor": 39.84,
+  "porter_model": "accounts/fireworks/models/glm-5p2",
+  "judge_model": "claude-haiku-4-5",
+  "porter_usage": {
+    "prompt_tokens": 12938,
+    "total_tokens": 28938,
+    "completion_tokens": 16000,
+    "prompt_tokens_details": {
+      "cached_tokens": 177
+    }
+  },
+  "judge_usage": {
+    "input_tokens": 12003,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "cache_creation": {
+      "ephemeral_5m_input_tokens": 0,
+      "ephemeral_1h_input_tokens": 0
+    },
+    "output_tokens": 119,
+    "service_tier": "standard",
+    "inference_geo": "not_available"
+  },
+  "judge_score": {
+    "completeness": 24,
+    "api_surface": 15,
+    "sql_features": 35,
+    "architecture": 20,
+    "notes": "Port is severely incomplete. Only partial lexer/parser stubs present; entirely missing: executor logic, table storage, row iteration, expression evaluation, ORDER BY sorting, JOIN implementation, statement stepping, and all public API functions. The single visible function (exec_tokens) is a skeleton with unfinished control flow."
+  }
+}

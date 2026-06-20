@@ -1,3 +1,5 @@
 [2026-06-20T17:43:02Z] loop start: 1 languages, orig_tokens=8805
 [2026-06-20T17:43:02Z]   >>> porting elixir (Elixir)
 [2026-06-20T17:45:52Z]       porter length-capped (16000 tok); retry high effort
+[2026-06-20T17:49:47Z]       porter done: 750 bytes, 221 tokens, 405.1s
+[2026-06-20T17:49:49Z]       judge: completeness=24 notes=Port is severely incomplete. Only partial lexer/parser stubs present; entirely m
