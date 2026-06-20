@@ -1,9 +1,0 @@
-```json
-{
-  "completeness": 2,
-  "api_surface": 5,
-  "sql_features": 0,
-  "architecture": 0,
-  "notes": "The port submission contains only a single line of C code fragment, not a meaningful F# implementation. No SQL parser, executor, schema management, or API functions are present."
-}
-```

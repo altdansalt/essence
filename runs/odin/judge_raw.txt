@@ -1,9 +1,0 @@
-```json
-{
-  "completeness": 42,
-  "api_surface": 55,
-  "sql_features": 50,
-  "architecture": 35,
-  "notes": "Port covers core API functions but lacks critical infrastructure: lexer, parser, and executor implementations are missing entirely. Dynamic memory management, expression evaluation, row storage, and join logic are not ported, making the code non-functional despite correct function signatures."
-}
-```
