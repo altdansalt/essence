@@ -3,3 +3,12 @@
 [2026-06-20T17:37:17Z]       porter length-capped (16000 tok); retry high effort
 [2026-06-20T17:39:51Z]       porter done: 478 bytes, 136 tokens, 304.0s
 [2026-06-20T17:39:53Z]       judge: completeness=15 notes=Port is severely incomplete: only two small cleanup procedures shown (free_stmt,
+[main 300024d] port: odin (Odin) completeness=15
+ 7 files changed, 2029 insertions(+)
+ create mode 100644 runs/odin/judge_raw.txt
+ create mode 100644 runs/odin/meta.json
+ create mode 100644 runs/odin/porter_raw.txt
+ create mode 100644 runs/odin/sqlite_core.odin
+To https://github.com/altdansalt/essence.git
+   09b55a0..300024d  main -> main
+[2026-06-20T17:39:54Z] loop done: 1 runs

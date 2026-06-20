@@ -114,3 +114,4 @@ NameError: name 'finish' is not defined
 [2026-06-20T17:38:36Z] loop done: 1 runs
 [2026-06-20T17:39:51Z]       porter done: 478 bytes, 136 tokens, 304.0s
 [2026-06-20T17:39:53Z]       judge: completeness=15 notes=Port is severely incomplete: only two small cleanup procedures shown (free_stmt,
+[2026-06-20T17:39:54Z] loop done: 1 runs
