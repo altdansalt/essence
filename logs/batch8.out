@@ -69,3 +69,14 @@ To https://github.com/altdansalt/essence.git
 [2026-06-20T17:15:42Z]   >>> porting odin (Odin)
 [2026-06-20T17:18:08Z]       porter done: 3438 bytes, 940 tokens, 145.9s
 [2026-06-20T17:18:10Z]       judge: completeness=42 notes=Port covers core API functions but lacks critical infrastructure: lexer, parser,
+[main 9ae955f] port: odin (Odin) completeness=42
+ 6 files changed, 2040 insertions(+)
+ create mode 100644 runs/odin/judge_raw.txt
+ create mode 100644 runs/odin/meta.json
+ create mode 100644 runs/odin/porter_raw.txt
+ create mode 100644 runs/odin/sqlite_core.odin
+To https://github.com/altdansalt/essence.git
+   65d7be3..9ae955f  main -> main
+[2026-06-20T17:18:11Z]   >>> porting rust (Rust)
+[2026-06-20T17:19:16Z]       porter done: 29398 bytes, 6805 tokens, 64.7s
+[2026-06-20T17:19:19Z]       judge: completeness=72 notes=The Rust port successfully translates the core architecture (lexer, parser, exec

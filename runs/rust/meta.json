@@ -1,0 +1,39 @@
+{
+  "language": "Rust",
+  "slug": "rust",
+  "timestamp_utc": "2026-06-20T17:19:19Z",
+  "elapsed_seconds": 64.7,
+  "original_tokens": 8805,
+  "ported_tokens": 6805,
+  "token_ratio": 0.7729,
+  "reduction_factor": 1.29,
+  "porter_model": "accounts/fireworks/models/glm-5p2",
+  "judge_model": "claude-haiku-4-5",
+  "porter_usage": {
+    "prompt_tokens": 12161,
+    "total_tokens": 19077,
+    "completion_tokens": 6916,
+    "prompt_tokens_details": {
+      "cached_tokens": 177
+    }
+  },
+  "judge_usage": {
+    "input_tokens": 20889,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "cache_creation": {
+      "ephemeral_5m_input_tokens": 0,
+      "ephemeral_1h_input_tokens": 0
+    },
+    "output_tokens": 170,
+    "service_tier": "standard",
+    "inference_geo": "not_available"
+  },
+  "judge_score": {
+    "completeness": 72,
+    "api_surface": 65,
+    "sql_features": 75,
+    "architecture": 78,
+    "notes": "The Rust port successfully translates the core architecture (lexer, parser, executor, schema, value system) and covers most SQL features. However, it has significant gaps: sqlite3_prepare_v2 is missing (prepare() exists but differs), sqlite3_close is a no-op, column accessors lack proper bounds checking details, and sqlite3_exec callback signature differs (no column names). The nested-loop join logic is present but ORDER BY sorting only works for single-table SELECT. Demo works but API surface is incomplete for production use."
+  }
+}

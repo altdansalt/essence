@@ -1,0 +1,9 @@
+```json
+{
+  "completeness": 72,
+  "api_surface": 65,
+  "sql_features": 75,
+  "architecture": 78,
+  "notes": "The Rust port successfully translates the core architecture (lexer, parser, executor, schema, value system) and covers most SQL features. However, it has significant gaps: sqlite3_prepare_v2 is missing (prepare() exists but differs), sqlite3_close is a no-op, column accessors lack proper bounds checking details, and sqlite3_exec callback signature differs (no column names). The nested-loop join logic is present but ORDER BY sorting only works for single-table SELECT. Demo works but API surface is incomplete for production use."
+}
+```
