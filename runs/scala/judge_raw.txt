@@ -1,0 +1,9 @@
+```json
+{
+  "completeness": 42,
+  "api_surface": 50,
+  "sql_features": 65,
+  "architecture": 35,
+  "notes": "The Scala port captures core SQL parsing and execution logic but has significant gaps: (1) parseInsert is broken with messy control flow and commented-out attempted fixes; (2) RowCtx.colIndex uses Schema static method incorrectly (Schema not passed); (3) ORDER BY only works for single tables, not joins; (4) no transaction support (inTxn exists but unused); (5) StmtHandle lacks prepared statement lifecycle (no finalization resources); (6) missing error handling for malformed queries during execution; (7) the nested-loop join implementation is present but untested. The lexer and basic AST are solid, but executor is incomplete."
+}
+```

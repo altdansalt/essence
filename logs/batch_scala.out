@@ -1,2 +1,4 @@
 [2026-06-20T17:43:02Z] loop start: 1 languages, orig_tokens=8805
 [2026-06-20T17:43:02Z]   >>> porting scala (Scala)
+[2026-06-20T17:44:27Z]       porter done: 23367 bytes, 6752 tokens, 85.3s
+[2026-06-20T17:44:30Z]       judge: completeness=42 notes=The Scala port captures core SQL parsing and execution logic but has significant
