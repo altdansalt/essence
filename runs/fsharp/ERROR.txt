@@ -1,8 +1,0 @@
-name 'finish' is not defined
-Traceback (most recent call last):
-  File "/home/exedev/essence/tools/loop.py", line 258, in main
-    record_run(lang, code, port_tokens, orig_tokens,
-  File "/home/exedev/essence/tools/loop.py", line 166, in record_run
-    "porter_finish_reason": finish,
-                            ^^^^^^
-NameError: name 'finish' is not defined

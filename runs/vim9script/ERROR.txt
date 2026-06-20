@@ -1,8 +1,0 @@
-name 'finish' is not defined
-Traceback (most recent call last):
-  File "/home/exedev/essence/tools/loop.py", line 258, in main
-    log(f"      judge: completeness={comp} notes={score.get('notes','')[:80]}")
-  File "/home/exedev/essence/tools/loop.py", line 166, in record_run
-    "elapsed_seconds": round(elapsed, 1),
-                            ^^^^^^
-NameError: name 'finish' is not defined
