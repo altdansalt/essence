@@ -1,3 +1,5 @@
 [2026-06-20T17:43:02Z] loop start: 1 languages, orig_tokens=8805
 [2026-06-20T17:43:02Z]   >>> porting erlang (Erlang)
 [2026-06-20T17:46:22Z]       porter length-capped (16000 tok); retry high effort
+[2026-06-20T17:49:20Z]       porter done: 923 bytes, 167 tokens, 378.8s
+[2026-06-20T17:49:23Z]       judge: completeness=8 notes=The Erlang port provides only a single `project/6` function for column projectio

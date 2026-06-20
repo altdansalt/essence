@@ -1,0 +1,1440 @@
+Let me port the C SQLite-style SQL engine to Erlang. I need to implement:
+
+1. Lexer
+2. Parser (recursive descent)
+3. Executor (nested-loop joins, WHERE, ORDER BY, projections)
+4. In-memory table store
+5. Public API: open, exec, prepare_v2, step, finalize, close, column_count, column_text, column_int64, errmsg
+6. Demo main
+
+Let me think about the Erlang module structure. I'll use a module `sqlite3` with functions matching the API. Since Erlang is functional and immutable, I'll represent the database as a state record/map that gets passed around.
+
+Let me think about the data structures:
+- Value: `{null}`, `{int, integer()}`, `{text, string()}`
+- Table: `{table, Name, Cols}` where Cols is a list of column names
+- Schema: list of tables
+- RowStore: list of rows (each row is a list of values)
+- Database: `{db, Schema, Stores, ErrMsg, InTxn}` - Schema is list of {Name, Cols}, Stores is a map from table name to list of rows
+
+For the statement (prepared statement), I'll need to track state for stepping through results.
+
+Let me write this out.
+
+For the API, since Erlang doesn't have mutable state, I'll return updated state from each call. The `exec` function will take a callback (a fun).
+
+Let me structure this:
+
+```erlang
+-module(sqlite3).
+-export([open/0, exec/3, prepare_v2/2, step/1, finalize/1, close/1,
+         column_count/1, column_text/2, column_int64/2, errmsg/1, main/0]).
+```
+
+Let me think about the types:
+
+- DB state: `#{tables => #{TableName => {Cols, Rows}}, errmsg => string()}`
+  - TableName is a lowercase atom or string? Let me use strings for case-insensitive comparison.
+  - Actually, let me keep table names as strings and do case-insensitive comparison.
+
+- Stmt state: `#{db => DB, stmt => ParsedStmt, started => bool, sorted => [Row], cur => int, outrow => [Value], nout => int}`
+
+Let me think about the lexer. I'll tokenize into a list of tokens.
+
+Token: `{Kind, Text}` where Kind is one of: eof, id, int, string, kw, punct, star, comma, lp, rp, semi, op, dot
+
+Let me write the lexer:
+
+```erlang
+lex(Sql) -> lex(Sql, []).
+
+lex([], Acc) -> lists:reverse([{eof, ""} | Acc]);
+lex([C | Rest] = Sql, Acc) ->
+    case C of
+        C when C =:= $\s; C =:= $\t; C =:= $\n; C =:= $\r -> lex(Rest, Acc);
+        $- when Rest =:= [$- | _] -> 
+            %% comment
+            lex(skip_to_newline(Rest), Acc);
+        ...
+    end.
+```
+
+Actually, let me be more careful. Let me write it with string operations.
+
+Let me think about this more carefully and write the whole thing.
+
+For keywords, I'll check against a list.
+
+Let me write the complete module:
+
+```erlang
+-module(sqlite3).
+-export([open/0, exec/3, exec/4, prepare_v2/2, step/1, finalize/1, close/1,
+         column_count/1, column_text/2, column_int64/2, errmsg/1, main/0]).
+
+%% Value helpers
+v_null() -> null.
+v_int(I) -> {int, I}.
+v_text(S) -> {text, S}.
+
+v_cmp(null, null) -> 0;
+v_cmp({int, A}, {int, B}) when A < B -> -1;
+v_cmp({int, A}, {int, B}) when A > B -> 1;
+v_cmp({int, A}, {int, B}) -> 0;
+v_cmp({text, A}, {text, B}) -> cmp_str(A, B);
+v_cmp(null, _) -> -1;  %% V_NULL=0 < V_INT=1 < V_TEXT=2
+v_cmp({int, _}, {text, _}) -> -1;
+v_cmp({text, _}, {int, _}) -> 1;
+v_cmp(_, null) -> 1.
+```
+
+Wait, looking at the C code: `if (a->type!=b->type) return (int)a->type-(int)b->type;` where V_NULL=0, V_INT=1, V_TEXT=2. So null < int < text.
+
+```erlang
+v_cmp(null, null) -> 0;
+v_cmp(null, _) -> -1;
+v_cmp(_, null) -> 1;
+v_cmp({int, A}, {int, B}) -> if A < B -> -1; A > B -> 1; true -> 0 end;
+v_cmp({text, A}, {text, B}) -> case string:compare(A, B) of
+    Lt when Lt < 0 -> -1;
+    Gt when Gt > 0 -> 1;
+    _ -> 0
+end.
+```
+
+Wait, but the type ordering: null(0) < int(1) < text(2). So:
+- null vs int: 0-1 = -1, so null < int
+- null vs text: 0-2 = -2, so null < text
+- int vs text: 1-2 = -1, so int < text
+
+Let me handle this properly:
+
+```erlang
+v_type_ord(null) -> 0;
+v_type_ord({int, _}) -> 1;
+v_type_ord({text, _}) -> 2.
+
+v_cmp(A, B) ->
+    TA = v_type_ord(A),
+    TB = v_type_ord(B),
+    if
+        TA =/= TB -> TA - TB;
+        true ->
+            case {A, B} of
+                {null, null} -> 0;
+                {{int, X}, {int, Y}} -> if X < Y -> -1; X > Y -> 1; true -> 0 end;
+                {{text, X}, {text, Y}} -> 
+                    C = case string:compare(X, Y) of
+                        Lt when Lt < 0 -> -1;
+                        Gt when Gt > 0 -> 1;
+                        _ -> 0
+                    end,
+                    C
+            end
+    end.
+```
+
+Hmm, `string:compare` might not be available in all Erlang versions. Let me use a simple comparison. Actually in Erlang, string comparison with `==`, `<`, `>` works on lists lexicographically. But I need to be careful about case. The C code uses `strcmp` which is case-sensitive byte comparison. In Erlang, comparing strings (which are lists of integers) with `<` and `>` gives lexicographic ordering based on character codes, which matches `strcmp`.
+
+```erlang
+v_cmp_str(A, B) when A < B -> -1;
+v_cmp_str(A, B) when A > B -> 1;
+v_cmp_str(_, _) -> 0.
+```
+
+Now for v_truthy: compares against v_int(0), returns true if not equal.
+
+```erlang
+v_truthy(V) -> v_cmp(V, {int, 0}) =/= 0.
+```
+
+v_to_text:
+```erlang
+v_to_text(null) -> "NULL";
+v_to_text({int, I}) -> integer_to_list(I);
+v_to_text({text, S}) -> S.
+```
+
+Now the lexer. Let me write it properly.
+
+```erlang
+keywords() ->
+    ["create","table","insert","into","values","select","from","where",
+     "order","by","asc","desc","and","or","not","null","begin","commit",
+     "inner","join","on","int","integer","text","primary","key","transaction"].
+
+is_kw(S) -> lists:member(string:lowercase(S), keywords()).
+```
+
+Wait, I need case-insensitive comparison. Let me use `string:casefold` or just lowercase.
+
+Actually, `string:to_lower/1` is deprecated but `string:lowercase/1` should work. Let me use that.
+
+For the lexer, I'll work with the string as a list of characters.
+
+```erlang
+lex(Sql) ->
+    Toks = lex1(Sql, []),
+    lists:reverse(Toks) ++ [{eof, ""}].
+
+lex1([], Acc) -> Acc;
+lex1([C | Rest] = S, Acc) ->
+    case C of
+        C when C =:= $\s; C =:= $\t; C =:= $\n; C =:= $\r -> lex1(Rest, Acc);
+        $- when Rest =/= [], hd(Rest) =:= $- ->
+            %% line comment
+            lex1(skip_comment(Rest), Acc);
+        C when (C >= $A andalso C =< $Z) orelse (C >= $a andalso C =< $z) orelse C =:= $_ ->
+            {Word, Rest2} = take_ident(S, []),
+            Kind = case is_kw(Word) of true -> kw; false -> id end,
+            lex1(Rest2, [{Kind, Word} | Acc]);
+        C when C >= $0 andalso C =< $9 ->
+            {Num, Rest2} = take_digit(S, []),
+            lex1(Rest2, [{int, Num} | Acc]);
+        $' ->
+            {Str, Rest2} = take_string(S, $'),
+            lex1(Rest2, [{string, Str} | Acc]);
+        $\" ->
+            {Str, Rest2} = take_string(S, $"),
+            lex1(Rest2, [{id, Str} | Acc]);
+        $* -> lex1(Rest, [{star, "*"} | Acc]);
+        $, -> lex1(Rest, [{comma, ","} | Acc]);
+        $( -> lex1(Rest, [{lp, "("} | Acc]);
+        $) -> lex1(Rest, [{rp, ")"} | Acc]);
+        $; -> lex1(Rest, [{semi, ";"} | Acc]);
+        $. -> lex1(Rest, [{dot, "."} | Acc]);
+        C when C =:= $=; C =:= $<; C =:= $>; C =:= $! ->
+            {Op, Rest2} = take_op(S, []),
+            lex1(Rest2, [{op, Op} | Acc]);
+        _ ->
+            lex1(Rest, [{punct, [C]} | Acc])
+    end.
+
+skip_comment([$\n | Rest]) -> Rest;
+skip_comment([_ | Rest]) -> skip_comment(Rest);
+skip_comment([]) -> [].
+
+take_ident([C | Rest], Acc) when (C >= $A andalso C =< $Z) orelse (C >= $a andalso C =< $z) orelse (C >= $0 andalso C =< $9) orelse C =:= $_ ->
+    take_ident(Rest, [C | Acc]);
+take_ident(S, Acc) -> {lists:reverse(Acc), S}.
+
+take_digit([C | Rest], Acc) when C >= $0 andalso C =< $9 ->
+    take_digit(Rest, [C | Acc]);
+take_digit(S, Acc) -> {lists:reverse(Acc), S}.
+
+take_string([$' | Rest], Acc) -> {lists:reverse(Acc), Rest};  %% Wait, need to handle the opening quote
+```
+
+Hmm, let me rethink. The string starts with `'`, so when we enter `take_string`, we've already seen the opening quote. Let me adjust:
+
+```erlang
+take_string([Q | Rest], Acc) ->  %% Q is the quote char, already consumed
+    take_string_body(Rest, Q, Acc).
+
+take_string_body([Q | Rest], Q, Acc) -> {lists:reverse(Acc), Rest};
+take_string_body([C | Rest], Q, Acc) -> take_string_body(Rest, Q, [C | Acc]);
+take_string_body([], _, Acc) -> {lists:reverse(Acc), []}.
+```
+
+Wait, but in the main lex function, when we see `'`, we call `take_string`. Let me restructure:
+
+```erlang
+$' ->
+    Rest1 = Rest,  %% after the opening quote
+    {Str, Rest2} = take_string_body(Rest1, $', []),
+    lex1(Rest2, [{string, Str} | Acc]);
+```
+
+For operators:
+```erlang
+take_op([C | Rest], Acc) ->
+    case {C, Rest} of
+        {$=, _} -> {lists:reverse([C | Acc]), Rest};  %% standalone = 
+        {$<, [$> | _]} -> {lists:reverse([$>, C | Acc]), tl(Rest)};  %% <>
+        {$<, [$= | _]} -> {lists:reverse([$=, C | Acc]), tl(Rest)};  %% <=
+        {$>, [$= | _]} -> {lists:reverse([$=, C | Acc]), tl(Rest)};  %% >=
+        {$!, [$= | _]} -> {lists:reverse([$=, C | Acc]), tl(Rest)};  %% !=
+        _ -> {lists:reverse([C | Acc]), Rest}
+    end.
+```
+
+Wait, looking at the C code more carefully:
+
+```c
+if (strchr("=<>!",c)){
+    size_t st=L->pos;
+    if (L->src[L->pos+1]=='=') L->pos++;
+    if (c=='<' && L->src[L->pos+1]=='>') L->pos++;
+    if (c=='!' && L->src[L->pos+1]=='=') L->pos++;
+    L->pos++;
+    lex_push(L,TK_OP,L->src+st,L->pos-st);
+}
+```
+
+So it starts at `c`, then:
+1. If next char is `=`, advance (so `<=`, `>=`, `!=`, `==` but `==` isn't really valid SQL)
+2. If c is `<` and next (after possible advance) is `>`, advance (so `<>`)
+3. If c is `!` and next (after possible advance) is `=`, advance (so `!=`)
+
+Wait, the order matters. Let me trace through:
+- For `<=`: c=`<`, pos+1=`=`. Step 1: pos++ (now at `=`). Step 2: c=`<` and src[pos+1] is whatever comes after `=`... not `>`, so no. Step 3: c=`<` not `!`, so no. Final pos++. Result: `<=`
+- For `<>`: c=`<`, pos+1=`>`. Step 1: `>` != `=`, no advance. Step 2: c=`<` and src[pos+1]=`>`, pos++. Step 3: no. Final pos++. Result: `<>`
+- For `!=`: c=`!`, pos+1=`=`. Step 1: pos++ (now at `=`). Step 2: c=`!` not `<`, no. Step 3: c=`!` and src[pos+1] is whatever after `=`... not `=`. Final pos++. Result: `!=`
+- For `=`: c=`=`, pos+1 is something else. No advances. Result: `=`
+- For `<`: c=`<`, pos+1 is something else. No advances. Result: `<`
+- For `>`: c=`>`, pos+1 is something else. No advances. Result: `>`
+
+So the operators can be: `=`, `<`, `>`, `<=`, `>=`, `<>`, `!=`
+
+Let me write take_op more carefully:
+
+```erlang
+take_op([C | Rest0], _Acc) ->
+    {Op, Rest1} = case {C, Rest0} of
+        {$<, [$> | R]} -> {"<>", R};
+        {$<, [$= | R]} -> {"<=", R};
+        {$>, [$= | R]} -> {">=", R};
+        {$!, [$= | R]} -> {"!=", R};
+        _ -> {[C], Rest0}
+    end,
+    {Op, Rest1}.
+```
+
+Wait, but the C code handles `<=` and `<>` differently. For `<=`:
+- c=`<`, src[pos+1]=`=`, so step 1 advances. Now pos is at `=`. Step 2: c=`<` and src[pos+1] is the char after `=`. If that's `>`, it would also advance, but that's unlikely. So result is `<=`.
+
+For `<>`:
+- c=`<`, src[pos+1]=`>`. Step 1: `>` != `=`, no advance. Step 2: c=`<` and src[pos+1]=`>`, advance. Now pos at `>`. Step 3: no. Final advance. Result: `<>`.
+
+So my Erlang version above is correct. But wait, what about `<>=`? That would be: c=`<`, src[pos+1]=`>`. Step 1: no. Step 2: advance to `>`. Step 3: no. Final advance. Result: `<>`, and `=` is left. That's fine.
+
+OK, my take_op looks correct. But I need to handle the case where `=` follows `<` or `>`:
+
+Actually wait, I need to re-examine. The C code does:
+1. First check if pos+1 is `=`, if so advance
+2. Then check if c is `<` and (new) pos+1 is `>`, if so advance
+3. Then check if c is `!` and (new) pos+1 is `=`, if so advance
+
+So for `<=`:
+- pos at `<`, pos+1 at `=`. Step 1: advance, pos now at `=`. Step 2: c=`<`, pos+1 is char after `=`. Not `>`. Step 3: c=`<`, not `!`. Final: advance. Result: `<=`.
+
+For `<>`:
+- pos at `<`, pos+1 at `>`. Step 1: `>` != `=`, no advance. Step 2: c=`<`, pos+1=`>`, advance. pos now at `>`. Step 3: no. Final: advance. Result: `<>`.
+
+My Erlang version handles these correctly.
+
+Now the parser. I'll use a recursive descent parser with a token list and position.
+
+Actually, in Erlang, I can pattern match on the token list directly, which is more idiomatic. Let me use a list-based approach where I consume tokens from the front.
+
+Let me represent the parser state as just the token list, and return `{Result, RemainingTokens}`.
+
+Actually, for error handling, let me return `{ok, Result, Rest}` or `{error, Reason}`.
+
+Let me think about the AST:
+
+Expr:
+- `{col, Name}` - column reference
+- `{int, Value}` - integer literal
+- `{str, Value}` - string literal  
+- `{binop, Op, Left, Right}` - binary operation
+
+ResultCol: `{col, Name}` or `{star}` or `{star_table, Name}` (for `table.*`)
+
+TableRef: `{table, Name, Alias}`
+
+Stmt:
+- `{create, Name, Cols}`
+- `{insert, Table, Values}`
+- `{select, Cols, Star, Tables, Where, OrderCol, OrderDesc, JoinOn}`
+- `{begin}`
+- `{commit}`
+
+Let me write the parser:
+
+```erlang
+parse(Toks) ->
+    case parse_stmt(Toks) of
+        {ok, Stmt, [{semi, _} | Rest]} -> {ok, Stmt, Rest};
+        {ok, Stmt, Rest} -> {ok, Stmt, Rest};
+        {error, _} = E -> E
+    end.
+```
+
+Wait, I need to handle multiple statements. Let me think about the exec function which loops over statements.
+
+Let me structure it as:
+- `parse_all(Toks)` -> `{ok, [Stmt]}` | `{error, Reason}`
+
+```erlang
+parse_all(Toks) -> parse_all(Toks, []).
+
+parse_all([{eof, _}], Acc) -> {ok, lists:reverse(Acc)};
+parse_all(Toks, Acc) ->
+    case parse_stmt(Toks) of
+        {ok, Stmt, Rest} ->
+            Rest2 = case Rest of [{semi, _} | R] -> R; _ -> Rest end,
+            parse_all(Rest2, [Stmt | Acc]);
+        {error, _} = E -> E
+    end.
+```
+
+Now parse_stmt:
+
+```erlang
+parse_stmt([{kw, Kw} | Rest]) ->
+    case string:lowercase(Kw) of
+        "begin" -> 
+            Rest2 = skip_kw(Rest, "transaction"),
+            {ok, {begin}, Rest2};
+        "commit" ->
+            Rest2 = skip_kw(Rest, "transaction"),
+            {ok, {commit}, Rest2};
+        "create" ->
+            case skip_kw(Rest, "table") of
+                [_|_] = Rest2 -> parse_create(Rest2);
+                _ -> {error, "expected table"}
+            end;
+        "insert" -> parse_insert(Rest);
+        "select" -> parse_select(Rest);
+        _ -> {error, "unknown statement"}
+    end;
+parse_stmt(_) -> {error, "parse error"}.
+
+skip_kw([{kw, Kw} | Rest], Name) ->
+    case string:lowercase(Kw) of
+        Name -> Rest;
+        _ -> [{kw, Kw} | Rest]
+    end;
+skip_kw(Toks, _) -> Toks.
+```
+
+Hmm, this is getting complex. Let me simplify by using helper functions.
+
+Actually, let me think about this differently. In Erlang, I can use a more functional approach with pattern matching on token lists. Let me define helper functions:
+
+```erlang
+%% Check if next token matches
+peek([{K, _} | _], K) -> true;
+peek(_, _) -> false.
+
+peek_kw([{kw, T} | _], Kw) -> string:lowercase(T) =:= Kw;
+peek_kw(_, _) -> false.
+
+%% Accept a token kind
+accept([{K, _} = Tok | Rest], K) -> {ok, Tok, Rest};
+accept(Toks, _) -> {error, not_found}.
+
+accept_kw([{kw, T} | Rest], Kw) ->
+    case string:lowercase(T) =:= Kw of
+        true -> {ok, T, Rest};
+        false -> error
+    end;
+accept_kw(_, _) -> error.
+```
+
+Hmm, this is getting messy with different return types. Let me use a consistent approach.
+
+Let me use a parser state that's just the token list, and functions that return `{Result, RestTokens}` or crash/throw on error. Since the C code also just returns -1 on parse error, I can use a similar approach.
+
+Actually, let me use `{ok, Result, Rest}` | `{error, Reason}` consistently, but that makes the code verbose. Let me try a different approach: use exceptions for parse errors, or use a maybe-style monad.
+
+Actually, the simplest approach in Erlang is to just use pattern matching and let it crash. If parsing fails, we'll get a function clause error, which we can catch. But that's not great for error messages.
+
+Let me try a cleaner approach. I'll use a convention where parse functions return `{Result, RestTokens}` on success, and `{error, Reason}` on failure. I'll use a helper to chain these.
+
+Actually, let me just write it straightforwardly. The C code is also not super clean about error handling.
+
+Let me try a different approach: I'll use a parse monad-ish style with `case` expressions.
+
+Actually, let me just write it directly and handle errors at the top level. For parse functions, I'll return `{ok, Result, Rest}` | `error`.
+
+Let me write the whole thing more carefully now.
+
+For the parser, let me use a simpler convention: functions take a token list and return `{Result, RestTokens}`. If there's a parse error, I'll throw `{parse_error, Msg}`.
+
+```erlang
+parse_stmt([{kw, K} | T]) ->
+    case lc(K) of
+        "begin" -> {begin, skip_opt_kw(T, "transaction")};
+        "commit" -> {commit, skip_opt_kw(T, "transaction")};
+        "create" -> 
+            {ok, _, T2} = accept_kw(T, "table"),
+            parse_create(T2);
+        "insert" -> parse_insert(T);
+        "select" -> parse_select(T);
+        _ -> throw({parse_error, "unknown"})
+    end;
+parse_stmt(_) -> throw({parse_error, "syntax error"}).
+```
+
+Hmm, but `accept_kw` returning `{ok, _, T2}` vs `error` is awkward. Let me just use a different convention.
+
+Let me define:
+
+```erlang
+%% Returns {Result, Rest} or throws {parse_error, Msg}
+expect_kw([{kw, T} | Rest], Kw) ->
+    case lc(T) =:= Kw of
+        true -> Rest;
+        false -> throw({parse_error, "expected " ++ Kw})
+    end;
+expect_kw(_, Kw) -> throw({parse_error, "expected " ++ Kw}).
+
+opt_kw([{kw, T} | Rest] = Toks, Kw) ->
+    case lc(T) =:= Kw of
+        true -> Rest;
+        false -> Toks
+    end;
+opt_kw(Toks, _) -> Toks.
+
+expect([{K, _} | Rest], K) -> Rest;
+expect(_, K) -> throw({parse_error, "expected " ++ atom_to_list(K)}).
+```
+
+OK let me just write the whole thing now. I'll be more direct.
+
+For the database state, I'll use a map:
+```erlang
+#{tables => #{TableName => {Cols, Rows}}, errmsg => ""}
+```
+Where TableName is a lowercase string (for case-insensitive matching), Cols is a list of column names (lowercase), Rows is a list of rows (each row is a list of Values).
+
+Wait, but column names should also be case-insensitive. Let me store them lowercase.
+
+Actually, looking at the C code, it uses `strcasecmp` for table and column name comparison. So I should lowercase everything.
+
+Let me use `string:lowercase/1` for this. But `string:lowercase` might not exist in older Erlang. Let me use `string:to_lower/1` which is the older name. Actually, both should work in modern Erlang. Let me use `string:lowercase/1`.
+
+Hmm, actually for Erlang/OTP 20+, `string:lowercase/1` is available. Let me use it.
+
+Now let me think about the prepared statement. In Erlang, since we don't have mutable state, the `step` function needs to return both the result and the updated statement state. So:
+
+```erlang
+step(Stmt) -> {row, Stmt2} | {done, Stmt2}
+```
+
+And `column_text/2`, `column_count/1`, `column_int64/2` operate on the statement state that has the current row.
+
+Let me define the statement state:
+```erlang
+#{db => DB, stmt => ParsedStmt, started => false, sorted => [Row], cur => Int, outrow => [Value], nout => Int}
+```
+
+For `exec`, I'll iterate through all statements, and for SELECT statements, I'll step through all rows and call the callback for each.
+
+Let me now write the complete module. I'll try to be concise but complete.
+
+```erlang
+-module(sqlite3).
+-export([open/0, exec/3, exec/4, prepare_v2/2, step/1, finalize/1, close/1,
+         column_count/1, column_text/2, column_int64/2, errmsg/1, main/0]).
+
+-define(DONE, 101).
+-define(ROW, 100).
+
+%% ========== Value ==========
+v_cmp(null, null) -> 0;
+v_cmp(null, _) -> -1;
+v_cmp(_, null) -> 1;
+v_cmp({int, A}, {int, B}) when A < B -> -1;
+v_cmp({int, A}, {int, B}) when A > B -> 1;
+v_cmp({int, _}, {text, _}) -> -1;
+v_cmp({text, _}, {int, _}) -> 1;
+v_cmp({text, A}, {text, B}) when A < B -> -1;
+v_cmp({text, A}, {text, B}) when A > B -> 1;
+v_cmp(_, _) -> 0.
+
+v_truthy(V) -> v_cmp(V, {int, 0}) =/= 0.
+
+v_to_text(null) -> "NULL";
+v_to_text({int, I}) -> integer_to_list(I);
+v_to_text({text, S}) -> S.
+
+v_copy(V) -> V.  %% Erlang terms are immutable, no copy needed
+
+%% ========== Lexer ==========
+keywords() ->
+    ["create","table","insert","into","values","select","from","where",
+     "order","by","asc","desc","and","or","not","null","begin","commit",
+     "inner","join","on","int","integer","text","primary","key","transaction"].
+
+is_kw(S) -> lists:member(lc(S), keywords()).
+
+lc(S) -> string:lowercase(S).
+
+lex(Sql) -> lex1(Sql, []).
+
+lex1([], Acc) -> lists:reverse([{eof, ""} | Acc]);
+lex1([C | Rest] = S, Acc) ->
+    case C of
+        C when C =:= $\s; C =:= $\t; C =:= $\n; C =:= $\r -> lex1(Rest, Acc);
+        $- when Rest =/= [], hd(Rest) =:= $- -> lex1(skip_comment(Rest), Acc);
+        C when (C >= $A andalso C =< $Z) orelse (C >= $a andalso C =< $z) orelse C =:= $_ ->
+            {Word, Rest2} = take_while(S, fun is_ident_char/1),
+            Kind = case is_kw(Word) of true -> kw; false -> id end,
+            lex1(Rest2, [{Kind, Word} | Acc]);
+        C when C >= $0 andalso C =< $9 ->
+            {Num, Rest2} = take_while(S, fun is_digit_char/1),
+            lex1(Rest2, [{int, Num} | Acc]);
+        $' -> {Str, Rest2} = take_quoted(Rest, $', []),
+              lex1(Rest2, [{string, Str} | Acc]);
+        $" -> {Str, Rest2} = take_quoted(Rest, $", []),
+              lex1(Rest2, [{id, Str} | Acc]);
+        $* -> lex1(Rest, [{star, "*"} | Acc]);
+        $, -> lex1(Rest, [{comma, ","} | Acc]);
+        $( -> lex1(Rest, [{lp, "("} | Acc]);
+        $) -> lex1(Rest, [{rp, ")"} | Acc]);
+        $; -> lex1(Rest, [{semi, ";"} | Acc]);
+        $. -> lex1(Rest, [{dot, "."} | Acc]);
+        C when C =:= $=; C =:= $<; C =:= $>; C =:= $! ->
+            {Op, Rest2} = take_op(S),
+            lex1(Rest2, [{op, Op} | Acc]);
+        _ -> lex1(Rest, [{punct, [C]} | Acc])
+    end.
+
+skip_comment([$\n | R]) -> R;
+skip_comment([_ | R]) -> skip_comment(R);
+skip_comment([]) -> [].
+
+is_ident_char(C) -> (C >= $A andalso C =< $Z) orelse (C >= $a andalso C =< $z) orelse (C >= $0 andalso C =< $9) orelse C =:= $_.
+is_digit_char(C) -> C >= $0 andalso C =< $9.
+
+take_while([C | R] = S, Pred) ->
+    case Pred(C) of
+        true -> {Rest, T} = take_while(R, Pred), {[C | Rest], T};
+        false -> {[], S}
+    end;
+take_while([], _) -> {[], []}.
+
+take_quoted([Q | R], Q, Acc) -> {lists:reverse(Acc), R};
+take_quoted([C | R], Q, Acc) -> take_quoted(R, Q, [C | Acc]);
+take_quoted([], _, Acc) -> {lists:reverse(Acc), []}.
+
+take_op([$<, $> | R]) -> {"<>", R};
+take_op([$<, $= | R]) -> {"<=", R};
+take_op([$>, $= | R]) -> {">=", R};
+take_op([$!, $= | R]) -> {"!=", R};
+take_op([C | R]) -> {[C], R}.
+```
+
+Now the parser. Let me use a convention where parse functions take a token list and return `{Result, RestTokens}`, throwing on error.
+
+```erlang
+%% Parser helpers
+expect_kw([{kw, T} | R], Kw) ->
+    case lc(T) =:= Kw of true -> R; false -> throw({parse_error, Kw}) end;
+expect_kw(_, Kw) -> throw({parse_error, Kw}).
+
+opt_kw([{kw, T} | R] = Toks, Kw) ->
+    case lc(T) =:= Kw of true -> R; false -> Toks end;
+opt_kw(Toks, _) -> Toks.
+
+peek_kw([{kw, T} | _], Kw) -> lc(T) =:= Kw;
+peek_kw(_, _) -> false.
+
+expect([{K, _} | R], K) -> R;
+expect(Toks, K) -> throw({parse_error, atom_to_list(K)}).
+
+opt([{K, _} | R], K) -> {true, R};
+opt(Toks, _) -> {false, Toks}.
+
+%% Parse all statements
+parse_all(Toks) -> parse_all(Toks, []).
+
+parse_all([{eof, _}], Acc) -> {ok, lists:reverse(Acc)};
+parse_all(Toks, Acc) ->
+    {Stmt, Rest} = parse_stmt(Toks),
+    Rest2 = case Rest of [{semi, _} | R] -> R; _ -> Rest end,
+    parse_all(Rest2, [Stmt | Acc]).
+
+parse_stmt([{kw, K} | T]) ->
+    case lc(K) of
+        "begin" -> {{begin}, opt_kw(T, "transaction")};
+        "commit" -> {{commit}, opt_kw(T, "transaction")};
+        "create" -> T2 = expect_kw(T, "table"), parse_create(T2);
+        "insert" -> parse_insert(T);
+        "select" -> parse_select(T);
+        _ -> throw({parse_error, "unknown"})
+    end;
+parse_stmt(_) -> throw({parse_error, "syntax"}).
+```
+
+Now parse_create:
+
+```erlang
+parse_create(Toks) ->
+    {Name, T2} = parse_name(Toks),
+    T3 = expect(T2, lp),
+    {Cols, T4} = parse_col_defs(T3, []),
+    T5 = expect(T4, rp),
+    {{create, lc(Name), [lc(C) || C <- Cols]}, T5}.
+
+parse_name([{id, T} | R]) -> {T, R};
+parse_name([{kw, T} | R]) -> {T, R};
+parse_name(_) -> throw({parse_error, "expected name"}).
+
+parse_col_defs([{rp, _} = T | _], Acc) -> {lists:reverse(Acc), T};
+parse_col_defs([{eof, _} | _], Acc) -> {lists:reverse(Acc), [{eof, ""}]};
+parse_col_defs(Toks, Acc) ->
+    {Name, T2} = parse_name(Toks),
+    %% Skip until comma, rp, or eof (skip column type, constraints, etc.)
+    T3 = skip_col_attrs(T2),
+    {T4, T5} = case T3 of
+        [{comma, _} | R] -> {comma, R};
+        _ -> {none, T3}
+    end,
+    case T4 of
+        comma -> parse_col_defs(T5, [Name | Acc]);
+        none -> {lists:reverse([Name | Acc]), T5}
+    end.
+
+skip_col_attrs([{comma, _} | _] = T) -> T;
+skip_col_attrs([{rp, _} | _] = T) -> T;
+skip_col_attrs([{eof, _} | _] = T) -> T;
+skip_col_attrs([_ | R]) -> skip_col_attrs(R);
+skip_col_attrs([]) -> [{eof, ""}].
+```
+
+Hmm wait, the C code's parse_create:
+```c
+while (P->t[P->i].kind!=TK_RP && P->t[P->i].kind!=TK_EOF){
+    if (P->t[P->i].kind!=TK_ID && P->t[P->i].kind!=TK_KW) return -1;
+    st->ct_cols[...]=strdup(P->t[P->i].text);
+    P->i++;
+    while (P->t[P->i].kind!=TK_COMMA && P->t[P->i].kind!=TK_RP && P->t[P->i].kind!=TK_EOF) P->i++;
+    p_accept(P,TK_COMMA,NULL);
+}
+```
+
+So it reads a name (ID or KW), then skips everything until comma/rp/eof, then optionally accepts comma. My implementation matches this.
+
+Now parse_insert:
+
+```erlang
+parse_insert(T) ->
+    T2 = expect_kw(T, "into"),
+    {Table, T3} = parse_name(T2),
+    T4 = expect_kw(T3, "values"),
+    T5 = expect(T4, lp),
+    {Vals, T6} = parse_values(T5, []),
+    T7 = expect(T6, rp),
+    {{insert, lc(Table), Vals}, T7}.
+
+parse_values([{rp, _} = T | _], Acc) -> {lists:reverse(Acc), T};
+parse_values(Toks, Acc) ->
+    {V, T2} = parse_value(Toks),
+    {T3, T4} = case T2 of
+        [{comma, _} | R] -> {comma, R};
+        _ -> {none, T2}
+    end,
+    case T3 of
+        comma -> parse_values(T4, [V | Acc]);
+        none -> {lists:reverse([V | Acc]), T4}
+    end.
+
+parse_value([{int, T} | R]) -> {{int, list_to_integer(T)}, R};
+parse_value([{string, T} | R]) -> {{text, T}, R};
+parse_value([{kw, K} | R]) ->
+    case lc(K) of
+        "null" -> {null, R};
+        _ -> throw({parse_error, "expected value"})
+    end;
+parse_value(_) -> throw({parse_error, "expected value"}).
+```
+
+Now parse_select:
+
+```erlang
+parse_select(T) ->
+    {Cols, Star, T2} = parse_select_cols(T),
+    T3 = expect_kw(T2, "from"),
+    {Tables, JoinOn, T4} = parse_tables(T3, [], undefined),
+    {Where, T5} = case opt_kw(T4, "where") of
+        [$_ | _] = Tw -> {parse_expr(Tw)};
+        Tw -> {undefined, Tw}
+    end,
+    ...
+```
+
+Hmm, this is getting complicated. Let me be more careful.
+
+```erlang
+parse_select(T) ->
+    {Cols, Star, T2} = parse_select_cols(T),
+    T3 = expect_kw(T2, "from"),
+    {Tables, JoinOn, T4} = parse_tables(T3, [], undefined),
+    {Where, T5} = parse_opt_where(T4),
+    {OrderCol, OrderDesc, T6} = parse_opt_order(T5),
+    {{select, Cols, Star, Tables, Where, OrderCol, OrderDesc, JoinOn}, T6}.
+
+parse_select_cols([{star, _} | R]) -> {[], true, R};
+parse_select_cols(Toks) ->
+    {Cols, T2} = parse_select_cols1(Toks, []),
+    {Cols, false, T2}.
+
+parse_select_cols1(Toks, Acc) ->
+    {Col, T2} = parse_result_col(Toks),
+    case T2 of
+        [{comma, _} | R] -> parse_select_cols1(R, [Col | Acc]);
+        _ -> {lists:reverse([Col | Acc]), T2}
+    end.
+
+parse_result_col([{star, _} | R]) -> {star, R};
+parse_result_col(Toks) ->
+    {Name, T2} = parse_name(Toks),
+    case T2 of
+        [{dot, _}, {star, _} | R] -> {{star_table, lc(Name)}, R};
+        [{dot, _} | R] ->
+            {Name2, R2} = parse_name(R),
+            {{col, lc(Name) ++ "." ++ lc(Name2)}, R2};
+        _ -> {{col, lc(Name)}, T2}
+    end.
+```
+
+Wait, I need to be careful. The C code stores column names with potential dots like "table.col". Let me keep that convention.
+
+Actually, looking at the C code more carefully, in `parse_primary`:
+```c
+if (P->t[P->i].kind==TK_ID || P->t[P->i].kind==TK_KW){
+    Expr *e=new_expr(E_COL);
+    char buf[256]; snprintf(buf,sizeof buf,"%s",t->text); P->i++;
+    if (P->t[P->i].kind==TK_DOT){
+        P->i++;
+        snprintf(buf+strlen(buf),sizeof(buf)-strlen(buf),".%s",P->t[P->i].text);
+        P->i++;
+    }
+    e->col=strdup(buf);
+    return e;
+}
+```
+
+So for expressions, it stores "table.col" as a single string. And in `parse_select` for result columns:
+```c
+if (P->t[P->i].kind==TK_ID || P->t[P->i].kind==TK_KW){
+    char buf[256]; snprintf(buf,sizeof buf,"%s",P->t[P->i].text); P->i++;
+    if (P->t[P->i].kind==TK_DOT){
+        P->i++;
+        if (p_accept(P,TK_STAR,NULL)) rc->star=1;
+        else { snprintf(buf+strlen(buf),sizeof(buf)-strlen(buf),".%s",P->t[P->i].text); P->i++; rc->col=strdup(buf); }
+    } else rc->col=strdup(buf);
+}
+```
+
+So for result columns, if it's `table.*`, star=1 and the table name is lost (just star). If it's `table.col`, col = "table.col". If it's just `col`, col = "col".
+
+Wait, but when star=1 for `table.*`, the C code doesn't store the table name. Looking at the executor:
+```c
+if (rc->star){ for (int i=0;i<n;i++) for (int j=0;j<tabs[i]->ncols;j++) s->outrow[s->nout++]=v_copy(&r->vals[offsets[i]+j]); }
+```
+
+It just outputs all columns from all tables, same as `*`. So `table.*` is treated the same as `*` in the executor. OK, so I can simplify.
+
+But wait, the C code does lowercase the column names? Let me check... No, it uses `strcasecmp` for comparison but stores the original case. In my Erlang version, I'm lowercasing everything, which should work fine for comparison purposes.
+
+Actually, wait. The C code stores column names as-is (original case) and uses `strcasecmp` for comparison. In my Erlang code, I'm lowercasing everything, which means the output column names will be lowercase. But the C code doesn't output column names in the demo (it just outputs values), so this should be fine.
+
+Hmm, but for correctness, let me not lowercase column names in the output. Actually, the C code doesn't have column name output in the API (no `column_name` function), so it doesn't matter. Let me just lowercase for comparison purposes.
+
+Actually, I realize I should be more careful. Let me store table and column names in lowercase for comparison, but the actual data (text values) should be preserved as-is.
+
+Let me continue with the parser.
+
+```erlang
+parse_tables(Toks, Acc, JoinOn) ->
+    {Name, T2} = parse_name(Toks),
+    {Alias, T3} = parse_opt_alias(T2),
+    TableRef = {table, lc(Name), case Alias of undefined -> undefined; _ -> lc(Alias) end},
+    case peek_kw(T3, "inner") orelse peek_kw(T3, "join") of
+        true ->
+            T4 = case opt_kw(T3, "inner") of
+                [_|_] = T -> expect_kw(T, "join");
+                T -> opt_kw(T, "join")
+            end,
+            %% Actually, let me handle this more carefully
+            ...
+    end.
+```
+
+Hmm, this is getting complicated. Let me restructure.
+
+```erlang
+parse_tables(Toks, Acc, JoinOn) ->
+    {Name, T2} = parse_name(Toks),
+    {Alias, T3} = parse_opt_alias(T2),
+    TRef = {table, lc(Name), alias_or_undef(Alias)},
+    case peek_kw(T3, "inner") orelse peek_kw(T3, "join") of
+        true ->
+            T4 = parse_join_kw(T3),
+            {Name2, T5} = parse_name(T4),
+            {Alias2, T6} = parse_opt_alias(T5),
+            TRef2 = {table, lc(Name2), alias_or_undef(Alias2)},
+            {OnExpr, T7} = case opt_kw(T6, "on") of
+                [_|_] = Ton -> {E, Tr} = parse_expr(Ton), {E, Tr};
+                Ton -> {undefined, Ton}
+            end,
+            NewJoinOn = combine_and(JoinOn, OnExpr),
+            parse_tables(T7, [TRef2, TRef | Acc], NewJoinOn);
+        false ->
+            {lists:reverse([TRef | Acc]), JoinOn, T3}
+    end.
+
+parse_join_kw(Toks) ->
+    case opt_kw(Toks, "inner") of
+        [_|_] = T -> expect_kw(T, "join");
+        T -> opt_kw(T, "join")  %% accept "join" if present
+    end.
+
+alias_or_undef(undefined) -> undefined;
+alias_or_undef(A) -> lc(A).
+
+combine_and(undefined, R) -> R;
+combine_and(L, undefined) -> L;
+combine_and(L, R) -> {binop, "AND", L, R}.
+
+parse_opt_alias(Toks) ->
+    case Toks of
+        [{id, T} | R] ->
+            case peek_kw(R, "on") orelse peek_kw(R, "where") orelse 
+                 peek_kw(R, "order") orelse peek_kw(R, "inner") orelse 
+                 peek_kw(R, "join") of
+                true -> {undefined, Toks};
+                false -> {T, R}
+            end;
+        _ -> {undefined, Toks}
+    end.
+```
+
+Wait, but `peek_kw` checks for keyword tokens, and the alias is an `id` token. The issue is: after the table name, the next token could be an alias (id), or it could be a keyword like "on", "where", "order", "inner", "join". The C code checks:
+
+```c
+if (P->t[P->i].kind==TK_ID && !p_peek_kw(P,"on") && !p_peek_kw(P,"where")
+    && !p_peek_kw(P,"order") && !p_peek_kw(P,"inner") && !p_peek_kw(P,"join")){
+    tr->alias=strdup(P->t[P->i].text); P->i++;
+}
+```
+
+So it checks if the current token is TK_ID AND the current token is not one of those keywords. But if it's TK_ID, it can't be a keyword (TK_KW). So the `!p_peek_kw(...)` checks are redundant... unless the token is both TK_ID and matches a keyword text. But in the lexer, keywords are tokenized as TK_KW, not TK_ID. So the check is: if it's TK_ID (which means it's not a keyword), then it's an alias.
+
+Wait, but the C code also checks `!p_peek_kw(P,"on")` etc. even though if it's TK_ID, it can't be a keyword. This seems like a safety check. In my Erlang code, if the token is `{id, _}`, it's not a keyword, so it's an alias. Let me simplify:
+
+```erlang
+parse_opt_alias([{id, T} | R]) -> {T, R};
+parse_opt_alias(Toks) -> {undefined, Toks}.
+```
+
+But wait, what if the alias happens to be a keyword like "on"? In the C code, "on" would be tokenized as TK_KW, so it wouldn't be treated as an alias. My Erlang code would also not treat it as an alias since it would be `{kw, "on"}` not `{id, "on"}`. So this is correct.
+
+Now parse_expr:
+
+```erlang
+parse_expr(Toks) ->
+    {L, T2} = parse_cmp(Toks),
+    case peek_kw(T2, "and") orelse peek_kw(T2, "or") of
+        true ->
+            {kw, Kw} = hd(T2),
+            Op = case lc(Kw) of "and" -> "AND"; "or" -> "OR" end,
+            {R, T3} = parse_expr(tl(T2)),
+            {{binop, Op, L, R}, T3};
+        false -> {L, T2}
+    end.
+
+parse_cmp(Toks) ->
+    {L, T2} = parse_primary(Toks),
+    case T2 of
+        [{op, Op} | R] ->
+            {R2, T3} = parse_primary(R),
+            {{binop, Op, L, R2}, T3};
+        _ -> {L, T2}
+    end.
+
+parse_primary([{int, T} | R]) -> {{int, list_to_integer(T)}, R};
+parse_primary([{string, T} | R]) -> {{str, T}, R};
+parse_primary([{id, T} | R]) -> parse_col_ref(T, R);
+parse_primary([{kw, T} | R]) -> parse_col_ref(T, R);
+parse_primary([{lp, _} | R]) ->
+    {E, T2} = parse_expr(R),
+    T3 = expect(T2, rp),
+    {E, T3};
+parse_primary(_) -> throw({parse_error, "expected expression"}).
+
+parse_col_ref(Name, Toks) ->
+    case Toks of
+        [{dot, _}, {id, Col} | R] -> {{col, lc(Name) ++ "." ++ lc(Col)}, R};
+        [{dot, _}, {kw, Col} | R] -> {{col, lc(Name) ++ "." ++ lc(Col)}, R};
+        _ -> {{col, lc(Name)}, Toks}
+    end.
+```
+
+Now parse_opt_where and parse_opt_order:
+
+```erlang
+parse_opt_where(Toks) ->
+    case opt_kw(Toks, "where") of
+        [_|_] = Tw -> {E, T2} = parse_expr(Tw), {E, T2};
+        Tw -> {undefined, Tw}
+    end.
+
+parse_opt_order(Toks) ->
+    case opt_kw(Toks, "order") of
+        [_|_] = T -> 
+            T2 = expect_kw(T, "by"),
+            {Col, T3} = parse_name(T2),
+            {Desc, T4} = case opt_kw(T3, "desc") of
+                [_|_] = Td -> {true, Td};
+                Td -> {false, opt_kw(Td, "asc")}
+            end,
+            {lc(Col), Desc, T4};
+        T -> {undefined, false, T}
+    end.
+```
+
+Now the executor. Let me think about the database state:
+
+```erlang
+%% DB: #{tables => #{lowercase_name => {Cols, Rows}}, errmsg => string()}
+%% Cols: [lowercase_col_name]
+%% Rows: [[Value]]
+```
+
+open:
+```erlang
+open() -> #{tables => #{}, errmsg => ""}.
+```
+
+errmsg:
+```erlang
+errmsg(#{errmsg := Msg}) -> Msg.
+```
+
+close:
+```erlang
+close(_DB) -> ok.
+```
+
+exec:
+```erlang
+exec(DB, Sql, Callback) -> exec(DB, Sql, Callback, undefined).
+exec(DB, Sql, Callback, _Arg) ->
+    Toks = lex(Sql),
+    case parse_all(Toks) of
+        {ok, Stmts} -> exec_stmts(DB, Stmts, Callback);
+        {error, _} -> {error, "parse error", DB}
+    end.
+```
+
+Wait, but exec needs to return the updated DB (since Erlang is immutable). Let me think about the return value.
+
+The C API returns an integer error code. In Erlang, I should return `{ok, DB}` or `{error, Reason, DB}`.
+
+```erlang
+exec(DB, Sql, Callback) -> exec(DB, Sql, Callback, undefined).
+exec(DB, Sql, Callback, _Arg) ->
+    Toks = lex(Sql),
+    case catch parse_all(Toks) of
+        {ok, Stmts} -> exec_stmts(DB, Stmts, Callback);
+        {parse_error, Msg} -> {error, Msg, DB};
+        _ -> {error, "parse error", DB}
+    end.
+
+exec_stmts(DB, [], _CB) -> {ok, DB};
+exec_stmts(DB, [Stmt | Rest], CB) ->
+    case exec_stmt(DB, Stmt, CB) of
+        {ok, DB2} -> exec_stmts(DB2, Rest, CB);
+        {error, _, _} = E -> E
+    end.
+
+exec_stmt(DB, {begin}, _CB) -> {ok, DB#{in_txn => true}};
+exec_stmt(DB, {commit}, _CB) -> {ok, DB#{in_txn => false}};
+exec_stmt(DB, {create, Name, Cols}, _CB) ->
+    Tables = maps:get(tables, DB),
+    case maps:is_key(Name, Tables) of
+        true -> {error, "table already exists: " ++ Name, DB};
+        false -> {ok, DB#{tables => maps:put(Name, {Cols, []}, Tables)}}
+    end;
+exec_stmt(DB, {insert, Table, Vals}, _CB) ->
+    Tables = maps:get(tables, DB),
+    case maps:find(Table, Tables) of
+        {ok, {Cols, Rows}} ->
+            DB#{tables => maps:put(Table, {Cols, [Vals | Rows]}, Tables)};
+        error -> {error, "no such table: " ++ Table, DB}
+    end;
+exec_stmt(DB, {select, _Cols, _Star, _Tables, _Where, _OrderCol, _OrderDesc, _JoinOn} = Sel, CB) ->
+    %% Execute select, call callback for each row
+    Rows = exec_select(DB, Sel),
+    lists:foreach(fun(Row) -> CB(Row) end, Rows),
+    {ok, DB}.
+```
+
+Wait, but the C callback signature is `void (*cb)(void*,int,char**,char**)`. In Erlang, I'll make the callback a fun that takes a list of values (as strings). Let me match the demo:
+
+```erlang
+print_row(Vals) ->
+    Strs = [v_to_text(V) || V <- Vals],
+    io:format("~s~n", [string:join(Strs, " | ")]).
+```
+
+Actually, looking at the C demo:
+```c
+static void print_row(void *arg, int n, char **vals, char **cols){
+    (void)arg;(void)cols;
+    for (int i=0;i<n;i++) printf("%s%s", vals[i], i+1<n?" | ":"\n");
+}
+```
+
+So it prints values separated by " | " and newline at end. In Erlang:
+```erlang
+print_row(Vals) ->
+    Strs = [v_to_text(V) || V <- Vals],
+    io:format("~s~n", [string:join(Strs, " | ")]).
+```
+
+Now exec_select. This is the core executor. Let me implement it:
+
+```erlang
+exec_select(DB, {select, Cols, Star, Tables, Where, OrderCol, OrderDesc, JoinOn}) ->
+    %% Get table info
+    TableInfos = [{TRef, get_table(DB, TName)} || {table, TName, _Alias} = TRef <- Tables],
+    %% Generate all row combinations (nested loop join)
+    AllRows = nested_loop(TableInfos, []),
+    %% Filter by WHERE and JOIN ON
+    Filtered = [Row || Row <- AllRows, 
+                       eval_where(Where, Tables, Row) andalso eval_where(JoinOn, Tables, Row)],
+    %% Sort by ORDER BY
+    Sorted = case OrderCol of
+        undefined -> Filtered;
+        _ -> sort_rows(Filtered, Tables, DB, OrderCol, OrderDesc)
+    end,
+    %% Project
+    [project(Cols, Star, Tables, DB, Row) || Row <- Sorted].
+```
+
+Hmm, I need to think about how rows are represented in the context of joins. In the C code, a "combined row" is the concatenation of all table rows. Let me do the same: a combined row is a flat list of values, and I need to track offsets for each table.
+
+Let me restructure:
+
+```erlang
+exec_select(DB, {select, Cols, Star, TableRefs, Where, OrderCol, OrderDesc, JoinOn}) ->
+    %% Get table data
+    TableData = [{TRef, get_table(DB, TName)} || {table, TName, _} = TRef <- TableRefs],
+    %% Compute offsets for each table in the combined row
+    Offsets = compute_offsets(TableData, 0),
+    %% Total columns
+    TotalCols = lists:sum([length(Cols) || {_, {Cols, _}} <- TableData]),
+    %% Generate all row combinations
+    AllRows = nested_loop([Rows || {_, {_, Rows}} <- TableData]),
+    %% Build RowCtx for each combination and filter
+    Filtered = [CombRow || CombRow <- AllRows,
+                           row_match(Where, TableRefs, TableData, Offsets, CombRow) 
+                           andalso row_match(JoinOn, TableRefs, TableData, Offsets, CombRow)],
+    %% Sort
+    Sorted = sort_rows(Filtered, TableRefs, TableData, Offsets, OrderCol, OrderDesc),
+    %% Project
+    [project(Cols, Star, TableRefs, TableData, Offsets, CombRow) || CombRow <- Sorted].
+```
+
+Let me implement the helper functions:
+
+```erlang
+get_table(DB, Name) ->
+    Tables = maps:get(tables, DB),
+    case maps:find(Name, Tables) of
+        {ok, TableInfo} -> TableInfo;
+        error -> {[], []}  %% table not found, empty
+    end.
+
+compute_offsets([], _) -> [];
+compute_offsets([{_, {Cols, _}} | Rest], Off) ->
+    [{Off, length(Cols)} | compute_offsets(Rest, Off + length(Cols))].
+
+%% Nested loop: generate all combinations of rows from multiple tables
+nested_loop([]) -> [[]];  %% no tables, one empty row
+nested_loop([Rows | Rest]) ->
+    [[Row | Comb] || Row <- Rows, Comb <- nested_loop(Rest)].
+```
+
+Wait, but I need the combined row to be flat, not nested. Let me adjust:
+
+```erlang
+nested_loop([]) -> [[]];
+nested_loop([Rows | Rest]) ->
+    [Row1 ++ Comb || Row1 <- Rows, Comb <- nested_loop(Rest)].
+```
+
+Actually, this is inefficient (list concatenation), but for a demo it's fine. Alternatively:
+
+```erlang
+nested_loop([]) -> [[]];
+nested_loop([Rows | Rest]) ->
+    [lists:append([Row1, Comb]) || Row1 <- Rows, Comb <- nested_loop(Rest)].
+```
+
+Or even better, use a different representation. But let me keep it simple.
+
+Now, for evaluating expressions, I need a RowCtx that maps column names to values. Let me think about how to do this.
+
+In the C code, `rowctx_colindex` finds a column by name, searching through all tables. It handles "table.col" and "col" formats.
+
+Let me implement:
+
+```erlang
+%% Find column index in combined row
+%% Returns {TableIndex, ColIndex} or not_found
+find_col(TableRefs, TableData, Offsets, ColName) ->
+    case string:split(ColName, ".") of
+        [TName, CName] ->
+            %% Qualified: table.col
+            find_qualified_col(TableRefs, TableData, Offsets, TName, CName);
+        [_] ->
+            %% Unqualified: search all tables
+            find_unqualified_col(TableData, Offsets, ColName)
+    end.
+
+find_qualified_col(TableRefs, TableData, Offsets, TName, CName) ->
+    lists:foldl(
+        fun({TRef, {Cols, _}}, {Off, _Len}, {Idx, Acc}) ->
+            ...
+        end, ...
+    ).
+```
+
+Hmm, this is getting complicated with the foldl. Let me use a simpler approach with recursion or list comprehensions.
+
+```erlang
+find_col(TableRefs, TableData, Offsets, ColName) ->
+    case string:split(ColName, ".") of
+        [TName, CName] ->
+            %% Find table by alias or name
+            Result = lists:foldl(
+                fun({{table, TN, Alias}, {Cols, _}}, {Off, _Len}, Idx) ->
+                    DisplayName = case Alias of undefined -> TN; _ -> Alias end,
+                    case DisplayName =:= TName of
+                        true ->
+                            ColIdx = index_of(CName, Cols),
+                            case ColIdx >= 0 of
+                                true -> {halt, Off + ColIdx};
+                                false -> {cont, Idx + 1}
+                            end;
+                        false -> {cont, Idx + 1}
+                    end
+                end, 0, lists:zip3(TableRefs, TableData, Offsets)),
+            ...
+    end.
+```
+
+This is getting messy. Let me use a different approach. Let me write a simple recursive function:
+
+```erlang
+find_col(TableRefs, TableData, Offsets, ColName) ->
+    DotPos = string:find(ColName, "."),
+    case DotPos of
+        nomatch ->
+            find_unqualified(TableData, Offsets, ColName, 0);
+        _ ->
+            TName = string:substr(ColName, 1, string:length(ColName) - string:length(DotPos)),
+            CName = string:substr(DotPos, 2),
+            find_qualified(TableRefs, TableData, Offsets, TName, CName, 0)
+    end.
+
+find_unqualified([], [], _, _) -> not_found;
+find_unqualified([{Cols, _} | TData], [{Off, _Len} | TOffs], ColName, _) ->
+    case index_of(ColName, Cols) of
+        -1 -> find_unqualified(TData, TOffs, ColName, 0);
+        Idx -> Off + Idx
+    end.
+
+find_qualified([], [], _, _, _, _) -> not_found;
+find_qualified([{TRef, {Cols, _}} | TRest], [{Off, _Len} | ORest], TName, CName, _) ->
+    {table, TN, Alias} = TRef,
+    DisplayName = case Alias of undefined -> TN; _ -> Alias end,
+    case DisplayName =:= TName of
+        true ->
+            case index_of(CName, Cols) of
+                -1 -> not_found;
+                Idx -> Off + Idx
+            end;
+        false -> find_qualified(TRest, ORest, TName, CName, 0)
+    end.
+
+index_of(Item, List) -> index_of(Item, List, 0).
+index_of(X, [X | _], N) -> N;
+index_of(X, [_ | T], N) -> index_of(X, T, N + 1);
+index_of(_, [], _) -> -1.
+```
+
+Wait, `string:find` returns `nomatch` or the remainder string starting from the match. Let me use a different approach for splitting:
+
+```erlang
+find_col(TableRefs, TableData, Offsets, ColName) ->
+    case string:split(ColName, ".", all) of
+        [TName, CName] ->
+            find_qualified(TableRefs, TableData, Offsets, TName, CName);
+        [_] ->
+            find_unqualified(TableData, Offsets, ColName)
+    end.
+```
+
+`string:split/3` with `all` should work. But I need to handle the case where there are multiple dots. The C code uses `strchr` which finds the first dot, so `table.col` is split at the first dot. `string:split(ColName, ".")` without `all` splits at the first occurrence, returning `[Before, After]`. That's what I want.
+
+Actually, `string:split/2` splits at the first occurrence. Let me use that.
+
+Now, eval_expr:
+
+```erlang
+eval_expr(undefined, _Ctx) -> null;
+eval_expr({int, I}, _Ctx) -> {int, I};
+eval_expr({str, S}, _Ctx) -> {text, S};
+eval_expr({col, Name}, Ctx) ->
+    case find_col(Ctx#ctx.refs, Ctx#ctx.data, Ctx#ctx.offsets, Name) of
+        not_found -> null;
+        Idx -> lists:nth(Idx + 1, Ctx#ctx.row)
+    end;
+eval_expr({binop, Op, L, R}, Ctx) ->
+    A = eval_expr(L, Ctx),
+    B = eval_expr(R, Ctx),
+    eval_binop(Op, A, B).
+```
+
+Hmm, I was trying to avoid records. Let me use a tuple or map for the context:
+
+```erlang
+%% Ctx = {TableRefs, TableData, Offsets, Row}
+eval_expr(undefined, _Ctx) -> null;
+eval_expr({int, I}, _Ctx) -> {int, I};
+eval_expr({str, S}, _Ctx) -> {text, S};
+eval_expr({col, Name}, {Refs, Data, Offsets, Row}) ->
+    case find_col(Refs, Data, Offsets, Name) of
+        not_found -> null;
+        Idx -> lists:nth(Idx + 1, Row)
+    end;
+eval_expr({binop, Op, L, R}, Ctx) ->
+    A = eval_expr(L, Ctx),
+    B = eval_expr(R, Ctx),
+    eval_binop(Op, A, B).
+
+eval_binop("AND", A, B) -> {int, case v_truthy(A) andalso v_truthy(B) of true -> 1; false -> 0 end};
+eval_binop("OR", A, B) -> {int, case v_truthy(A) orelse v_truthy(B) of true -> 1; false -> 0 end};
+eval_binop(Op, A, B) ->
+    Cmp = v_cmp(A, B),
+    Result = case Op of
+        "=" -> Cmp =:= 0;
+        "<>" -> Cmp =/= 0;
+        "!=" -> Cmp =/= 0;
+        "<" -> Cmp < 0;
+        ">" -> Cmp > 0;
+        "<=" -> Cmp =< 0;
+        ">=" -> Cmp >= 0;
+        _ -> false
+    end,
+    {int, case Result of true -> 1; false -> 0 end}.
+```
+
+Wait, the C code doesn't handle `!=` in the comparison. Let me check:
+```c
+if (!strcmp(e->op,"=")) res=v_int(cmp==0);
+else if (!strcmp(e->op,"<>")) res=v_int(cmp!=0);
+else if (!strcmp(e->op,"<")) res=v_int(cmp<0);
+else if (!strcmp(e->op,">")) res=v_int(cmp>0);
+else if (!strcmp(e->op,"<=")) res=v_int(cmp<=0);
+else if (!strcmp(e->op,">=")) res=v_int(cmp>=0);
+```
+
+No `!=` handling. But the lexer does produce `!=`. So `!=` would fall through and `res` stays `v_null()`. Let me match this behavior:
+
+```erlang
+eval_binop(Op, A, B) ->
+    Cmp = v_cmp(A, B),
+    Result = case Op of
+        "=" -> Cmp =:= 0;
+        "<>" -> Cmp =/= 0;
+        "<" -> Cmp < 0;
+        ">" -> Cmp > 0;
+        "<=" -> Cmp =< 0;
+        ">=" -> Cmp >= 0;
+        _ -> null  %% unknown op, return null (C returns v_null())
+    end,
+    case Result of
+        null -> null;
+        true -> {int, 1};
+        false -> {int, 0}
+    end.
+```
+
+Now row_match:
+
+```erlang
+row_match(undefined, _Ctx) -> true;
+row_match(Expr, Ctx) ->
+    V = eval_expr(Expr, Ctx),
+    v_truthy(V).
+```
+
+Now sorting. The C code does insertion sort on the order column. For single-table, it maps directly. For joins, it tries to find the column but may fail (goto no_sort).
+
+```erlang
+sort_rows(Rows, TableRefs, TableData, Offsets, OrderCol, Desc) ->
+    case TableRefs of
+        [_Single] ->
+            [{Cols, _}] = [TD || {_, TD} <- TableData],
+            Cidx = index_of(OrderCol, Cols),
+            case Cidx >= 0 of
+                true ->
+                    SortFun = fun(A, B) ->
+                        Va = lists:nth(Cidx + 1, A),
+                        Vb = lists:nth(Cidx + 1, B),
+                        Cmp = v_cmp(Va, Vb),
+                        case Desc of
+                            true -> Cmp > 0;
+                            false -> Cmp < 0
+                        end
+                    end,
+                    lists:sort(SortFun, Rows);
+                false -> Rows
+            end;
+        _ -> Rows  %% multi-table: no sort (matches C behavior)
+    end.
+```
+
+Wait, the C code uses insertion sort, which is stable. `lists:sort` in Erlang is also stable. But the comparison function needs to return `true` if A should come before B. Let me check:
+
+For ascending: A before B if A < B, so `Cmp < 0` -> true
+For descending: A before B if A > B, so `Cmp > 0` -> true
+
+This looks correct.
+
+Now projection:
+
+```erlang
+project(Cols, Star, TableRefs, TableData, Offsets, Row) ->
+    case Star of
+        true ->
+            %% SELECT * - output all columns from all tables
+            Row;
+        false ->
+            %% Specific columns
+            lists:flatmap(
+                fun(Col) ->
+                    case Col of
+                        star ->
+                            %% table.* - output all columns from all tables
+                            Row;
+                        {star_table, _TName} ->
+                            %% Same as star in C implementation
+                            Row;
+                        {col, Name} ->
+                            case find_col(TableRefs, TableData, Offsets, Name) of
+                                not_found -> [null];
+                                Idx -> [lists:nth(Idx + 1, Row)]
+                            end
+                    end
+                end, Cols)
+    end.
+```
+
+Wait, but for `star` and `{star_table, _}`, the C code outputs all columns from all tables. But in my `project`, I'm using `flatmap`, so for `star` it would output the entire Row, which is correct. But if there are multiple result columns and one is `star`, it would duplicate. Let me check the C code:
+
+```c
+if (s->st.sel_star){
+    for (int i=0;i<n;i++) for (int j=0;j<tabs[i]->ncols;j++) s->outrow[s->nout++]=v_copy(&r->vals[offsets[i]+j]);
+} else {
+    for (int k=0;k<s->st.sel_ncols;k++){
+        ResultCol

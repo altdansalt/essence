@@ -1,3 +1,4 @@
 [2026-06-20T17:43:02Z] loop start: 1 languages, orig_tokens=8805
 [2026-06-20T17:43:02Z]   >>> porting ocaml (OCaml)
 [2026-06-20T17:46:56Z]       porter length-capped (16000 tok); retry high effort
+[2026-06-20T17:49:23Z]       porter done: 1904 bytes, 623 tokens, 381.2s

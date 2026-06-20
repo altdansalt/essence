@@ -1,0 +1,9 @@
+```json
+{
+  "completeness": 8,
+  "api_surface": 2,
+  "sql_features": 5,
+  "architecture": 3,
+  "notes": "The Erlang port provides only a single `project/6` function for column projection, missing ~95% of the implementation including lexer, parser, executor, database schema management, statement preparation, and all public API functions (sqlite3_open/close/exec/prepare_v2/step/finalize/column_*). No evidence of value types, table storage, WHERE filtering, JOIN handling, or ORDER BY sorting."
+}
+```

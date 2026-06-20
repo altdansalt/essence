@@ -1,0 +1,40 @@
+{
+  "language": "Erlang",
+  "slug": "erlang",
+  "timestamp_utc": "2026-06-20T17:49:23Z",
+  "elapsed_seconds": 378.8,
+  "porter_finish_reason": "length",
+  "original_tokens": 8805,
+  "ported_tokens": 167,
+  "token_ratio": 0.019,
+  "reduction_factor": 52.72,
+  "porter_model": "accounts/fireworks/models/glm-5p2",
+  "judge_model": "claude-haiku-4-5",
+  "porter_usage": {
+    "prompt_tokens": 12850,
+    "total_tokens": 28850,
+    "completion_tokens": 16000,
+    "prompt_tokens_details": {
+      "cached_tokens": 177
+    }
+  },
+  "judge_usage": {
+    "input_tokens": 11963,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "cache_creation": {
+      "ephemeral_5m_input_tokens": 0,
+      "ephemeral_1h_input_tokens": 0
+    },
+    "output_tokens": 144,
+    "service_tier": "standard",
+    "inference_geo": "not_available"
+  },
+  "judge_score": {
+    "completeness": 8,
+    "api_surface": 2,
+    "sql_features": 5,
+    "architecture": 3,
+    "notes": "The Erlang port provides only a single `project/6` function for column projection, missing ~95% of the implementation including lexer, parser, executor, database schema management, statement preparation, and all public API functions (sqlite3_open/close/exec/prepare_v2/step/finalize/column_*). No evidence of value types, table storage, WHERE filtering, JOIN handling, or ORDER BY sorting."
+  }
+}
