@@ -2,3 +2,15 @@
 [2026-06-20T17:04:04Z]   >>> porting haxe (Haxe)
 [2026-06-20T17:05:13Z]       porter done: 25676 bytes, 7182 tokens, 69.1s
 [2026-06-20T17:05:16Z]       judge: completeness=72 notes=Port captures core lexer, parser, and executor structure with correct SQL featur
+[main 9794d4f] port: haxe (Haxe) completeness=72
+ 6 files changed, 1370 insertions(+)
+ create mode 100644 logs/batch8.out
+ create mode 100644 runs/haxe/judge_raw.txt
+ create mode 100644 runs/haxe/meta.json
+ create mode 100644 runs/haxe/porter_raw.txt
+ create mode 100644 runs/haxe/sqlite_core.txt
+To https://github.com/altdansalt/essence.git
+   47d8c08..9794d4f  main -> main
+[2026-06-20T17:05:17Z]   >>> porting nostos (Nostos)
+[2026-06-20T17:07:48Z]       porter done: 102 bytes, 41 tokens, 150.6s
+[2026-06-20T17:07:49Z]       judge: completeness=2 notes=Ported code is a trivial struct mutation example in an unrelated language (Nosto

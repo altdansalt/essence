@@ -1,0 +1,9 @@
+```json
+{
+  "completeness": 2,
+  "api_surface": 5,
+  "sql_features": 0,
+  "architecture": 0,
+  "notes": "Ported code is a trivial struct mutation example in an unrelated language (Nostos) with zero implementation of SQLite functionality, schema, parsing, execution, or any SQL features."
+}
+```

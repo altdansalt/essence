@@ -1,0 +1,3 @@
+var type MutPoint = { x: Float, y: Float }
+mp = MutPoint(1.0, 2.0)
+mp.x = 5.0    # direct mutation OK

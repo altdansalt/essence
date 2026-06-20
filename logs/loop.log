@@ -17,3 +17,6 @@
 [2026-06-20T17:04:04Z]   >>> porting haxe (Haxe)
 [2026-06-20T17:05:13Z]       porter done: 25676 bytes, 7182 tokens, 69.1s
 [2026-06-20T17:05:16Z]       judge: completeness=72 notes=Port captures core lexer, parser, and executor structure with correct SQL featur
+[2026-06-20T17:05:17Z]   >>> porting nostos (Nostos)
+[2026-06-20T17:07:48Z]       porter done: 102 bytes, 41 tokens, 150.6s
+[2026-06-20T17:07:49Z]       judge: completeness=2 notes=Ported code is a trivial struct mutation example in an unrelated language (Nosto
