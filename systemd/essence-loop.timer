@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the essence porting loop periodically
+
+[Timer]
+# Every 20 minutes. Each run ports one language and pushes.
+OnBootSec=2min
+OnUnitActiveSec=20min
+# Don't pile up; one at a time
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,17 @@
+[Unit]
+Description=essence porting loop (port a language, judge, commit, push)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=exedev
+WorkingDirectory=/home/exedev/essence
+# Port one language per firing (the loop skips already-done slugs, so each
+# firing advances the set by one). --no-push disabled: we want it to push.
+# Logs go to logs/loop.log and journald.
+ExecStart=/usr/bin/python3 /home/exedev/essence/tools/loop.py --limit 1
+StandardOutput=append:/home/exedev/essence/logs/cron.log
+StandardError=append:/home/exedev/essence/logs/cron.log
+TimeoutStartSec=1800
+Nice=10
