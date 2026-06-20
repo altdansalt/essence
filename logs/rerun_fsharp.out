@@ -1,0 +1,13 @@
+[2026-06-20T17:24:29Z] loop start: 1 languages, orig_tokens=8805
+[2026-06-20T17:24:29Z]   >>> porting fsharp (F#)
+[2026-06-20T17:25:43Z]       porter done: 22758 bytes, 6037 tokens, 73.6s
+[2026-06-20T17:25:45Z]       judge: completeness=72 notes=The F# port captures the core lexer, parser, AST structure, and basic execution 
+[2026-06-20T17:25:45Z]       ERROR on fsharp: name 'finish' is not defined
+[2026-06-20T17:25:45Z] Traceback (most recent call last):
+  File "/home/exedev/essence/tools/loop.py", line 258, in main
+    record_run(lang, code, port_tokens, orig_tokens,
+  File "/home/exedev/essence/tools/loop.py", line 166, in record_run
+    "porter_finish_reason": finish,
+                            ^^^^^^
+NameError: name 'finish' is not defined
+
