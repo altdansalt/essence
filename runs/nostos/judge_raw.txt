@@ -1,0 +1,9 @@
+```json
+{
+  "completeness": 42,
+  "api_surface": 35,
+  "sql_features": 55,
+  "architecture": 45,
+  "notes": "The port captures core architectural elements (lexer, parser, AST, schema, executor) and translates most SQL features, but has critical gaps: no proper error handling/propagation, collectMatching's nested-loop logic is incomplete (generateCombo never builds correct Stmt records), ORDER BY implementation is broken, rowctxColindex uses imperative loops instead of functional search, and the SELECT execution path doesn't properly reconstruct combined rows from joins. API surface lacks prepare_v2 signature fidelity and column accessors don't match the original's return contracts."
+}
+```

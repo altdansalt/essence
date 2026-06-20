@@ -1,2 +1,5 @@
 [2026-06-20T17:34:47Z] loop start: 1 languages, orig_tokens=8805
 [2026-06-20T17:34:47Z]   >>> porting nostos (Nostos)
+[2026-06-20T17:37:33Z]       porter length-capped (16000 tok); retry high effort
+[2026-06-20T17:38:31Z]       porter done: 25385 bytes, 6506 tokens, 224.7s
+[2026-06-20T17:38:35Z]       judge: completeness=42 notes=The port captures core architectural elements (lexer, parser, AST, schema, execu

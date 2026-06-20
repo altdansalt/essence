@@ -106,3 +106,8 @@ NameError: name 'finish' is not defined
 [2026-06-20T17:35:57Z]       porter done: 24139 bytes, 6298 tokens, 69.7s
 [2026-06-20T17:35:59Z]       judge: completeness=32 notes=The F# port has significant structural issues: Parser class lacks proper positio
 [2026-06-20T17:36:01Z] loop done: 1 runs
+[2026-06-20T17:37:17Z]       porter length-capped (16000 tok); retry high effort
+[2026-06-20T17:37:33Z]       porter length-capped (16000 tok); retry high effort
+[2026-06-20T17:37:35Z]       porter length-capped (16000 tok); retry high effort
+[2026-06-20T17:38:31Z]       porter done: 25385 bytes, 6506 tokens, 224.7s
+[2026-06-20T17:38:35Z]       judge: completeness=42 notes=The port captures core architectural elements (lexer, parser, AST, schema, execu

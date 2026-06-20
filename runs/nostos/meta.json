@@ -1,0 +1,40 @@
+{
+  "language": "Nostos",
+  "slug": "nostos",
+  "timestamp_utc": "2026-06-20T17:38:35Z",
+  "elapsed_seconds": 224.7,
+  "porter_finish_reason": "stop",
+  "original_tokens": 8805,
+  "ported_tokens": 6506,
+  "token_ratio": 0.7389,
+  "reduction_factor": 1.35,
+  "porter_model": "accounts/fireworks/models/glm-5p2",
+  "judge_model": "claude-haiku-4-5",
+  "porter_usage": {
+    "prompt_tokens": 13913,
+    "total_tokens": 20504,
+    "completion_tokens": 6591,
+    "prompt_tokens_details": {
+      "cached_tokens": 177
+    }
+  },
+  "judge_usage": {
+    "input_tokens": 20208,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "cache_creation": {
+      "ephemeral_5m_input_tokens": 0,
+      "ephemeral_1h_input_tokens": 0
+    },
+    "output_tokens": 174,
+    "service_tier": "standard",
+    "inference_geo": "not_available"
+  },
+  "judge_score": {
+    "completeness": 42,
+    "api_surface": 35,
+    "sql_features": 55,
+    "architecture": 45,
+    "notes": "The port captures core architectural elements (lexer, parser, AST, schema, executor) and translates most SQL features, but has critical gaps: no proper error handling/propagation, collectMatching's nested-loop logic is incomplete (generateCombo never builds correct Stmt records), ORDER BY implementation is broken, rowctxColindex uses imperative loops instead of functional search, and the SELECT execution path doesn't properly reconstruct combined rows from joins. API surface lacks prepare_v2 signature fidelity and column accessors don't match the original's return contracts."
+  }
+}

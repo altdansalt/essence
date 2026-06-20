@@ -1,0 +1,821 @@
+## sqlite_core.nos -- compact in-memory SQLite-style SQL engine ported from C.
+## Implements: CREATE TABLE, INSERT ... VALUES, SELECT with projections,
+## SELECT *, WHERE (=,<>,<,>,<=,>=,AND,OR), ORDER BY [DESC|ASC], INNER JOIN ... ON.
+## Public API: Sqlite3.open/exec/prepare/step/finalize/close,
+## Stmt.columnCount/columnText/columnInt64, errmsg.
+
+## ---------- Value ----------
+type VType = VNull | VInt | VText
+
+type Value = {
+    type: VType,
+    ival: Int,
+    sval: String
+}
+
+vNull() = Value(VNull, 0, "")
+vInt(i) = Value(VInt, i, "")
+vText(s) = Value(VText, 0, if s == null then "" else s)
+
+vCopy(v) = match v.type {
+    VText -> vText(v.sval)
+    _ -> v
+}
+
+vCmp(a, b) = match (a.type, b.type) {
+    (VNull, VNull) -> 0
+    (VNull, _) -> -1
+    (_, VNull) -> 1
+    (VInt, VInt) -> if a.ival < b.ival then -1 else if a.ival > b.ival then 1 else 0
+    (VText, VText) -> {
+        sa = if a.sval == null then "" else a.sval
+        sb = if b.sval == null then "" else b.sval
+        if sa < sb then -1 else if sa > sb then 1 else 0
+    }
+    (VInt, VText) -> -1
+    (VText, VInt) -> 1
+}
+
+vToText(v) = match v.type {
+    VInt -> show(v.ival)
+    VText -> if v.sval == null then "" else v.sval
+    VNull -> "NULL"
+}
+
+vTruthy(v) = vCmp(v, vInt(0)) != 0
+
+## ---------- Schema ----------
+type Table = { name: String, cols: List[String] }
+type Schema = { tables: List[Table] }
+
+schemaFind(s, name) = {
+    ln = name.toLower()
+    s.tables.find(t => t.name.toLower() == ln)
+}
+
+schemaIndex(s, name) = {
+    ln = name.toLower()
+    s.tables.indexWhere(t => t.name.toLower() == ln)
+}
+
+schemaAdd(s, name, cols) = {
+    case schemaFind(s, name) of {
+        Some(_) -> Err("table already exists: " ++ name)
+        None -> Ok({ tables: s.tables ++ [Table(name, cols)] })
+    }
+}
+
+tableColIndex(t, col) = {
+    lc = col.toLower()
+    t.cols.indexWhere(c => c.toLower() == lc)
+}
+
+## ---------- Row / store ----------
+type Row = { vals: List[Value] }
+type RowStore = { rows: List[Row] }
+
+## ---------- Lexer ----------
+type TokKind =
+    TkEof | TkId | TkInt | TkString | TkKw | TkPunct
+    | TkStar | TkComma | TkLp | TkRp | TkSemi | TkOp | TkDot
+
+type Token = { kind: TokKind, text: String }
+
+KEYWORDS = [
+    "create","table","insert","into","values","select","from","where",
+    "order","by","asc","desc","and","or","not","null","begin","commit",
+    "inner","join","on","int","integer","text","primary","key","transaction"
+]
+
+isKw(s) = KEYWORDS.any(k => k.toLower() == s.toLower())
+
+isAlpha(c) = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'
+isAlnum(c) = isAlpha(c) || (c >= '0' && c <= '9')
+isDigit(c) = c >= '0' && c <= '9'
+isSpace(c) = c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v'
+
+lex(src) = {
+    chars = src.chars()
+    n = chars.length()
+    var pos = 0
+    var toks = []
+
+    while pos < n {
+        c = chars[pos]
+        if isSpace(c) then { pos += 1; () }
+        else if c == '-' && pos + 1 < n && chars[pos + 1] == '-' then {
+            while pos < n && chars[pos] != '\n' { pos += 1 }
+            ()
+        }
+        else if isAlpha(c) then {
+            start = pos
+            while pos < n && isAlnum(chars[pos]) { pos += 1 }
+            word = chars.slice(start, pos).join("")
+            toks = toks ++ [Token(if isKw(word) then TkKw else TkId, word)]
+            ()
+        }
+        else if isDigit(c) then {
+            start = pos
+            while pos < n && isDigit(chars[pos]) { pos += 1 }
+            toks = toks ++ [Token(TkInt, chars.slice(start, pos).join(""))]
+            ()
+        }
+        else if c == '\'' then {
+            pos += 1
+            start = pos
+            while pos < n && chars[pos] != '\'' { pos += 1 }
+            toks = toks ++ [Token(TkString, chars.slice(start, pos).join(""))]
+            if pos < n then pos += 1
+            ()
+        }
+        else if c == '"' then {
+            pos += 1
+            start = pos
+            while pos < n && chars[pos] != '"' { pos += 1 }
+            toks = toks ++ [Token(TkId, chars.slice(start, pos).join(""))]
+            if pos < n then pos += 1
+            ()
+        }
+        else {
+            single = match c {
+                '*' -> Token(TkStar, "*")
+                ',' -> Token(TkComma, ",")
+                '(' -> Token(TkLp, "(")
+                ')' -> Token(TkRp, ")")
+                ';' -> Token(TkSemi, ";")
+                '.' -> Token(TkDot, ".")
+                _ -> {
+                    if c == '=' || c == '<' || c == '>' || c == '!' then {
+                        start = pos
+                        if pos + 1 < n && chars[pos + 1] == '=' then pos += 1
+                        if c == '<' && pos + 1 < n && chars[pos + 1] == '>' then pos += 1
+                        if c == '!' && pos + 1 < n && chars[pos + 1] == '=' then pos += 1
+                        pos += 1
+                        Token(TkOp, chars.slice(start, pos).join(""))
+                    } else {
+                        Token(TkPunct, show(c))
+                    }
+                }
+            }
+            pos += 1
+            toks = toks ++ [single]
+            ()
+        }
+    }
+    toks ++ [Token(TkEof, "")]
+}
+
+## ---------- AST ----------
+type Expr =
+    | ECol(String)
+    | EInt(Int)
+    | EStr(String)
+    | EBinop(String, Expr, Expr)
+
+type ResultCol = { col: String, star: Bool }
+type TableRef = { tname: String, alias: String }
+
+type Stmt =
+    | SCreate(String, List[String])
+    | SInsert(String, List[Value])
+    | SSelect(List[ResultCol], Bool, List[TableRef], Option[Expr], Option[String], Bool, Option[Expr])
+    | SBegin
+    | SCommit
+
+## ---------- Parser ----------
+type Parser = { toks: List[Token], var i: Int }
+
+pPeek(p) = p.toks[p.i]
+pPeekAt(p, off) = p.toks[p.i + off]
+
+pAccept(p, k) = {
+    t = pPeek(p)
+    if t.kind == k then { p.i += 1; true } else false
+}
+
+pAcceptKw(p, kw) = {
+    t = pPeek(p)
+    if t.kind == TkKw && t.text.toLower() == kw.toLower() then { p.i += 1; true } else false
+}
+
+pPeekKw(p, kw) = {
+    t = pPeek(p)
+    t.kind == TkKw && t.text.toLower() == kw.toLower()
+}
+
+parsePrimary(p) = {
+    t = pPeek(p)
+    match t.kind {
+        TkInt -> { p.i += 1; EInt(toInt(t.text)) }
+        TkString -> { p.i += 1; EStr(t.text) }
+        TkId -> {
+            col = t.text
+            p.i += 1
+            if pPeek(p).kind == TkDot then {
+                p.i += 1
+                col = col ++ "." ++ pPeek(p).text
+                p.i += 1
+            }
+            ECol(col)
+        }
+        TkKw -> {
+            col = t.text
+            p.i += 1
+            if pPeek(p).kind == TkDot then {
+                p.i += 1
+                col = col ++ "." ++ pPeek(p).text
+                p.i += 1
+            }
+            ECol(col)
+        }
+        TkLp -> {
+            p.i += 1
+            e = parseExpr(p)
+            pAccept(p, TkRp)
+            e
+        }
+        _ -> EInt(0)
+    }
+}
+
+parseCmp(p) = {
+    l = parsePrimary(p)
+    if pPeek(p).kind == TkOp then {
+        op = pPeek(p).text
+        p.i += 1
+        r = parsePrimary(p)
+        EBinop(op, l, r)
+    } else l
+}
+
+parseExpr(p) = {
+    l = parseCmp(p)
+    if pPeekKw(p, "and") then {
+        p.i += 1
+        r = parseExpr(p)
+        EBinop("AND", l, r)
+    } else if pPeekKw(p, "or") then {
+        p.i += 1
+        r = parseExpr(p)
+        EBinop("OR", l, r)
+    } else l
+}
+
+parseCreate(p) = {
+    t = pPeek(p)
+    if t.kind != TkId && t.kind != TkKw then Err("parse error")
+    else {
+        name = t.text
+        p.i += 1
+        if !pAccept(p, TkLp) then Err("parse error")
+        else {
+            var cols = []
+            while pPeek(p).kind != TkRp && pPeek(p).kind != TkEof {
+                ct = pPeek(p)
+                if ct.kind != TkId && ct.kind != TkKw then { cols = cols; () }
+                else {
+                    cols = cols ++ [ct.text]
+                    p.i += 1
+                    while pPeek(p).kind != TkComma && pPeek(p).kind != TkRp && pPeek(p).kind != TkEof {
+                        p.i += 1
+                    }
+                    pAccept(p, TkComma)
+                }
+            }
+            pAccept(p, TkRp)
+            Ok(SCreate(name, cols))
+        }
+    }
+}
+
+parseInsert(p) = {
+    if !pAcceptKw(p, "into") then Err("parse error")
+    else {
+        t = pPeek(p)
+        if t.kind != TkId then Err("parse error")
+        else {
+            table = t.text
+            p.i += 1
+            if !pAcceptKw(p, "values") then Err("parse error")
+            else if !pAccept(p, TkLp) then Err("parse error")
+            else {
+                var vals = []
+                while pPeek(p).kind != TkRp && pPeek(p).kind != TkEof {
+                    vt = pPeek(p)
+                    v = match vt.kind {
+                        TkInt -> { vInt(toInt(vt.text)) }
+                        TkString -> { vText(vt.text) }
+                        TkKw -> {
+                            if vt.text.toLower() == "null" then vNull()
+                            else vNull()
+                        }
+                        _ -> vNull()
+                    }
+                    if vt.kind == TkInt || vt.kind == TkString || (vt.kind == TkKw && vt.text.toLower() == "null") then {
+                        p.i += 1
+                        vals = vals ++ [v]
+                        if !pAccept(p, TkComma) then ()
+                    } else ()
+                }
+                pAccept(p, TkRp)
+                Ok(SInsert(table, vals))
+            }
+        }
+    }
+}
+
+parseSelect(p) = {
+    var selStar = false
+    var selCols = []
+    if pAccept(p, TkStar) then {
+        selStar = true
+    } else {
+        var done = false
+        while !done {
+            if pAccept(p, TkStar) then {
+                selCols = selCols ++ [ResultCol("", true)]
+            } else {
+                t = pPeek(p)
+                if t.kind == TkId || t.kind == TkKw then {
+                    col = t.text
+                    p.i += 1
+                    if pPeek(p).kind == TkDot then {
+                        p.i += 1
+                        if pAccept(p, TkStar) then {
+                            selCols = selCols ++ [ResultCol(col, true)]
+                        } else {
+                            col = col ++ "." ++ pPeek(p).text
+                            p.i += 1
+                            selCols = selCols ++ [ResultCol(col, false)]
+                        }
+                    } else {
+                        selCols = selCols ++ [ResultCol(col, false)]
+                    }
+                } else {
+                    done = true
+                }
+            }
+            if !pAccept(p, TkComma) then done = true
+        }
+    }
+    if !pAcceptKw(p, "from") then Err("parse error")
+    else {
+        t = pPeek(p)
+        if t.kind != TkId then Err("parse error")
+        else {
+            var tables = []
+            tname = t.text
+            p.i += 1
+            alias = ""
+            nt = pPeek(p)
+            if nt.kind == TkId && !pPeekKw(p, "on") && !pPeekKw(p, "where")
+               && !pPeekKw(p, "order") && !pPeekKw(p, "inner") && !pPeekKw(p, "join") then {
+                alias = nt.text
+                p.i += 1
+            }
+            tables = tables ++ [TableRef(tname, alias)]
+
+            var joinOn = None
+            while pPeekKw(p, "inner") || pPeekKw(p, "join") {
+                if pAcceptKw(p, "inner") then { pAcceptKw(p, "join") }
+                else { pAcceptKw(p, "join") }
+                jt = pPeek(p)
+                if jt.kind != TkId then { () }
+                else {
+                    jname = jt.text
+                    p.i += 1
+                    jalias = ""
+                    jnt = pPeek(p)
+                    if jnt.kind == TkId && !pPeekKw(p, "on") && !pPeekKw(p, "where") && !pPeekKw(p, "order") then {
+                        jalias = jnt.text
+                        p.i += 1
+                    }
+                    tables = tables ++ [TableRef(jname, jalias)]
+                    if pAcceptKw(p, "on") then {
+                        onExpr = parseExpr(p)
+                        joinOn = match joinOn {
+                            None -> Some(onExpr)
+                            Some(existing) -> Some(EBinop("AND", existing, onExpr))
+                        }
+                    }
+                }
+            }
+
+            selWhere = None
+            if pAcceptKw(p, "where") then {
+                selWhere = Some(parseExpr(p))
+            }
+
+            orderCol = None
+            orderDesc = false
+            if pAcceptKw(p, "order") then {
+                if pAcceptKw(p, "by") then {
+                    ot = pPeek(p)
+                    if ot.kind == TkId || ot.kind == TkKw then {
+                        orderCol = Some(ot.text)
+                        p.i += 1
+                        if pAcceptKw(p, "desc") then { orderDesc = true }
+                        else { pAcceptKw(p, "asc") }
+                    }
+                }
+            }
+
+            Ok(SSelect(selCols, selStar, tables, selWhere, orderCol, orderDesc, joinOn))
+        }
+    }
+}
+
+parse(p) = {
+    if pPeekKw(p, "begin") then {
+        p.i += 1
+        pAcceptKw(p, "transaction")
+        Ok(SBegin)
+    } else if pPeekKw(p, "commit") then {
+        p.i += 1
+        pAcceptKw(p, "transaction")
+        Ok(SCommit)
+    } else if pAcceptKw(p, "create") then {
+        if pAcceptKw(p, "table") then parseCreate(p)
+        else Err("parse error")
+    } else if pAcceptKw(p, "insert") then {
+        parseInsert(p)
+    } else if pAcceptKw(p, "select") then {
+        parseSelect(p)
+    } else Err("parse error")
+}
+
+## ---------- Database ----------
+type Sqlite3 = {
+    schema: Schema,
+    stores: List[RowStore],
+    var errmsg: String,
+    var inTxn: Bool
+}
+
+type Sqlite3Stmt = {
+    db: Sqlite3,
+    stmt: Stmt,
+    var started: Bool,
+    var done: Bool,
+    var sorted: List[List[Value]],
+    var curSorted: Int,
+    var outrow: List[Value]
+}
+
+## ---------- expression eval ----------
+type RowCtx = {
+    refs: List[TableRef],
+    tabs: List[Table],
+    rows: List[List[Value]]
+}
+
+rowctxColindex(c, col) = {
+    dotPos = col.indexOf(".")
+    if dotPos >= 0 then {
+        tname = col.substring(0, dotPos)
+        cname = col.substring(dotPos + 1)
+        result = None
+        for i = 0 to c.refs.length() {
+            if result == None then {
+                ref = c.refs[i]
+                tn = if ref.alias != "" then ref.alias else ref.tname
+                if tn.toLower() == tname.toLower() then {
+                    ci = tableColIndex(c.tabs[i], cname)
+                    if ci >= 0 then { result = Some((i, ci)) }
+                }
+            }
+        }
+        result
+    } else {
+        result = None
+        for i = 0 to c.tabs.length() {
+            if result == None then {
+                ci = tableColIndex(c.tabs[i], col)
+                if ci >= 0 then { result = Some((i, ci)) }
+            }
+        }
+        result
+    }
+}
+
+evalExpr(e, c) = match e {
+    EInt(v) -> vInt(v)
+    EStr(s) -> vText(s)
+    ECol(col) -> {
+        case rowctxColindex(c, col) of {
+            None -> vNull()
+            Some((ti, ci)) -> vCopy(c.rows[ti][ci])
+        }
+    }
+    EBinop(op, l, r) -> {
+        a = evalExpr(l, c)
+        b = evalExpr(r, c)
+        match op.toLower() {
+            "and" -> vInt(if vTruthy(a) && vTruthy(b) then 1 else 0)
+            "or" -> vInt(if vTruthy(a) || vTruthy(b) then 1 else 0)
+            _ -> {
+                cmp = vCmp(a, b)
+                res = match op {
+                    "=" -> cmp == 0
+                    "<>" -> cmp != 0
+                    "<" -> cmp < 0
+                    ">" -> cmp > 0
+                    "<=" -> cmp <= 0
+                    ">=" -> cmp >= 0
+                    _ -> false
+                }
+                vInt(if res then 1 else 0)
+            }
+        }
+    }
+}
+
+rowMatch(whereExpr, c) = match whereExpr {
+    None -> true
+    Some(e) -> vTruthy(evalExpr(e, c))
+}
+
+## ---------- nested-loop join collection ----------
+collectMatching(db, stmt) = {
+    n = stmt.selTables.length()
+    idxs = stmt.selTables.map(t => schemaIndex(db.schema, t.tname))
+    tabs = stmt.selTables.map(t => {
+        case schemaFind(db.schema, t.tname) of {
+            Some(tab) -> tab
+            None -> Table("", [])
+        }
+    })
+    storeRows = idxs.map(i => {
+        if i >= 0 then db.stores[i].rows else []
+    })
+
+    ## nested loop: generate all combinations
+    var results = []
+
+    generateCombo(depth, currentRows) = {
+        if depth == n then {
+            ctx = RowCtx(stmt.selTables, tabs, currentRows)
+            if rowMatch(stmt.selWhere, ctx) && rowMatch(stmt.selJoinOn, ctx) then {
+                combined = currentRows.flatten()
+                results = results ++ [combined]
+            }
+        } else {
+            for row in storeRows[depth] {
+                generateCombo(depth + 1, currentRows ++ [row.vals])
+            }
+        }
+    }
+
+    generateCombo(0, [])
+
+    ## ORDER BY
+    case stmt.selOrderCol of {
+        None -> results
+        Some(ocol) -> {
+            if n == 1 then {
+                cidx = tableColIndex(tabs[0], ocol)
+                if cidx >= 0 then {
+                    results.sortWith((ra, rb) => {
+                        cmp = vCmp(ra[cidx], rb[cidx])
+                        if stmt.selOrderDesc then {
+                            if cmp > 0 then true else false
+                        } else {
+                            if cmp < 0 then true else false
+                        }
+                    })
+                } else results
+            } else results
+        }
+    }
+}
+
+## ---------- prepared statement step ----------
+stmtStepSelect(s) = {
+    stmt = s.stmt
+    case stmt of {
+        SSelect(selCols, selStar, selTables, selWhere, orderCol, orderDesc, joinOn) -> {
+            if !s.started then {
+                s.started = true
+                fullStmt = SSelect(selCols, selStar, selTables, selWhere, orderCol, orderDesc, joinOn)
+                s.sorted = collectMatching(s.db, fullStmt)
+                s.curSorted = 0
+            }
+            if s.curSorted >= s.sorted.length() then 101
+            else {
+                r = s.sorted[s.curSorted]
+                s.curSorted += 1
+                n = selTables.length()
+                tabs = selTables.map(t => {
+                    case schemaFind(s.db.schema, t.tname) of {
+                        Some(tab) -> tab
+                        None -> Table("", [])
+                    }
+                })
+                ## compute offsets
+                var offsets = []
+                var off = 0
+                for i = 0 to n {
+                    offsets = offsets ++ [off]
+                    off += tabs[i].cols.length()
+                }
+
+                ## build output
+                var outrow = []
+                if selStar then {
+                    for i = 0 to n {
+                        for j = 0 to tabs[i].cols.length() {
+                            outrow = outrow ++ [vCopy(r[offsets[i] + j])]
+                        }
+                    }
+                } else {
+                    for k = 0 to selCols.length() {
+                        rc = selCols[k]
+                        if rc.star then {
+                            for i = 0 to n {
+                                for j = 0 to tabs[i].cols.length() {
+                                    outrow = outrow ++ [vCopy(r[offsets[i] + j])]
+                                }
+                            }
+                        } else {
+                            dotPos = rc.col.indexOf(".")
+                            case dotPos >= 0 of {
+                                true -> {
+                                    tname = rc.col.substring(0, dotPos)
+                                    cname = rc.col.substring(dotPos + 1)
+                                    ti = 0
+                                    ci = -1
+                                    for i = 0 to n {
+                                        if ci < 0 then {
+                                            ref = selTables[i]
+                                            tn = if ref.alias != "" then ref.alias else ref.tname
+                                            if tn.toLower() == tname.toLower() then {
+                                                ci = tableColIndex(tabs[i], cname)
+                                                ti = i
+                                            }
+                                        }
+                                    }
+                                    if ci < 0 then { outrow = outrow ++ [vNull()] }
+                                    else { outrow = outrow ++ [vCopy(r[offsets[ti] + ci])] }
+                                }
+                                false -> {
+                                    ti = 0
+                                    ci = -1
+                                    for i = 0 to n {
+                                        if ci < 0 then {
+                                            ci = tableColIndex(tabs[i], rc.col)
+                                            ti = i
+                                        }
+                                    }
+                                    if ci < 0 then { outrow = outrow ++ [vNull()] }
+                                    else { outrow = outrow ++ [vCopy(r[offsets[ti] + ci])] }
+                                }
+                            }
+                        }
+                    }
+                }
+                s.outrow = outrow
+                100
+            }
+        }
+        _ -> 101
+    }
+}
+
+## ---------- public API ----------
+Sqlite3.open(name) = {
+    Sqlite3(Schema([]), [], "", false)
+}
+
+Sqlite3.close(db) = 0
+
+Sqlite3.errmsg(db) = if db == null then "" else db.errmsg
+
+dbExecCreate(db, name, cols) = {
+    case schemaAdd(db.schema, name, cols) of {
+        Ok(newSchema) -> {
+            db.schema = newSchema
+            db.stores = db.stores ++ [RowStore([])]
+            0
+        }
+        Err(msg) -> { db.errmsg = msg; -1 }
+    }
+}
+
+dbExecInsert(db, table, vals) = {
+    idx = schemaIndex(db.schema, table)
+    if idx < 0 then {
+        db.errmsg = "no such table: " ++ table
+        -1
+    } else {
+        rs = db.stores[idx]
+        newRows = rs.rows ++ [Row(vals.map(v => vCopy(v)))]
+        db.stores = db.stores.set(idx, RowStore(newRows))
+        0
+    }
+}
+
+Sqlite3.exec(db, sql, cb, arg) = {
+    toks = lex(sql)
+    p = Parser(toks, 0)
+    var rc = 0
+    var stop = false
+    while !stop && pPeek(p).kind != TkEof {
+        case parse(p) of {
+            Err(msg) -> { rc = 1; db.errmsg = msg; stop = true }
+            Ok(stmt) -> {
+                pAccept(p, TkSemi)
+                match stmt {
+                    SBegin -> { db.inTxn = true }
+                    SCommit -> { db.inTxn = false }
+                    SCreate(name, cols) -> {
+                        r = dbExecCreate(db, name, cols)
+                        if r != 0 then { rc = r; stop = true }
+                    }
+                    SInsert(table, vals) -> {
+                        r = dbExecInsert(db, table, vals)
+                        if r != 0 then { rc = r; stop = true }
+                    }
+                    SSelect(_, _, _, _, _, _, _) -> {
+                        s = Sqlite3Stmt(db, stmt, false, false, [], 0, [])
+                        var stepping = true
+                        while stepping {
+                            r = stmtStepSelect(s)
+                            if r == 100 then {
+                                vals = s.outrow.map(v => vToText(v))
+                                if cb != null then cb(arg, vals.length(), vals)
+                            } else {
+                                stepping = false
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    rc
+}
+
+Sqlite3.prepare(db, sql) = {
+    toks = lex(sql)
+    p = Parser(toks, 0)
+    case parse(p) of {
+        Err(msg) -> { db.errmsg = msg; Err(msg) }
+        Ok(stmt) -> {
+            pAccept(p, TkSemi)
+            Ok(Sqlite3Stmt(db, stmt, false, false, [], 0, []))
+        }
+    }
+}
+
+Sqlite3.step(s) = {
+    case s.stmt of {
+        SSelect(_, _, _, _, _, _, _) -> stmtStepSelect(s)
+        _ -> 101
+    }
+}
+
+Sqlite3.columnCount(s) = s.outrow.length()
+
+Sqlite3.columnText(s, i) = {
+    if i < 0 || i >= s.outrow.length() then null
+    else vToText(s.outrow[i])
+}
+
+Sqlite3.columnInt64(s, i) = {
+    if i < 0 || i >= s.outrow.length() then 0
+    else {
+        v = s.outrow[i]
+        case v.type of { VInt -> v.ival; _ -> 0 }
+    }
+}
+
+Sqlite3.finalize(s) = 0
+
+## ---------- demo ----------
+printRow(arg, n, vals) = {
+    var line = ""
+    for i = 0 to n {
+        line = line ++ vals[i]
+        if i + 1 < n then { line = line ++ " | " }
+    }
+    println(line)
+}
+
+main() = {
+    case Sqlite3.open(":memory:") of {
+        db -> {
+            sql =
+                "CREATE TABLE users (id INTEGER, name TEXT);"
+                ++ "INSERT INTO users VALUES (1, 'ada');"
+                ++ "INSERT INTO users VALUES (2, 'grace');"
+                ++ "INSERT INTO users VALUES (3, 'linus');"
+                ++ "SELECT * FROM users WHERE id > 1 ORDER BY id DESC;"
+
+            rc = Sqlite3.exec(db, sql, printRow, null)
+            if rc != 0 then {
+                println("err: " ++ Sqlite3.errmsg(db))
+            }
+            Sqlite3.close(db)
+        }
+    }
+}
