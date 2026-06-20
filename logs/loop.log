@@ -82,3 +82,15 @@ NameError: name 'finish' is not defined
 NameError: name 'finish' is not defined
 
 [2026-06-20T17:25:57Z] loop done: 0 runs
+[2026-06-20T17:30:10Z]       porter length-capped (16000 tok); retry high effort
+[2026-06-20T17:33:00Z]       porter done: 189 bytes, 58 tokens, 508.0s
+[2026-06-20T17:33:02Z]       judge: completeness=5 notes=The port is a bare skeleton with only a class declaration and one method stub. I
+[2026-06-20T17:33:02Z]       ERROR on vim9script: name 'finish' is not defined
+[2026-06-20T17:33:02Z] Traceback (most recent call last):
+  File "/home/exedev/essence/tools/loop.py", line 258, in main
+    log(f"      judge: completeness={comp} notes={score.get('notes','')[:80]}")
+  File "/home/exedev/essence/tools/loop.py", line 166, in record_run
+    "elapsed_seconds": round(elapsed, 1),
+                            ^^^^^^
+NameError: name 'finish' is not defined
+

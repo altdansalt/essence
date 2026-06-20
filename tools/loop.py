@@ -150,7 +150,8 @@ def parse_judge(text: str) -> dict:
 
 def record_run(lang: dict, ported_code: str, port_tokens: int, orig_tokens: int,
                porter_usage: dict, judge_score: dict, judge_usage: dict,
-               elapsed: float, raw_porter: str, raw_judge: str) -> str:
+               elapsed: float, raw_porter: str, raw_judge: str,
+               finish: str = "") -> str:
     slug = lang["slug"]
     rundir = os.path.join(RUNS_DIR, slug)
     os.makedirs(rundir, exist_ok=True)
@@ -256,7 +257,8 @@ def main(argv: list[str]) -> int:
             comp = score.get("completeness", 0)
             log(f"      judge: completeness={comp} notes={score.get('notes','')[:80]}")
             record_run(lang, code, port_tokens, orig_tokens,
-                        porter_usage, score, judge_usage, elapsed, raw_porter, raw_judge)
+                        porter_usage, score, judge_usage, elapsed, raw_porter, raw_judge,
+                        finish)
             done += 1
             commit_push(f"port: {slug} ({lang['name']}) completeness={comp}", not args.no_push)
         except Exception as e:

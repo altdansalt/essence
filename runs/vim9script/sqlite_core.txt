@@ -1,0 +1,9 @@
+class Sqlite3
+  var tables: list<dict<any>> = []
+  var stores: list<list<list<dict<any>>>> = []
+  var _errmsg: string = ''
+
+  def errmsg(): string
+    return this._errmsg
+  enddef
+endclass

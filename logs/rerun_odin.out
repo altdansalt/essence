@@ -15,3 +15,30 @@ NameError: name 'finish' is not defined
  5 files changed, 954 insertions(+)
  create mode 100644 runs/odin/ERROR.txt
  create mode 100644 runs/odin/sqlite_core.odin
+To https://github.com/altdansalt/essence.git
+ ! [remote rejected] main -> main (cannot lock ref 'refs/heads/main': is at d4169485e8844485a692ec08da0a43cb0f28d4be but expected 5c61a5d5c4dabf714fc5de10387b0dd35c5539bb)
+error: failed to push some refs to 'https://github.com/altdansalt/essence.git'
+Traceback (most recent call last):
+  File "/home/exedev/essence/tools/loop.py", line 258, in main
+    record_run(lang, code, port_tokens, orig_tokens,
+  File "/home/exedev/essence/tools/loop.py", line 166, in record_run
+    "porter_finish_reason": finish,
+                            ^^^^^^
+NameError: name 'finish' is not defined
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/home/exedev/essence/tools/loop.py", line 305, in <module>
+    raise SystemExit(main(sys.argv[1:]))
+                     ^^^^^^^^^^^^^^^^^^
+  File "/home/exedev/essence/tools/loop.py", line 268, in main
+    commit_push(f"port: {slug} failed: {e}", not args.no_push)
+  File "/home/exedev/essence/tools/loop.py", line 210, in commit_push
+    git("push")
+  File "/home/exedev/essence/tools/loop.py", line 200, in git
+    return subprocess.run(["git", *args], cwd=ROOT, check=check).returncode
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/subprocess.py", line 571, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['git', 'push']' returned non-zero exit status 1.
