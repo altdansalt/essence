@@ -1,0 +1,9 @@
+```json
+{
+  "completeness": 78,
+  "api_surface": 85,
+  "sql_features": 75,
+  "architecture": 80,
+  "notes": "TypeScript port captures the core API surface and SQL features well, but has incomplete cleanup (missing finalize memory cleanup), partially working ORDER BY (only single-table), and missing support for transaction management semantics. The nested-loop join logic and expression evaluation are functionally equivalent."
+}
+```

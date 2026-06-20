@@ -1,0 +1,4 @@
+[2026-06-20T17:43:02Z] loop start: 1 languages, orig_tokens=8805
+[2026-06-20T17:43:02Z]   >>> porting typescript (TypeScript)
+[2026-06-20T17:44:02Z]       porter done: 21100 bytes, 6291 tokens, 60.1s
+[2026-06-20T17:44:04Z]       judge: completeness=78 notes=TypeScript port captures the core API surface and SQL features well, but has inc

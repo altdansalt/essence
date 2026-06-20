@@ -1,0 +1,616 @@
+```typescript
+// sqlite_core.ts -- compact in-memory SQLite-style SQL engine (TypeScript port)
+
+type VType = 0 | 1 | 2; // V_NULL=0, V_INT=1, V_TEXT=2
+
+class Value {
+  constructor(public type: VType, public ival: number = 0, public sval: string = "") {}
+  static null() { return new Value(0); }
+  static int(i: number) { return new Value(1, i); }
+  static text(s: string) { return new Value(2, 0, s ?? ""); }
+  copy(): Value { return this.type === 2 ? Value.text(this.sval) : new Value(this.type, this.ival); }
+  cmp(b: Value): number {
+    if (this.type !== b.type) return this.type - b.type;
+    if (this.type === 1) return this.ival < b.ival ? -1 : this.ival > b.ival ? 1 : 0;
+    if (this.type === 2) return (this.sval ?? "").localeCompare(b.sval ?? "");
+    return 0;
+  }
+  toText(): string {
+    if (this.type === 1) return String(this.ival);
+    if (this.type === 2) return this.sval;
+    return "NULL";
+  }
+  truthy(): boolean { return this.cmp(Value.int(0)) !== 0; }
+}
+
+// ---------- Schema ----------
+class Table {
+  constructor(public name: string, public cols: string[]) {}
+  colIndex(col: string): number {
+    return this.cols.findIndex(c => c.toLowerCase() === col.toLowerCase());
+  }
+}
+
+// ---------- Row / Store ----------
+class Row { constructor(public vals: Value[] = []) {} }
+type RowNode = { row: Row; next: RowNode | null };
+
+class RowStore {
+  head: RowNode | null = null;
+  tail: RowNode | null = null;
+  nrows = 0;
+  append(row: Row) {
+    const n: RowNode = { row, next: null };
+    if (this.tail) this.tail.next = n; else this.head = n;
+    this.tail = n;
+    this.nrows++;
+  }
+  *rows(): IterableIterator<Row> {
+    let cur = this.head;
+    while (cur) { yield cur.row; cur = cur.next; }
+  }
+}
+
+// ---------- Lexer ----------
+type TokKind = "EOF" | "ID" | "INT" | "STRING" | "KW" | "PUNCT" | "STAR" | "COMMA" | "LP" | "RP" | "SEMI" | "OP" | "DOT";
+class Token { constructor(public kind: TokKind, public text: string) {} }
+
+const KEYWORDS = [
+  "create","table","insert","into","values","select","from","where",
+  "order","by","asc","desc","and","or","not","null","begin","commit",
+  "inner","join","on","int","integer","text","primary","key","transaction"
+];
+const isKw = (s: string) => KEYWORDS.includes(s.toLowerCase());
+
+function lex(sql: string): Token[] {
+  const toks: Token[] = [];
+  let pos = 0;
+  const push = (k: TokKind, s: string) => toks.push(new Token(k, s));
+  while (pos < sql.length) {
+    const c = sql[pos];
+    if (/\s/.test(c)) { pos++; continue; }
+    if (c === '-' && sql[pos + 1] === '-') {
+      while (pos < sql.length && sql[pos] !== '\n') pos++;
+      continue;
+    }
+    if (/[a-zA-Z_]/.test(c)) {
+      const st = pos;
+      while (pos < sql.length && /[a-zA-Z0-9_]/.test(sql[pos])) pos++;
+      const word = sql.slice(st, pos);
+      push(isKw(word) ? "KW" : "ID", word);
+      continue;
+    }
+    if (/\d/.test(c)) {
+      const st = pos;
+      while (pos < sql.length && /\d/.test(sql[pos])) pos++;
+      push("INT", sql.slice(st, pos));
+      continue;
+    }
+    if (c === "'") {
+      pos++;
+      const st = pos;
+      while (pos < sql.length && sql[pos] !== "'") pos++;
+      push("STRING", sql.slice(st, pos));
+      if (sql[pos] === "'") pos++;
+      continue;
+    }
+    if (c === '"') {
+      pos++;
+      const st = pos;
+      while (pos < sql.length && sql[pos] !== '"') pos++;
+      push("ID", sql.slice(st, pos));
+      if (sql[pos] === '"') pos++;
+      continue;
+    }
+    if (c === '*') { push("STAR", "*"); pos++; continue; }
+    if (c === ',') { push("COMMA", ","); pos++; continue; }
+    if (c === '(') { push("LP", "("); pos++; continue; }
+    if (c === ')') { push("RP", ")"); pos++; continue; }
+    if (c === ';') { push("SEMI", ";"); pos++; continue; }
+    if (c === '.') { push("DOT", "."); pos++; continue; }
+    if ("=<>!".includes(c)) {
+      const st = pos;
+      if (sql[pos + 1] === '=') pos++;
+      if (c === '<' && sql[pos + 1] === '>') pos++;
+      if (c === '!' && sql[pos + 1] === '=') pos++;
+      pos++;
+      push("OP", sql.slice(st, pos));
+      continue;
+    }
+    push("PUNCT", c); pos++;
+  }
+  push("EOF", "");
+  return toks;
+}
+
+// ---------- AST ----------
+type Expr =
+  | { kind: "COL"; col: string }
+  | { kind: "INT"; ival: number }
+  | { kind: "STR"; sval: string }
+  | { kind: "BINOP"; op: string; l: Expr | null; r: Expr | null };
+
+interface ResultCol { col: string | null; star: boolean }
+interface TableRef { tname: string; alias: string | null }
+
+interface Stmt {
+  is_create: boolean; is_insert: boolean; is_select: boolean; is_begin: boolean; is_commit: boolean;
+  ct_name: string | null; ct_cols: string[] | null;
+  ins_table: string | null; ins_vals: Value[];
+  sel_cols: ResultCol[]; sel_star: boolean;
+  sel_tables: TableRef[];
+  sel_where: Expr | null;
+  sel_order_col: string | null; sel_order_desc: boolean;
+  sel_join_on: Expr | null;
+}
+
+function emptyStmt(): Stmt {
+  return {
+    is_create: false, is_insert: false, is_select: false, is_begin: false, is_commit: false,
+    ct_name: null, ct_cols: null,
+    ins_table: null, ins_vals: [],
+    sel_cols: [], sel_star: false,
+    sel_tables: [],
+    sel_where: null,
+    sel_order_col: null, sel_order_desc: false,
+    sel_join_on: null
+  };
+}
+
+// ---------- Parser ----------
+class Parser {
+  i = 0;
+  constructor(public toks: Token[]) {}
+
+  peek() { return this.toks[this.i]; }
+  accept(k: TokKind, text?: string): boolean {
+    const t = this.toks[this.i];
+    if (t.kind !== k) return false;
+    if (text && t.text.toLowerCase() !== text.toLowerCase()) return false;
+    this.i++; return true;
+  }
+  acceptKw(kw: string): boolean { return this.accept("KW", kw); }
+  peekKw(kw: string): boolean {
+    const t = this.toks[this.i];
+    return t.kind === "KW" && t.text.toLowerCase() === kw.toLowerCase();
+  }
+
+  parsePrimary(): Expr | null {
+    const t = this.toks[this.i];
+    if (t.kind === "INT") { this.i++; return { kind: "INT", ival: parseInt(t.text, 10) }; }
+    if (t.kind === "STRING") { this.i++; return { kind: "STR", sval: t.text }; }
+    if (t.kind === "ID" || t.kind === "KW") {
+      let col = t.text; this.i++;
+      if (this.toks[this.i].kind === "DOT") {
+        this.i++;
+        col += "." + this.toks[this.i].text; this.i++;
+      }
+      return { kind: "COL", col };
+    }
+    if (this.accept("LP")) { const e = this.parseExpr(); this.accept("RP"); return e; }
+    return null;
+  }
+
+  parseCmp(): Expr | null {
+    const l = this.parsePrimary();
+    if (this.toks[this.i].kind === "OP") {
+      const op = this.toks[this.i].text; this.i++;
+      const r = this.parsePrimary();
+      return { kind: "BINOP", op, l, r };
+    }
+    return l;
+  }
+
+  parseExpr(): Expr | null {
+    const l = this.parseCmp();
+    if (this.peekKw("and") || this.peekKw("or")) {
+      const op = this.peekKw("and") ? "AND" : "OR";
+      this.i++;
+      const r = this.parseExpr();
+      return { kind: "BINOP", op, l, r };
+    }
+    return l;
+  }
+
+  parseCreate(st: Stmt): number {
+    st.is_create = true;
+    const t = this.toks[this.i];
+    if (t.kind !== "ID" && t.kind !== "KW") return -1;
+    st.ct_name = t.text; this.i++;
+    if (!this.accept("LP")) return -1;
+    st.ct_cols = [];
+    while (this.toks[this.i].kind !== "RP" && this.toks[this.i].kind !== "EOF") {
+      const ct = this.toks[this.i];
+      if (ct.kind !== "ID" && ct.kind !== "KW") return -1;
+      st.ct_cols.push(ct.text); this.i++;
+      while (this.toks[this.i].kind !== "COMMA" && this.toks[this.i].kind !== "RP" && this.toks[this.i].kind !== "EOF") this.i++;
+      this.accept("COMMA");
+    }
+    this.accept("RP");
+    return 0;
+  }
+
+  parseInsert(st: Stmt): number {
+    st.is_insert = true;
+    if (!this.acceptKw("into")) return -1;
+    if (this.toks[this.i].kind !== "ID") return -1;
+    st.ins_table = this.toks[this.i].text; this.i++;
+    if (!this.acceptKw("values")) return -1;
+    if (!this.accept("LP")) return -1;
+    while (this.toks[this.i].kind !== "RP" && this.toks[this.i].kind !== "EOF") {
+      const t = this.toks[this.i];
+      if (t.kind === "INT") st.ins_vals.push(Value.int(parseInt(t.text, 10)));
+      else if (t.kind === "STRING") st.ins_vals.push(Value.text(t.text));
+      else if (this.acceptKw("null")) st.ins_vals.push(Value.null());
+      else return -1;
+      this.i++;
+      if (!this.accept("COMMA")) break;
+    }
+    if (!this.accept("RP")) return -1;
+    return 0;
+  }
+
+  parseSelect(st: Stmt): number {
+    st.is_select = true;
+    if (this.accept("STAR")) { st.sel_star = true; }
+    else do {
+      const rc: ResultCol = { col: null, star: false };
+      if (this.accept("STAR")) { rc.star = true; }
+      else if (this.toks[this.i].kind === "ID" || this.toks[this.i].kind === "KW") {
+        let col = this.toks[this.i].text; this.i++;
+        if (this.toks[this.i].kind === "DOT") {
+          this.i++;
+          if (this.accept("STAR")) { rc.star = true; }
+          else { col += "." + this.toks[this.i].text; this.i++; rc.col = col; }
+        } else rc.col = col;
+      } else return -1;
+      st.sel_cols.push(rc);
+    } while (this.accept("COMMA"));
+    if (!this.acceptKw("from")) return -1;
+    if (this.toks[this.i].kind !== "ID") return -1;
+    // first table
+    {
+      const tr: TableRef = { tname: this.toks[this.i].text, alias: null }; this.i++;
+      if (this.toks[this.i].kind === "ID" && !this.peekKw("on") && !this.peekKw("where")
+          && !this.peekKw("order") && !this.peekKw("inner") && !this.peekKw("join")) {
+        tr.alias = this.toks[this.i].text; this.i++;
+      }
+      st.sel_tables.push(tr);
+    }
+    while (this.peekKw("inner") || this.peekKw("join")) {
+      if (this.acceptKw("inner")) { if (!this.acceptKw("join")) return -1; }
+      else this.acceptKw("join");
+      if (this.toks[this.i].kind !== "ID") return -1;
+      const tr: TableRef = { tname: this.toks[this.i].text, alias: null }; this.i++;
+      if (this.toks[this.i].kind === "ID" && !this.peekKw("on") && !this.peekKw("where") && !this.peekKw("order")) {
+        tr.alias = this.toks[this.i].text; this.i++;
+      }
+      st.sel_tables.push(tr);
+      if (this.acceptKw("on")) {
+        const on = this.parseExpr();
+        if (!st.sel_join_on) st.sel_join_on = on;
+        else st.sel_join_on = { kind: "BINOP", op: "AND", l: st.sel_join_on, r: on };
+      }
+    }
+    if (this.acceptKw("where")) st.sel_where = this.parseExpr();
+    if (this.acceptKw("order")) {
+      if (!this.acceptKw("by")) return -1;
+      const t = this.toks[this.i];
+      if (t.kind !== "ID" && t.kind !== "KW") return -1;
+      st.sel_order_col = t.text; this.i++;
+      if (this.acceptKw("desc")) st.sel_order_desc = true;
+      else this.acceptKw("asc");
+    }
+    return 0;
+  }
+
+  parse(st: Stmt): number {
+    if (this.peekKw("begin")) { st.is_begin = true; this.i++; this.acceptKw("transaction"); }
+    else if (this.peekKw("commit")) { st.is_commit = true; this.i++; this.acceptKw("transaction"); }
+    else if (this.acceptKw("create")) { if (this.acceptKw("table")) return this.parseCreate(st); return -1; }
+    else if (this.acceptKw("insert")) return this.parseInsert(st);
+    else if (this.acceptKw("select")) return this.parseSelect(st);
+    else return -1;
+    this.accept("SEMI");
+    return 0;
+  }
+}
+
+// ---------- Row context for eval ----------
+interface RowCtx {
+  refs: TableRef[];
+  tabs: (Table | null)[];
+  rows: Row[];
+}
+
+function rowctxColIndex(c: RowCtx, col: string): [number, number] | null {
+  const dot = col.indexOf('.');
+  if (dot >= 0) {
+    const tname = col.slice(0, dot);
+    const cname = col.slice(dot + 1);
+    for (let i = 0; i < c.refs.length; i++) {
+      const tn = c.refs[i].alias ?? c.refs[i].tname;
+      if (tn.toLowerCase() === tname.toLowerCase()) {
+        const ci = c.tabs[i]!.colIndex(cname);
+        if (ci >= 0) return [i, ci];
+      }
+    }
+    return null;
+  }
+  for (let i = 0; i < c.tabs.length; i++) {
+    const ci = c.tabs[i]!.colIndex(col);
+    if (ci >= 0) return [i, ci];
+  }
+  return null;
+}
+
+function evalExpr(e: Expr | null, c: RowCtx): Value {
+  if (!e) return Value.null();
+  switch (e.kind) {
+    case "INT": return Value.int(e.ival);
+    case "STR": return Value.text(e.sval);
+    case "COL": {
+      const idx = rowctxColIndex(c, e.col);
+      if (!idx) return Value.null();
+      return c.rows[idx[0]].vals[idx[1]].copy();
+    }
+    case "BINOP": {
+      const a = evalExpr(e.l, c);
+      const b = evalExpr(e.r, c);
+      if (e.op.toUpperCase() === "AND") return Value.int(a.truthy() && b.truthy() ? 1 : 0);
+      if (e.op.toUpperCase() === "OR") return Value.int(a.truthy() || b.truthy() ? 1 : 0);
+      const cmp = a.cmp(b);
+      switch (e.op) {
+        case "=": return Value.int(cmp === 0 ? 1 : 0);
+        case "<>": return Value.int(cmp !== 0 ? 1 : 0);
+        case "<": return Value.int(cmp < 0 ? 1 : 0);
+        case ">": return Value.int(cmp > 0 ? 1 : 0);
+        case "<=": return Value.int(cmp <= 0 ? 1 : 0);
+        case ">=": return Value.int(cmp >= 0 ? 1 : 0);
+        default: return Value.null();
+      }
+    }
+  }
+}
+
+function rowMatch(where: Expr | null, c: RowCtx): boolean {
+  if (!where) return true;
+  return evalExpr(where, c).truthy();
+}
+
+// ---------- Database ----------
+export class Sqlite3 {
+  tables: Table[] = [];
+  stores: RowStore[] = [];
+  errmsg = "";
+  inTxn = false;
+
+  schemaFind(name: string): Table | null {
+    return this.tables.find(t => t.name.toLowerCase() === name.toLowerCase()) ?? null;
+  }
+  schemaIndex(name: string): number {
+    return this.tables.findIndex(t => t.name.toLowerCase() === name.toLowerCase());
+  }
+
+  execCreate(st: Stmt): number {
+    if (this.schemaFind(st.ct_name!)) {
+      this.errmsg = `table already exists: ${st.ct_name}`;
+      return -1;
+    }
+    this.tables.push(new Table(st.ct_name!, st.ct_cols!));
+    this.stores.push(new RowStore());
+    st.ct_cols = null;
+    return 0;
+  }
+
+  execInsert(st: Stmt): number {
+    const idx = this.schemaIndex(st.ins_table!);
+    if (idx < 0) { this.errmsg = `no such table: ${st.ins_table}`; return -1; }
+    this.stores[idx].append(new Row(st.ins_vals.map(v => v.copy())));
+    return 0;
+  }
+}
+
+// ---------- Prepared statement ----------
+export class Sqlite3Stmt {
+  db: Sqlite3;
+  st: Stmt;
+  started = false;
+  done = false;
+  outrow: Value[] = [];
+  nout = 0;
+  sorted: Row[] = [];
+  curSorted = 0;
+
+  constructor(db: Sqlite3, st: Stmt) { this.db = db; this.st = st; }
+
+  collectMatching(): void {
+    const n = this.st.sel_tables.length;
+    const idxs = this.st.sel_tables.map(t => this.db.schemaIndex(t.tname));
+    const tabs = idxs.map(i => this.db.tables[i] ?? null);
+    const refs = this.st.sel_tables;
+
+    // nested loop
+    const curs: (RowNode | null)[] = idxs.map(i => i >= 0 ? this.db.stores[i].head : null);
+
+    const advance = (): boolean => {
+      for (let k = n - 1; k >= 0; k--) {
+        curs[k] = curs[k]!.next;
+        if (curs[k]) return true;
+        if (k > 0) curs[k] = idxs[k] >= 0 ? this.db.stores[idxs[k]].head : null;
+      }
+      return false;
+    };
+
+    if (curs.every(c => c !== null)) {
+      do {
+        const rows = curs.map(c => c!.row);
+        const ctx: RowCtx = { refs, tabs, rows };
+        if (rowMatch(this.st.sel_where, ctx) && (!this.st.sel_join_on || rowMatch(this.st.sel_join_on, ctx))) {
+          const vals: Value[] = [];
+          for (const r of rows) for (const v of r.vals) vals.push(v.copy());
+          this.sorted.push(new Row(vals));
+        }
+      } while (advance());
+    }
+
+    // ORDER BY (single-table)
+    if (this.st.sel_order_col && this.st.sel_tables.length === 1) {
+      const tab = this.db.schemaFind(this.st.sel_tables[0].tname);
+      if (tab) {
+        const cidx = tab.colIndex(this.st.sel_order_col);
+        if (cidx >= 0) {
+          // insertion sort
+          for (let i = 1; i < this.sorted.length; i++) {
+            for (let j = i; j > 0; j--) {
+              const a = this.sorted[j - 1].vals[cidx];
+              const b = this.sorted[j].vals[cidx];
+              const cmp = a.cmp(b);
+              if ((this.st.sel_order_desc && cmp < 0) || (!this.st.sel_order_desc && cmp > 0)) {
+                [this.sorted[j - 1], this.sorted[j]] = [this.sorted[j], this.sorted[j - 1]];
+              } else break;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  stepSelect(): number {
+    if (!this.started) { this.started = true; this.collectMatching(); }
+    if (this.curSorted >= this.sorted.length) return 101; // DONE
+    const r = this.sorted[this.curSorted++];
+    const n = this.st.sel_tables.length;
+    const tabs = this.st.sel_tables.map(t => this.db.schemaFind(t.tname)!);
+    const refs = this.st.sel_tables;
+    const offsets: number[] = [];
+    let off = 0;
+    for (let i = 0; i < n; i++) { offsets[i] = off; off += tabs[i].ncols; }
+
+    let nout = 0;
+    if (this.st.sel_star) { nout = off; }
+    else {
+      for (const rc of this.st.sel_cols) {
+        if (rc.star) { for (let i = 0; i < n; i++) nout += tabs[i].cols.length; }
+        else nout++;
+      }
+    }
+    this.outrow = [];
+    this.nout = 0;
+
+    if (this.st.sel_star) {
+      for (let i = 0; i < n; i++)
+        for (let j = 0; j < tabs[i].cols.length; j++)
+          this.outrow[this.nout++] = r.vals[offsets[i] + j].copy();
+    } else {
+      for (const rc of this.st.sel_cols) {
+        if (rc.star) {
+          for (let i = 0; i < n; i++)
+            for (let j = 0; j < tabs[i].cols.length; j++)
+              this.outrow[this.nout++] = r.vals[offsets[i] + j].copy();
+        } else {
+          const dot = rc.col!.indexOf('.');
+          let ti = 0, ci = -1;
+          if (dot >= 0) {
+            const tname = rc.col!.slice(0, dot);
+            const cname = rc.col!.slice(dot + 1);
+            for (let i = 0; i < n; i++) {
+              const tn = refs[i].alias ?? refs[i].tname;
+              if (tn.toLowerCase() === tname.toLowerCase()) { ci = tabs[i].colIndex(cname); ti = i; break; }
+            }
+          } else {
+            for (let i = 0; i < n; i++) { ci = tabs[i].colIndex(rc.col!); if (ci >= 0) { ti = i; break; } }
+          }
+          if (ci < 0) this.outrow[this.nout++] = Value.null();
+          else this.outrow[this.nout++] = r.vals[offsets[ti] + ci].copy();
+        }
+      }
+    }
+    return 100; // ROW
+  }
+
+  step(): number {
+    if (this.st.is_select) return this.stepSelect();
+    return 101;
+  }
+
+  columnCount(): number { return this.nout; }
+  columnText(i: number): string | null {
+    if (i < 0 || i >= this.nout) return null;
+    return this.outrow[i].toText();
+  }
+  columnInt64(i: number): number {
+    if (i < 0 || i >= this.nout) return 0;
+    return this.outrow[i].type === 1 ? this.outrow[i].ival : 0;
+  }
+}
+
+// ---------- Public API ----------
+export function sqlite3_open(_name?: string): Sqlite3 { return new Sqlite3(); }
+
+export function sqlite3_close(_db: Sqlite3): number { return 0; }
+
+export function sqlite3_errmsg(db: Sqlite3): string { return db ? db.errmsg : ""; }
+
+type ExecCallback = (n: number, vals: string[], cols: string[]) => void;
+
+export function sqlite3_exec(db: Sqlite3, sql: string, cb?: ExecCallback | null): number {
+  const toks = lex(sql);
+  const P = new Parser(toks);
+  let rc = 0;
+  while (P.peek().kind !== "EOF") {
+    const st = emptyStmt();
+    if (P.parse(st) < 0) { db.errmsg = "parse error"; rc = 1; break; }
+    if (st.is_begin) { db.inTxn = true; }
+    else if (st.is_commit) { db.inTxn = false; }
+    else if (st.is_create) { rc = db.execCreate(st); }
+    else if (st.is_insert) { rc = db.execInsert(st); }
+    else if (st.is_select) {
+      const s = new Sqlite3Stmt(db, st);
+      let r: number;
+      while ((r = s.stepSelect()) === 100) {
+        const vals = s.outrow.map(v => v.toText());
+        if (cb) cb(s.nout, vals, []);
+      }
+    }
+    if (rc) break;
+  }
+  return rc;
+}
+
+export function sqlite3_prepare_v2(db: Sqlite3, sql: string): Sqlite3Stmt | null {
+  const toks = lex(sql);
+  const P = new Parser(toks);
+  const st = emptyStmt();
+  if (P.parse(st) < 0) { db.errmsg = "parse error"; return null; }
+  return new Sqlite3Stmt(db, st);
+}
+
+export function sqlite3_step(s: Sqlite3Stmt): number { return s.step(); }
+export function sqlite3_column_count(s: Sqlite3Stmt): number { return s.columnCount(); }
+export function sqlite3_column_text(s: Sqlite3Stmt, i: number): string | null { return s.columnText(i); }
+export function sqlite3_column_int64(s: Sqlite3Stmt, i: number): number { return s.columnInt64(i); }
+export function sqlite3_finalize(_s: Sqlite3Stmt): number { return 0; }
+
+// ---------- Demo ----------
+function printRow(n: number, vals: string[]): void {
+  let line = "";
+  for (let i = 0; i < n; i++) line += vals[i] + (i + 1 < n ? " | " : "\n");
+  process.stdout.write(line);
+}
+
+// SQLITE_CORE_DEMO equivalent
+if (require.main === module) {
+  const db = sqlite3_open(":memory:");
+  const sql =
+    "CREATE TABLE users (id INTEGER, name TEXT);" +
+    "INSERT INTO users VALUES (1, 'ada');" +
+    "INSERT INTO users VALUES (2, 'grace');" +
+    "INSERT INTO users VALUES (3, 'linus');" +
+    "SELECT * FROM users WHERE id > 1 ORDER BY id DESC;";
+  if (sqlite3_exec(db, sql, printRow)) {
+    console.error("err: " + sqlite3_errmsg(db));
+  }
+  sqlite3_close(db);
+}
+```

@@ -118,3 +118,22 @@ NameError: name 'finish' is not defined
 [2026-06-20T17:40:37Z]       porter done: 429 bytes, 132 tokens, 350.0s
 [2026-06-20T17:40:39Z]       judge: completeness=8 notes=Port is essentially a stub demo that calls nonexistent Sqlite3 class methods wit
 [2026-06-20T17:40:40Z] loop done: 1 runs
+[2026-06-20T17:43:02Z] loop start: 1 languages, orig_tokens=8805
+[2026-06-20T17:43:02Z]   >>> porting erlang (Erlang)
+[2026-06-20T17:43:02Z] loop start: 1 languages, orig_tokens=8805
+[2026-06-20T17:43:02Z]   >>> porting ocaml (OCaml)
+[2026-06-20T17:43:02Z] loop start: 1 languages, orig_tokens=8805
+[2026-06-20T17:43:02Z]   >>> porting swift (Swift)
+[2026-06-20T17:43:02Z] loop start: 1 languages, orig_tokens=8805
+[2026-06-20T17:43:02Z]   >>> porting haskell (Haskell)
+[2026-06-20T17:43:02Z] loop start: 1 languages, orig_tokens=8805
+[2026-06-20T17:43:02Z]   >>> porting elixir (Elixir)
+[2026-06-20T17:43:02Z] loop start: 1 languages, orig_tokens=8805
+[2026-06-20T17:43:02Z]   >>> porting typescript (TypeScript)
+[2026-06-20T17:43:02Z] loop start: 1 languages, orig_tokens=8805
+[2026-06-20T17:43:02Z]   >>> porting scala (Scala)
+[2026-06-20T17:43:02Z] loop start: 1 languages, orig_tokens=8805
+[2026-06-20T17:43:02Z]   >>> porting gleam (Gleam)
+[2026-06-20T17:44:02Z]       porter done: 21100 bytes, 6291 tokens, 60.1s
+[2026-06-20T17:44:02Z]       porter done: 20537 bytes, 5578 tokens, 60.4s
+[2026-06-20T17:44:04Z]       judge: completeness=78 notes=TypeScript port captures the core API surface and SQL features well, but has inc

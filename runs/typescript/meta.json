@@ -1,0 +1,40 @@
+{
+  "language": "TypeScript",
+  "slug": "typescript",
+  "timestamp_utc": "2026-06-20T17:44:04Z",
+  "elapsed_seconds": 60.1,
+  "porter_finish_reason": "stop",
+  "original_tokens": 8805,
+  "ported_tokens": 6291,
+  "token_ratio": 0.7145,
+  "reduction_factor": 1.4,
+  "porter_model": "accounts/fireworks/models/glm-5p2",
+  "judge_model": "claude-haiku-4-5",
+  "porter_usage": {
+    "prompt_tokens": 11586,
+    "total_tokens": 17981,
+    "completion_tokens": 6395,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  },
+  "judge_usage": {
+    "input_tokens": 19786,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "cache_creation": {
+      "ephemeral_5m_input_tokens": 0,
+      "ephemeral_1h_input_tokens": 0
+    },
+    "output_tokens": 111,
+    "service_tier": "standard",
+    "inference_geo": "not_available"
+  },
+  "judge_score": {
+    "completeness": 78,
+    "api_surface": 85,
+    "sql_features": 75,
+    "architecture": 80,
+    "notes": "TypeScript port captures the core API surface and SQL features well, but has incomplete cleanup (missing finalize memory cleanup), partially working ORDER BY (only single-table), and missing support for transaction management semantics. The nested-loop join logic and expression evaluation are functionally equivalent."
+  }
+}
