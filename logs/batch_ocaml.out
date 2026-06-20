@@ -3,3 +3,12 @@
 [2026-06-20T17:46:56Z]       porter length-capped (16000 tok); retry high effort
 [2026-06-20T17:49:23Z]       porter done: 1904 bytes, 623 tokens, 381.2s
 [2026-06-20T17:49:25Z]       judge: completeness=15 notes=The port is severely incomplete, containing only expression evaluation and row c
+[main 8374a69] port: ocaml (OCaml) completeness=15
+ 7 files changed, 1651 insertions(+)
+ create mode 100644 runs/ocaml/judge_raw.txt
+ create mode 100644 runs/ocaml/meta.json
+ create mode 100644 runs/ocaml/porter_raw.txt
+ create mode 100644 runs/ocaml/sqlite_core.ml
+To https://github.com/altdansalt/essence.git
+   1bfcb89..8374a69  main -> main
+[2026-06-20T17:49:26Z] loop done: 1 runs
