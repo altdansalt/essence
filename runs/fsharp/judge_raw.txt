@@ -1,0 +1,9 @@
+```json
+{
+  "completeness": 32,
+  "api_surface": 25,
+  "sql_features": 45,
+  "architecture": 35,
+  "notes": "The F# port has significant structural issues: Parser class lacks proper position tracking across statement boundaries, no working multi-statement loop in Exec, incomplete JOIN handling (nested loop collection broken), ORDER BY only works for single-table queries, prepare_v2 and finalize API stubs missing proper implementation, and critical bugs in RowStore/Row representation (stores Value[][] instead of proper row indexing for joins)."
+}
+```

@@ -1,0 +1,40 @@
+{
+  "language": "F#",
+  "slug": "fsharp",
+  "timestamp_utc": "2026-06-20T17:35:59Z",
+  "elapsed_seconds": 69.7,
+  "porter_finish_reason": "stop",
+  "original_tokens": 8805,
+  "ported_tokens": 6298,
+  "token_ratio": 0.7153,
+  "reduction_factor": 1.4,
+  "porter_model": "accounts/fireworks/models/glm-5p2",
+  "judge_model": "claude-haiku-4-5",
+  "porter_usage": {
+    "prompt_tokens": 14198,
+    "total_tokens": 20521,
+    "completion_tokens": 6323,
+    "prompt_tokens_details": {
+      "cached_tokens": 14197
+    }
+  },
+  "judge_usage": {
+    "input_tokens": 19395,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "cache_creation": {
+      "ephemeral_5m_input_tokens": 0,
+      "ephemeral_1h_input_tokens": 0
+    },
+    "output_tokens": 141,
+    "service_tier": "standard",
+    "inference_geo": "not_available"
+  },
+  "judge_score": {
+    "completeness": 32,
+    "api_surface": 25,
+    "sql_features": 45,
+    "architecture": 35,
+    "notes": "The F# port has significant structural issues: Parser class lacks proper position tracking across statement boundaries, no working multi-statement loop in Exec, incomplete JOIN handling (nested loop collection broken), ORDER BY only works for single-table queries, prepare_v2 and finalize API stubs missing proper implementation, and critical bugs in RowStore/Row representation (stores Value[][] instead of proper row indexing for joins)."
+  }
+}

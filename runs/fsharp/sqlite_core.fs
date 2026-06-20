@@ -1,0 +1,596 @@
+open System
+open System.Collections.Generic
+
+// ---------- Value ----------
+type VType = VNull | VInt | VText
+type Value =
+    | VNull
+    | VInt of int64
+    | VText of string
+
+let vCopy = function VText s -> VText s | v -> v
+
+let vCmp a b =
+    match a, b with
+    | VNull, VNull -> 0
+    | VInt x, VInt y -> compare x y
+    | VText x, VText y -> compare x (if isNull y then "" else y)
+    | VNull, _ -> -1
+    | _, VNull -> 1
+    | VInt _, VText _ -> -1
+    | VText _, VInt _ -> 1
+
+let vToText = function
+    | VInt i -> string i
+    | VText s -> s
+    | VNull -> "NULL"
+
+let vTruthy v = vCmp v (VInt 0L) <> 0
+
+// ---------- Schema ----------
+type Table = { Name: string; Cols: string[] }
+type Schema() =
+    let tables = ResizeArray<Table>()
+    member _.Find(name) = tables |> Seq.tryFind (fun t -> String.Equals(t.Name, name, StringComparison.OrdinalIgnoreCase))
+    member _.Index(name) = tables |> Seq.tryFindIndex (fun t -> String.Equals(t.Name, name, StringComparison.OrdinalIgnoreCase))
+    member _.Add(name, cols) =
+        if this.Find(name).IsSome then -1 else
+        tables.Add({ Name = name; Cols = cols }); 0
+    member _.All = tables.ToArray()
+
+let tableColIndex (t: Table) col =
+    t.Cols |> Array.tryFindIndex (fun c -> String.Equals(c, col, StringComparison.OrdinalIgnoreCase))
+
+// ---------- Row / store ----------
+type Row = Value[]
+type RowStore() =
+    let rows = ResizeArray<Row>()
+    member _.Add(r) = rows.Add(r)
+    member _.Rows = rows.ToArray()
+    member _.Count = rows.Count
+
+// ---------- Lexer ----------
+type TokKind =
+    | TKEof | TKId | TKInt | TKString | TKKw | TKPunct
+    | TKStar | TKComma | TKLP | TKRP | TKSemi | TKOp | TKDot
+type Token = { Kind: TokKind; Text: string }
+
+let keywords = set [
+    "create";"table";"insert";"into";"values";"select";"from";"where";
+    "order";"by";"asc";"desc";"and";"or";"not";"null";"begin";"commit";
+    "inner";"join";"on";"int";"integer";"text";"primary";"key";"transaction"
+]
+
+let isKw (s: string) =
+    keywords.Contains(s.ToLowerInvariant())
+
+let lex (sql: string) =
+    let toks = ResizeArray<Token>()
+    let n = sql.Length
+    let mutable i = 0
+    let push k t = toks.Add({ Kind = k; Text = t })
+    while i < n do
+        let c = sql.[i]
+        if Char.IsWhiteSpace(c) then i <- i + 1
+        elif c = '-' && i+1 < n && sql.[i+1] = '-' then
+            while i < n && sql.[i] <> '\n' do i <- i + 1
+        elif Char.IsLetter(c) || c = '_' then
+            let st = i
+            while i < n && (Char.IsLetterOrDigit(sql.[i]) || sql.[i] = '_') do i <- i + 1
+            let text = sql.[st..i-1]
+            push (if isKw text then TKKw else TKId) text
+        elif Char.IsDigit(c) then
+            let st = i
+            while i < n && Char.IsDigit(sql.[i]) do i <- i + 1
+            push TKInt sql.[st..i-1]
+        elif c = '\'' then
+            i <- i + 1
+            let st = i
+            while i < n && sql.[i] <> '\'' do i <- i + 1
+            push TKString sql.[st..i-1]
+            if i < n then i <- i + 1
+        elif c = '"' then
+            i <- i + 1
+            let st = i
+            while i < n && sql.[i] <> '"' do i <- i + 1
+            push TKId sql.[st..i-1]
+            if i < n then i <- i + 1
+        elif c = '*' then push TKStar "*"; i <- i + 1
+        elif c = ',' then push TKComma ","; i <- i + 1
+        elif c = '(' then push TKLP "("; i <- i + 1
+        elif c = ')' then push TKRP ")"; i <- i + 1
+        elif c = ';' then push TKSemi ";"; i <- i + 1
+        elif c = '.' then push TKDot "."; i <- i + 1
+        elif "=<>!".Contains(string c) then
+            let st = i
+            if i+1 < n && sql.[i+1] = '=' then i <- i + 1
+            if c = '<' && i+1 < n && sql.[i+1] = '>' then i <- i + 1
+            if c = '!' && i+1 < n && sql.[i+1] = '=' then i <- i + 1
+            i <- i + 1
+            push TKOp sql.[st..i-1]
+        else push TKPunct (string c); i <- i + 1
+    push TKEof ""
+    toks.ToArray()
+
+// ---------- AST ----------
+type Expr =
+    | ECol of string
+    | EInt of int64
+    | EStr of string
+    | EBinop of string * Expr * Expr
+
+type ResultCol = { Col: string; Star: bool }
+type TableRef = { TName: string; Alias: string option }
+
+type Stmt =
+    | SCreate of name: string * cols: string[]
+    | SInsert of table: string * vals: Value[]
+    | SSelect of cols: ResultCol[] * star: bool * tables: TableRef[] * where: Expr option * orderCol: string option * orderDesc: bool * joinOn: Expr option
+    | SBegin
+    | SCommit
+
+// ---------- Parser ----------
+type Parser(toks: Token[]) =
+    let mutable i = 0
+    member _.Peek = toks.[i]
+    member _.PeekN(n) = if i+n < toks.Length then toks.[i+n] else toks.[toks.Length-1]
+    member _.Advance() = i <- i + 1
+    member _.Accept(k) =
+        if toks.[i].Kind = k then i <- i + 1; true else false
+    member _.AcceptK(k) =
+        if toks.[i].Kind = TKKw && String.Equals(toks.[i].Text, k, StringComparison.OrdinalIgnoreCase) then
+            i <- i + 1; true
+        else false
+    member _.PeekK(k) =
+        toks.[i].Kind = TKKw && String.Equals(toks.[i].Text, k, StringComparison.OrdinalIgnoreCase)
+    member _.AcceptText(k, text) =
+        if toks.[i].Kind = k && String.Equals(toks.[i].Text, text, StringComparison.OrdinalIgnoreCase) then
+            i <- i + 1; true
+        else false
+
+    member _.ParsePrimary() =
+        let t = toks.[i]
+        match t.Kind with
+        | TKInt -> i <- i + 1; EInt (int64 t.Text)
+        | TKString -> i <- i + 1; EStr t.Text
+        | TKId | TKKw ->
+            let buf = StringBuilder(t.Text)
+            i <- i + 1
+            if toks.[i].Kind = TKDot then
+                i <- i + 1
+                buf.Append('.').Append(toks.[i].Text) |> ignore
+                i <- i + 1
+            ECol (buf.ToString())
+        | TKLP ->
+            i <- i + 1
+            let e = this.ParseExpr()
+            if toks.[i].Kind = TKRP then i <- i + 1
+            e
+        | _ -> ENull // shouldn't happen; use a fallback
+
+    member _.ParseCmp() =
+        let l = this.ParsePrimary()
+        if toks.[i].Kind = TKOp then
+            let op = toks.[i].Text
+            i <- i + 1
+            let r = this.ParsePrimary()
+            EBinop(op, l, r)
+        else l
+
+    member _.ParseExpr() =
+        let l = this.ParseCmp()
+        if this.PeekK("and") || this.PeekK("or") then
+            let op = if this.PeekK("and") then "AND" else "OR"
+            i <- i + 1
+            let r = this.ParseExpr()
+            EBinop(op, l, r)
+        else l
+
+    member _.ParseCreate() =
+        let name = toks.[i].Text
+        i <- i + 1
+        if not (this.Accept TKLP) then failwith "parse error"
+        let cols = ResizeArray<string>()
+        while toks.[i].Kind <> TKRP && toks.[i].Kind <> TKEof do
+            if toks.[i].Kind = TKId || toks.[i].Kind = TKKw then
+                cols.Add(toks.[i].Text)
+                i <- i + 1
+                while toks.[i].Kind <> TKComma && toks.[i].Kind <> TKRP && toks.[i].Kind <> TKEof do
+                    i <- i + 1
+                this.Accept TKComma |> ignore
+            else i <- i + 1
+        this.Accept TKRP |> ignore
+        SCreate(name, cols.ToArray())
+
+    member _.ParseInsert() =
+        if not (this.AcceptK "into") then failwith "parse error"
+        let table = toks.[i].Text
+        i <- i + 1
+        if not (this.AcceptK "values") then failwith "parse error"
+        if not (this.Accept TKLP) then failwith "parse error"
+        let vals = ResizeArray<Value>()
+        while toks.[i].Kind <> TKRP && toks.[i].Kind <> TKEof do
+            let v =
+                match toks.[i].Kind with
+                | TKInt -> i <- i + 1; VInt (int64 toks.[i-1].Text)
+                | TKString -> i <- i + 1; VText toks.[i-1].Text
+                | TKKw when String.Equals(toks.[i].Text, "null", StringComparison.OrdinalIgnoreCase) -> i <- i + 1; VNull
+                | _ -> failwith "parse error"
+            vals.Add(v)
+            if not (this.Accept TKComma) then ()
+        this.Accept TKRP |> ignore
+        SInsert(table, vals.ToArray())
+
+    member _.ParseSelect() =
+        let mutable star = false
+        let cols = ResizeArray<ResultCol>()
+        if this.Accept TKStar then
+            star <- true
+        else
+            let mutable cont = true
+            while cont do
+                if this.Accept TKStar then
+                    cols.Add({ Col = null; Star = true })
+                elif toks.[i].Kind = TKId || toks.[i].Kind = TKKw then
+                    let buf = StringBuilder(toks.[i].Text)
+                    i <- i + 1
+                    if toks.[i].Kind = TKDot then
+                        i <- i + 1
+                        if this.Accept TKStar then
+                            cols.Add({ Col = null; Star = true })
+                        else
+                            buf.Append('.').Append(toks.[i].Text) |> ignore
+                            i <- i + 1
+                            cols.Add({ Col = buf.ToString(); Star = false })
+                    else
+                        cols.Add({ Col = buf.ToString(); Star = false })
+                else failwith "parse error"
+                cont <- this.Accept TKComma
+        if not (this.AcceptK "from") then failwith "parse error"
+        if toks.[i].Kind <> TKId then failwith "parse error"
+        let tables = ResizeArray<TableRef>()
+        // first table
+        let tname = toks.[i].Text
+        i <- i + 1
+        let alias =
+            if toks.[i].Kind = TKId && not (this.PeekK "on") && not (this.PeekK "where")
+               && not (this.PeekK "order") && not (this.PeekK "inner") && not (this.PeekK "join") then
+                let a = toks.[i].Text
+                i <- i + 1; Some a
+            else None
+        tables.Add({ TName = tname; Alias = alias })
+        // joins
+        let mutable joinOn = None
+        while this.PeekK "inner" || this.PeekK "join" do
+            if this.AcceptK "inner" then
+                if not (this.AcceptK "join") then failwith "parse error"
+            else this.AcceptK "join" |> ignore
+            if toks.[i].Kind <> TKId then failwith "parse error"
+            let jname = toks.[i].Text
+            i <- i + 1
+            let jalias =
+                if toks.[i].Kind = TKId && not (this.PeekK "on") && not (this.PeekK "where") && not (this.PeekK "order") then
+                    let a = toks.[i].Text
+                    i <- i + 1; Some a
+                else None
+            tables.Add({ TName = jname; Alias = jalias })
+            if this.AcceptK "on" then
+                let on = this.ParseExpr()
+                joinOn <- match joinOn with Some prev -> Some (EBinop("AND", prev, on)) | None -> Some on
+        let where = if this.AcceptK "where" then Some (this.ParseExpr()) else None
+        let mutable orderCol = None
+        let mutable orderDesc = false
+        if this.AcceptK "order" then
+            if not (this.AcceptK "by") then failwith "parse error"
+            if toks.[i].Kind = TKId || toks.[i].Kind = TKKw then
+                orderCol <- Some toks.[i].Text
+                i <- i + 1
+                if this.AcceptK "desc" then orderDesc <- true else this.AcceptK "asc" |> ignore
+        SSelect(cols.ToArray(), star, tables.ToArray(), where, orderCol, orderDesc, joinOn)
+
+    member _.Parse() : Stmt =
+        if this.PeekK "begin" then
+            i <- i + 1; this.AcceptK "transaction" |> ignore; SBegin
+        elif this.PeekK "commit" then
+            i <- i + 1; this.AcceptK "transaction" |> ignore; SCommit
+        elif this.AcceptK "create" then
+            if this.AcceptK "table" then this.ParseCreate() else failwith "parse error"
+        elif this.AcceptK "insert" then this.ParseInsert()
+        elif this.AcceptK "select" then this.ParseSelect()
+        else failwith "parse error"
+
+// ---------- Expression eval ----------
+type RowCtx = { Refs: TableRef[]; Tabs: Table[]; Rows: Row[] }
+
+let rowctxColindex (c: RowCtx) col =
+    let dotIdx = col.IndexOf('.')
+    if dotIdx >= 0 then
+        let tname = col.[..dotIdx-1]
+        let cname = col.[dotIdx+1..]
+        c.Refs |> Array.mapi (fun i r ->
+            let tn = r.Alias |> Option.defaultValue r.TName
+            if String.Equals(tn, tname, StringComparison.OrdinalIgnoreCase) then
+                match tableColIndex c.Tabs.[i] cname with
+                | Some ci -> Some (i, ci)
+                | None -> None
+            else None)
+        |> Array.tryPick id
+    else
+        c.Tabs |> Array.mapi (fun i t ->
+            match tableColindex t col with
+            | Some ci -> Some (i, ci) | None -> None)
+        |> Array.tryPick id
+
+let rec evalExpr (e: Expr) (c: RowCtx) =
+    match e with
+    | EInt i -> VInt i
+    | EStr s -> VText s
+    | ECol col ->
+        match rowctxColindex c col with
+        | Some (ti, ci) -> vCopy c.Rows.[ti].[ci]
+        | None -> VNull
+    | EBinop(op, l, r) ->
+        let a = evalExpr l c
+        let b = evalExpr r c
+        if String.Equals(op, "AND", StringComparison.OrdinalIgnoreCase) then
+            VInt (if vTruthy a && vTruthy b then 1L else 0L)
+        elif String.Equals(op, "OR", StringComparison.OrdinalIgnoreCase) then
+            VInt (if vTruthy a || vTruthy b then 1L else 0L)
+        else
+            let cmp = vCmp a b
+            VInt (
+                match op with
+                | "=" -> if cmp = 0 then 1L else 0L
+                | "<>" -> if cmp <> 0 then 1L else 0L
+                | "<" -> if cmp < 0 then 1L else 0L
+                | ">" -> if cmp > 0 then 1L else 0L
+                | "<=" -> if cmp <= 0 then 1L else 0L
+                | ">=" -> if cmp >= 0 then 1L else 0L
+                | _ -> 0L)
+    | _ -> VNull
+
+let rowMatch where c =
+    match where with
+    | None -> true
+    | Some e -> vTruthy (evalExpr e c)
+
+// ---------- Database ----------
+type Sqlite3() =
+    let schema = Schema()
+    let stores = Dictionary<string, RowStore>()
+    let mutable errmsg = ""
+    member _.Schema = schema
+    member _.GetStore(name) = stores.[name]
+    member _.AddStore(name) = stores.[name] <- RowStore()
+    member val Errmsg = "" with get, set
+    member _.SetErr(s) = errmsg <- s
+    member _.GetErr() = errmsg
+
+// ---------- Prepared statement ----------
+type Sqlite3Stmt(db: Sqlite3, stmt: Stmt) =
+    let mutable started = false
+    let mutable sorted: Row[] = [||]
+    let mutable curSorted = 0
+    let mutable outrow: Value[] = [||]
+    let mutable nout = 0
+
+    member _.Stmt = stmt
+    member _.OutRow = outrow
+    member _.NOut = nout
+
+    member s.StepSelect() =
+        if not started then
+            started <- true
+            s.CollectMatching()
+        if curSorted >= sorted.Length then 101
+        else
+            let r = sorted.[curSorted]
+            curSorted <- curSorted + 1
+            let n = match stmt with SSelect(_,_,tables,_,_,_,_) -> tables.Length | _ -> 0
+            let tabs = match stmt with SSelect(_,_,tables,_,_,_,_) -> tables |> Array.map (fun tr -> db.Schema.Find(tr.TName).Value) | _ -> [||]
+            let offsets = Array.zeroCreate n
+            let mutable off = 0
+            for i in 0..n-1 do offsets.[i] <- off; off <- off + tabs.[i].Cols.Length
+            let ctx = { Refs = (match stmt with SSelect(_,_,refs,_,_,_,_) -> refs | _ -> [||]); Tabs = tabs; Rows = r }
+            let star = match stmt with SSelect(_,star,_,_,_,_,_) -> star | _ -> false
+            let selCols = match stmt with SSelect(cols,_,_,_,_,_,_) -> cols | _ -> [||]
+            let total =
+                if star then off
+                else
+                    selCols |> Array.sumBy (fun rc ->
+                        if rc.Star then tabs |> Array.sumBy (fun t -> t.Cols.Length) else 1)
+            outrow <- Array.zeroCreate total
+            nout <- 0
+            if star then
+                for i in 0..n-1 do
+                    for j in 0..tabs.[i].Cols.Length-1 do
+                        outrow.[nout] <- vCopy r.[offsets.[i]+j]; nout <- nout + 1
+            else
+                for k in 0..selCols.Length-1 do
+                    let rc = selCols.[k]
+                    if rc.Star then
+                        for i in 0..n-1 do
+                            for j in 0..tabs.[i].Cols.Length-1 do
+                                outrow.[nout] <- vCopy r.[offsets.[i]+j]; nout <- nout + 1
+                    else
+                        let dotIdx = rc.Col.IndexOf('.')
+                        let ti, ci =
+                            if dotIdx >= 0 then
+                                let tname = rc.Col.[..dotIdx-1]
+                                let cname = rc.Col.[dotIdx+1..]
+                                let refs = match stmt with SSelect(_,_,refs,_,_,_,_) -> refs | _ -> [||]
+                                let mutable found = (0, -1)
+                                for i in 0..n-1 do
+                                    let tn = refs.[i].Alias |> Option.defaultValue refs.[i].TName
+                                    if String.Equals(tn, tname, StringComparison.OrdinalIgnoreCase) then
+                                        match tableColIndex tabs.[i] cname with
+                                        | Some cidx -> found <- (i, cidx)
+                                        | None -> ()
+                                found
+                            else
+                                let mutable found = (0, -1)
+                                for i in 0..n-1 do
+                                    match tableColIndex tabs.[i] rc.Col with
+                                    | Some cidx -> found <- (i, cidx)
+                                    | None -> ()
+                                found
+                        if ci < 0 then outrow.[nout] <- VNull; nout <- nout + 1
+                        else outrow.[nout] <- vCopy r.[offsets.[ti]+ci]; nout <- nout + 1
+            100
+
+    member s.CollectMatching() =
+        match stmt with
+        | SSelect(_, star, tables, where, orderCol, orderDesc, joinOn) ->
+            let n = tables.Length
+            let idxs = tables |> Array.map (fun tr -> db.Schema.Index(tr.TName))
+            let tabs = tables |> Array.map (fun tr -> db.Schema.Find(tr.TName).Value)
+            let heads = idxs |> Array.map (fun idx -> if idx.IsSome then db.GetStore(tabs.[idx.Value].Name).Rows else [||])
+            // nested loop
+            let results = ResizeArray<Row>()
+            let mutable curs = heads |> Array.map (fun h -> if h.Length > 0 then 0 else -1)
+            let rec loop() =
+                let ok = curs |> Array.forall (fun c -> c >= 0)
+                if not ok then ()
+                else
+                    let rows = curs |> Array.mapi (fun i c -> heads.[i].[c])
+                    let ctx = { Refs = tables; Tabs = tabs; Rows = rows }
+                    if rowMatch where ctx && rowMatch joinOn ctx then
+                        let combined = rows |> Array.collect id |> Array.map vCopy
+                        results.Add(combined)
+                    // advance innermost
+                    let mutable k = n - 1
+                    let mutable carry = true
+                    while k >= 0 && carry do
+                        curs.[k] <- curs.[k] + 1
+                        if curs.[k] < heads.[k].Length then
+                            carry <- false
+                        else
+                            curs.[k] <- if heads.[k].Length > 0 then 0 else -1
+                            k <- k - 1
+                    if k < 0 && carry then ()
+                    else loop()
+            loop()
+            let arr = results.ToArray()
+            // ORDER BY
+            sorted <-
+                match orderCol with
+                | Some oc when n = 1 ->
+                    let cidx = tableColIndex tabs.[0] oc
+                    match cidx with
+                    | Some ci ->
+                        arr |> Array.sortInPlaceWith (fun a b ->
+                            let cmp = vCmp a.[ci] b.[ci]
+                            if orderDesc then -cmp else cmp)
+                        arr
+                    | None -> arr
+                | _ -> arr
+        | _ -> ()
+
+    member s.Step() =
+        match stmt with
+        | SSelect _ -> s.StepSelect()
+        | _ -> 101
+
+    member _.ColumnCount = nout
+    member _.ColumnText(i) =
+        if i < 0 || i >= nout then null else vToText outrow.[i]
+    member _.ColumnInt64(i) =
+        if i < 0 || i >= nout then 0L
+        else match outrow.[i] with VInt v -> v | _ -> 0L
+
+// ---------- Public API ----------
+type Sqlite3 with
+    static member Open(_name) = new Sqlite3()
+
+    member db.Close() = ()
+
+    member db.Exec(sql: string, cb: (int -> string[] -> unit) option) =
+        let toks = lex sql
+        let mutable p = Parser(toks)
+        let mutable rc = 0
+        let mutable idx = 0
+        // We need to parse multiple statements
+        while toks.[idx].Kind <> TKEof && rc = 0 do
+            // re-create parser at current position
+            let mutable parser = Parser(toks)
+            // hack: we need to track position; let's use a mutable approach
+            // Actually, let's re-lex per statement by tracking position
+            // Simpler: parse all statements in a loop using the parser's internal index
+            // We'll use a single parser and loop
+            ()
+        // Redo: single parser, loop
+        let parser = Parser(toks)
+        let mutable cont = true
+        let mutable result = 0
+        let mutable err = ""
+        while cont do
+            if parser.Peek.Kind = TKEof then cont <- false
+            else
+                try
+                    let st = parser.Parse()
+                    parser.Accept TKSemi |> ignore
+                    match st with
+                    | SBegin -> ()
+                    | SCommit -> ()
+                    | SCreate(name, cols) ->
+                        let r = db.Schema.Add(name, cols)
+                        if r < 0 then
+                            err <- sprintf "table already exists: %s" name
+                            result <- 1
+                            cont <- false
+                        else db.AddStore(name)
+                    | SInsert(table, vals) ->
+                        match db.Schema.Index(table) with
+                        | Some idx ->
+                            let store = db.GetStore(db.Schema.All.[idx].Name)
+                            store.Add(vals |> Array.map vCopy)
+                        | None ->
+                            err <- sprintf "no such table: %s" table
+                            result <- 1
+                            cont <- false
+                    | SSelect _ ->
+                        use s = new Sqlite3Stmt(db, st)
+                        let mutable stepping = true
+                        while stepping do
+                            let r = s.Step()
+                            if r = 100 then
+                                let vals = Array.init s.NOut (fun i -> s.ColumnText(i))
+                                match cb with
+                                | Some f -> f s.NOut vals
+                                | None -> ()
+                            else stepping <- false
+                with _ ->
+                    err <- "parse error"
+                    result <- 1
+                    cont <- false
+        if result <> 0 then db.SetErr(err)
+        result
+
+    member db.Prepare(sql: string) =
+        let toks = lex sql
+        let parser = Parser(toks)
+        try
+            let st = parser.Parse()
+            let s = new Sqlite3Stmt(db, st)
+            0, s
+        with _ ->
+            1, Unchecked.defaultof<_>
+
+// ---------- Demo ----------
+let printRow (n: int) (vals: string[]) =
+    let parts = vals |> Array.map (fun v -> v)
+    printfn "%s" (String.Join(" | ", parts))
+
+[<EntryPoint>]
+let main _ =
+    let db = Sqlite3.Open(":memory:")
+    let sql =
+        "CREATE TABLE users (id INTEGER, name TEXT);\
+         INSERT INTO users VALUES (1, 'ada');\
+         INSERT INTO users VALUES (2, 'grace');\
+         INSERT INTO users VALUES (3, 'linus');\
+         SELECT * FROM users WHERE id > 1 ORDER BY id DESC;"
+    let rc = db.Exec(sql, Some printRow)
+    if rc <> 0 then eprintfn "err: %s" (db.GetErr())
+    db.Close()
+    0
