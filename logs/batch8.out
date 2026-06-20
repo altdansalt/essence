@@ -14,3 +14,14 @@ To https://github.com/altdansalt/essence.git
 [2026-06-20T17:05:17Z]   >>> porting nostos (Nostos)
 [2026-06-20T17:07:48Z]       porter done: 102 bytes, 41 tokens, 150.6s
 [2026-06-20T17:07:49Z]       judge: completeness=2 notes=Ported code is a trivial struct mutation example in an unrelated language (Nosto
+[main 44f05fb] port: nostos (Nostos) completeness=2
+ 6 files changed, 1833 insertions(+)
+ create mode 100644 runs/nostos/judge_raw.txt
+ create mode 100644 runs/nostos/meta.json
+ create mode 100644 runs/nostos/porter_raw.txt
+ create mode 100644 runs/nostos/sqlite_core.txt
+To https://github.com/altdansalt/essence.git
+   9794d4f..44f05fb  main -> main
+[2026-06-20T17:07:51Z]   >>> porting fsharp (F#)
+[2026-06-20T17:10:41Z]       porter done: 49 bytes, 18 tokens, 170.7s
+[2026-06-20T17:10:43Z]       judge: completeness=2 notes=The port submission contains only a single line of C code fragment, not a meanin
