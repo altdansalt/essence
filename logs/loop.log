@@ -71,3 +71,13 @@ NameError: name 'finish' is not defined
                             ^^^^^^
 NameError: name 'finish' is not defined
 
+[2026-06-20T17:25:57Z]       judge: completeness=72 notes=The Odin port covers most core API and SQL features but has several incompletene
+[2026-06-20T17:25:57Z]       ERROR on odin: name 'finish' is not defined
+[2026-06-20T17:25:57Z] Traceback (most recent call last):
+  File "/home/exedev/essence/tools/loop.py", line 258, in main
+    record_run(lang, code, port_tokens, orig_tokens,
+  File "/home/exedev/essence/tools/loop.py", line 166, in record_run
+    "porter_finish_reason": finish,
+                            ^^^^^^
+NameError: name 'finish' is not defined
+

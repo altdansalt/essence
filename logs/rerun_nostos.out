@@ -11,3 +11,7 @@
                             ^^^^^^
 NameError: name 'finish' is not defined
 
+[main d416948] port: nostos failed: name 'finish' is not defined
+ 6 files changed, 838 insertions(+)
+ create mode 100644 runs/nostos/ERROR.txt
+ create mode 100644 runs/nostos/sqlite_core.txt

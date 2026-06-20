@@ -1,3 +1,13 @@
 [2026-06-20T17:24:32Z] loop start: 1 languages, orig_tokens=8805
 [2026-06-20T17:24:32Z]   >>> porting odin (Odin)
 [2026-06-20T17:25:54Z]       porter done: 21050 bytes, 7421 tokens, 81.9s
+[2026-06-20T17:25:57Z]       judge: completeness=72 notes=The Odin port covers most core API and SQL features but has several incompletene
+[2026-06-20T17:25:57Z]       ERROR on odin: name 'finish' is not defined
+[2026-06-20T17:25:57Z] Traceback (most recent call last):
+  File "/home/exedev/essence/tools/loop.py", line 258, in main
+    record_run(lang, code, port_tokens, orig_tokens,
+  File "/home/exedev/essence/tools/loop.py", line 166, in record_run
+    "porter_finish_reason": finish,
+                            ^^^^^^
+NameError: name 'finish' is not defined
+
