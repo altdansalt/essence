@@ -2,3 +2,9 @@
 [2026-06-20T17:43:02Z]   >>> porting swift (Swift)
 [2026-06-20T17:44:02Z]       porter done: 20537 bytes, 5578 tokens, 60.4s
 [2026-06-20T17:44:05Z]       judge: completeness=72 notes=Swift port successfully translates core lexer, parser, and executor logic with g
+[main 41c8ee0] port: swift (Swift) completeness=72
+ 7 files changed, 1313 insertions(+)
+ create mode 100644 runs/swift/judge_raw.txt
+ create mode 100644 runs/swift/meta.json
+ create mode 100644 runs/swift/porter_raw.txt
+ create mode 100644 runs/swift/sqlite_core.swift

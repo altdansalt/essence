@@ -16,3 +16,6 @@
  create mode 100644 runs/typescript/meta.json
  create mode 100644 runs/typescript/porter_raw.txt
  create mode 100644 runs/typescript/sqlite_core.ts
+To https://github.com/altdansalt/essence.git
+   5c0a3e3..cc93892  main -> main
+[2026-06-20T17:44:05Z] loop done: 1 runs
