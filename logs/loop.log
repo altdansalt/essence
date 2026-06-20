@@ -162,3 +162,4 @@ subprocess.CalledProcessError: Command '['git', 'push']' returned non-zero exit 
 [2026-06-20T17:47:10Z]       porter length-capped (16000 tok); retry high effort
 [2026-06-20T17:49:04Z]       porter done: 407 bytes, 180 tokens, 362.6s
 [2026-06-20T17:49:07Z]       judge: completeness=12 notes=The port shows only a single utility function (v_cmp) with no database, parser, 
+[2026-06-20T17:49:08Z] loop done: 1 runs

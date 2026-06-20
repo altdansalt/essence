@@ -3,3 +3,12 @@
 [2026-06-20T17:46:21Z]       porter length-capped (16000 tok); retry high effort
 [2026-06-20T17:49:04Z]       porter done: 407 bytes, 180 tokens, 362.6s
 [2026-06-20T17:49:07Z]       judge: completeness=12 notes=The port shows only a single utility function (v_cmp) with no database, parser, 
+[main 2f8806e] port: gleam (Gleam) completeness=12
+ 11 files changed, 1896 insertions(+)
+ create mode 100644 runs/gleam/judge_raw.txt
+ create mode 100644 runs/gleam/meta.json
+ create mode 100644 runs/gleam/porter_raw.txt
+ create mode 100644 runs/gleam/sqlite_core.gleam
+To https://github.com/altdansalt/essence.git
+   f30f4b4..2f8806e  main -> main
+[2026-06-20T17:49:08Z] loop done: 1 runs
