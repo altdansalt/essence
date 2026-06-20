@@ -1,0 +1,39 @@
+{
+  "language": "C#",
+  "slug": "csharp",
+  "timestamp_utc": "2026-06-20T17:11:57Z",
+  "elapsed_seconds": 69.0,
+  "original_tokens": 8805,
+  "ported_tokens": 6931,
+  "token_ratio": 0.7872,
+  "reduction_factor": 1.27,
+  "porter_model": "accounts/fireworks/models/glm-5p2",
+  "judge_model": "claude-haiku-4-5",
+  "porter_usage": {
+    "prompt_tokens": 13645,
+    "total_tokens": 20678,
+    "completion_tokens": 7033,
+    "prompt_tokens_details": {
+      "cached_tokens": 177
+    }
+  },
+  "judge_usage": {
+    "input_tokens": 21043,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "cache_creation": {
+      "ephemeral_5m_input_tokens": 0,
+      "ephemeral_1h_input_tokens": 0
+    },
+    "output_tokens": 207,
+    "service_tier": "standard",
+    "inference_geo": "not_available"
+  },
+  "judge_score": {
+    "completeness": 72,
+    "api_surface": 85,
+    "sql_features": 78,
+    "architecture": 65,
+    "notes": "Port captures most API surface (sqlite3_open/close/exec/prepare_v2/step/finalize/column_*) and core SQL features (CREATE TABLE, INSERT, SELECT with WHERE/ORDER BY/JOIN). However, significant gaps exist: RowCtx.ColIndex returns int but C version returns via out-params (semantic mismatch); ORDER BY sort only handles single-table case and lacks multi-table column offset mapping; expression evaluation context handling differs substantially; no transaction state enforcement despite in_txn flag; StepSelect rebuilds RowCtx incorrectly for joins (creates single-row array instead of proper per-table split). Architecture divergence in value copying semantics and memory model."
+  }
+}

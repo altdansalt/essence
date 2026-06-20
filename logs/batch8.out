@@ -25,3 +25,14 @@ To https://github.com/altdansalt/essence.git
 [2026-06-20T17:07:51Z]   >>> porting fsharp (F#)
 [2026-06-20T17:10:41Z]       porter done: 49 bytes, 18 tokens, 170.7s
 [2026-06-20T17:10:43Z]       judge: completeness=2 notes=The port submission contains only a single line of C code fragment, not a meanin
+[main 4563bcd] port: fsharp (F#) completeness=2
+ 6 files changed, 1553 insertions(+)
+ create mode 100644 runs/fsharp/judge_raw.txt
+ create mode 100644 runs/fsharp/meta.json
+ create mode 100644 runs/fsharp/porter_raw.txt
+ create mode 100644 runs/fsharp/sqlite_core.fs
+To https://github.com/altdansalt/essence.git
+   44f05fb..4563bcd  main -> main
+[2026-06-20T17:10:45Z]   >>> porting csharp (C#)
+[2026-06-20T17:11:54Z]       porter done: 29026 bytes, 6931 tokens, 69.0s
+[2026-06-20T17:11:57Z]       judge: completeness=72 notes=Port captures most API surface (sqlite3_open/close/exec/prepare_v2/step/finalize

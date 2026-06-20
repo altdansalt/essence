@@ -1,0 +1,702 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+
+namespace SqliteCore
+{
+    // ---------- Value ----------
+    enum VType { V_NULL, V_INT, V_TEXT }
+    struct Value
+    {
+        public VType type;
+        public long ival;
+        public string sval;
+        public static Value Null => new Value { type = VType.V_NULL };
+        public static Value Int(long i) => new Value { type = VType.V_INT, ival = i };
+        public static Value Text(string s) => new Value { type = VType.V_TEXT, sval = s ?? "" };
+        public Value Copy() => type == VType.V_TEXT ? Text(sval) : this;
+        public static int Compare(Value a, Value b)
+        {
+            if (a.type != b.type) return (int)a.type - (int)b.type;
+            if (a.type == VType.V_INT) return a.ival < b.ival ? -1 : a.ival > b.ival ? 1 : 0;
+            if (a.type == VType.V_TEXT) return string.Compare(a.sval ?? "", b.sval ?? "", StringComparison.Ordinal);
+            return 0;
+        }
+        public string ToText() => type == VType.V_INT ? ival.ToString() : type == VType.V_TEXT ? sval : "NULL";
+        public bool Truthy() => Compare(this, Int(0)) != 0;
+    }
+
+    // ---------- Schema ----------
+    class Table
+    {
+        public string name;
+        public string[] cols;
+    }
+
+    // ---------- Row / store ----------
+    class Row
+    {
+        public Value[] vals;
+    }
+    class RowNode
+    {
+        public Row row;
+        public RowNode next;
+    }
+    class RowStore
+    {
+        public RowNode head, tail;
+        public int nrows;
+    }
+
+    // ---------- Lexer ----------
+    enum TokKind { TK_EOF, TK_ID, TK_INT, TK_STRING, TK_KW, TK_PUNCT, TK_STAR, TK_COMMA, TK_LP, TK_RP, TK_SEMI, TK_OP, TK_DOT }
+    class Token { public TokKind kind; public string text; }
+
+    static class Lexer
+    {
+        static readonly string[] KEYWORDS = {
+            "create","table","insert","into","values","select","from","where",
+            "order","by","asc","desc","and","or","not","null","begin","commit",
+            "inner","join","on","int","integer","text","primary","key","transaction"
+        };
+        static bool IsKw(string s) => KEYWORDS.Any(k => k.Equals(s, StringComparison.OrdinalIgnoreCase));
+        static bool IsKwN(string s, int n)
+        {
+            for (int i = 0; i < KEYWORDS.Length; i++)
+                if (KEYWORDS[i].Length == n && KEYWORDS[i].Equals(s.Substring(0, n), StringComparison.OrdinalIgnoreCase)) return true;
+            return false;
+        }
+
+        public static List<Token> Lex(string sql)
+        {
+            var toks = new List<Token>();
+            int pos = 0;
+            void Push(TokKind k, string s) => toks.Add(new Token { kind = k, text = s });
+            while (pos < sql.Length)
+            {
+                char c = sql[pos];
+                if (char.IsWhiteSpace(c)) { pos++; continue; }
+                if (c == '-' && pos + 1 < sql.Length && sql[pos + 1] == '-')
+                {
+                    while (pos < sql.Length && sql[pos] != '\n') pos++;
+                    continue;
+                }
+                if (char.IsLetter(c) || c == '_')
+                {
+                    int st = pos;
+                    while (pos < sql.Length && (char.IsLetterOrDigit(sql[pos]) || sql[pos] == '_')) pos++;
+                    int len = pos - st;
+                    Push(IsKwN(sql.Substring(st, len), len) ? TokKind.TK_KW : TokKind.TK_ID, sql.Substring(st, len));
+                    continue;
+                }
+                if (char.IsDigit(c))
+                {
+                    int st = pos;
+                    while (pos < sql.Length && char.IsDigit(sql[pos])) pos++;
+                    Push(TokKind.TK_INT, sql.Substring(st, pos - st));
+                    continue;
+                }
+                if (c == '\'')
+                {
+                    pos++;
+                    int st = pos;
+                    while (pos < sql.Length && sql[pos] != '\'') pos++;
+                    Push(TokKind.TK_STRING, sql.Substring(st, pos - st));
+                    if (pos < sql.Length && sql[pos] == '\'') pos++;
+                    continue;
+                }
+                if (c == '"')
+                {
+                    pos++;
+                    int st = pos;
+                    while (pos < sql.Length && sql[pos] != '"') pos++;
+                    Push(TokKind.TK_ID, sql.Substring(st, pos - st));
+                    if (pos < sql.Length && sql[pos] == '"') pos++;
+                    continue;
+                }
+                switch (c)
+                {
+                    case '*': Push(TokKind.TK_STAR, "*"); pos++; break;
+                    case ',': Push(TokKind.TK_COMMA, ","); pos++; break;
+                    case '(': Push(TokKind.TK_LP, "("); pos++; break;
+                    case ')': Push(TokKind.TK_RP, ")"); pos++; break;
+                    case ';': Push(TokKind.TK_SEMI, ";"); pos++; break;
+                    case '.': Push(TokKind.TK_DOT, "."); pos++; break;
+                    default:
+                        if ("=<>!".IndexOf(c) >= 0)
+                        {
+                            int st = pos;
+                            if (pos + 1 < sql.Length && sql[pos + 1] == '=') pos++;
+                            if (c == '<' && pos + 1 < sql.Length && sql[pos + 1] == '>') pos++;
+                            if (c == '!' && pos + 1 < sql.Length && sql[pos + 1] == '=') pos++;
+                            pos++;
+                            Push(TokKind.TK_OP, sql.Substring(st, pos - st));
+                        }
+                        else { Push(TokKind.TK_PUNCT, c.ToString()); pos++; }
+                        break;
+                }
+            }
+            Push(TokKind.TK_EOF, "");
+            return toks;
+        }
+    }
+
+    // ---------- AST ----------
+    enum ExprKind { E_COL, E_INT, E_STR, E_BINOP }
+    class Expr
+    {
+        public ExprKind kind;
+        public string col;
+        public long ival;
+        public string sval;
+        public string op;
+        public Expr l, r;
+    }
+    class ResultCol { public string col; public bool star; }
+    class TableRef { public string tname; public string alias; }
+
+    class Stmt
+    {
+        public bool is_create, is_insert, is_select, is_begin, is_commit;
+        public string ct_name; public List<string> ct_cols = new List<string>();
+        public string ins_table; public List<Value> ins_vals = new List<Value>();
+        public List<ResultCol> sel_cols = new List<ResultCol>(); public bool sel_star;
+        public List<TableRef> sel_tables = new List<TableRef>();
+        public Expr sel_where;
+        public string sel_order_col; public bool sel_order_desc;
+        public Expr sel_join_on;
+    }
+
+    // ---------- Parser ----------
+    class Parser
+    {
+        List<Token> toks;
+        int i;
+        public Parser(List<Token> t) { toks = t; i = 0; }
+        Token T => toks[i];
+        public bool Accept(TokKind k, string text = null)
+        {
+            if (T.kind != k) return false;
+            if (text != null && !text.Equals(T.text, StringComparison.OrdinalIgnoreCase)) return false;
+            i++; return true;
+        }
+        public bool AcceptKw(string kw) => Accept(TokKind.TK_KW, kw);
+        public bool PeekKw(string kw) => T.kind == TokKind.TK_KW && kw.Equals(T.text, StringComparison.OrdinalIgnoreCase);
+
+        Expr NewExpr(ExprKind k) => new Expr { kind = k };
+
+        public Expr ParsePrimary()
+        {
+            var t = T;
+            if (t.kind == TokKind.TK_INT) { var e = NewExpr(ExprKind.E_INT); e.ival = long.Parse(t.text); i++; return e; }
+            if (t.kind == TokKind.TK_STRING) { var e = NewExpr(ExprKind.E_STR); e.sval = t.text; i++; return e; }
+            if (t.kind == TokKind.TK_ID || t.kind == TokKind.TK_KW)
+            {
+                var e = NewExpr(ExprKind.E_COL);
+                string buf = t.text; i++;
+                if (T.kind == TokKind.TK_DOT) { i++; buf += "." + T.text; i++; }
+                e.col = buf;
+                return e;
+            }
+            if (Accept(TokKind.TK_LP)) { var e = ParseExpr(); Accept(TokKind.TK_RP); return e; }
+            return null;
+        }
+        public Expr ParseCmp()
+        {
+            Expr l = ParsePrimary();
+            if (T.kind == TokKind.TK_OP)
+            {
+                var e = NewExpr(ExprKind.E_BINOP);
+                e.op = T.text; i++; e.l = l; e.r = ParsePrimary(); return e;
+            }
+            return l;
+        }
+        public Expr ParseExpr()
+        {
+            Expr l = ParseCmp();
+            if (PeekKw("and") || PeekKw("or"))
+            {
+                var e = NewExpr(ExprKind.E_BINOP);
+                e.op = PeekKw("and") ? "AND" : "OR";
+                i++; e.l = l; e.r = ParseExpr(); return e;
+            }
+            return l;
+        }
+
+        public int ParseCreate(Stmt st)
+        {
+            st.is_create = true;
+            if (T.kind != TokKind.TK_ID && T.kind != TokKind.TK_KW) return -1;
+            st.ct_name = T.text; i++;
+            if (!Accept(TokKind.TK_LP)) return -1;
+            while (T.kind != TokKind.TK_RP && T.kind != TokKind.TK_EOF)
+            {
+                if (T.kind != TokKind.TK_ID && T.kind != TokKind.TK_KW) return -1;
+                st.ct_cols.Add(T.text); i++;
+                while (T.kind != TokKind.TK_COMMA && T.kind != TokKind.TK_RP && T.kind != TokKind.TK_EOF) i++;
+                Accept(TokKind.TK_COMMA);
+            }
+            Accept(TokKind.TK_RP);
+            return 0;
+        }
+        public int ParseInsert(Stmt st)
+        {
+            st.is_insert = true;
+            if (!AcceptKw("into")) return -1;
+            if (T.kind != TokKind.TK_ID) return -1;
+            st.ins_table = T.text; i++;
+            if (!AcceptKw("values")) return -1;
+            if (!Accept(TokKind.TK_LP)) return -1;
+            while (T.kind != TokKind.TK_RP && T.kind != TokKind.TK_EOF)
+            {
+                if (T.kind == TokKind.TK_INT) st.ins_vals.Add(Value.Int(long.Parse(T.text)));
+                else if (T.kind == TokKind.TK_STRING) st.ins_vals.Add(Value.Text(T.text));
+                else if (AcceptKw("null")) st.ins_vals.Add(Value.Null);
+                else return -1;
+                i++;
+                if (!Accept(TokKind.TK_COMMA)) break;
+            }
+            if (!Accept(TokKind.TK_RP)) return -1;
+            return 0;
+        }
+        public int ParseSelect(Stmt st)
+        {
+            st.is_select = true;
+            if (Accept(TokKind.TK_STAR)) { st.sel_star = true; }
+            else do {
+                var rc = new ResultCol();
+                if (Accept(TokKind.TK_STAR)) { rc.star = true; }
+                else if (T.kind == TokKind.TK_ID || T.kind == TokKind.TK_KW)
+                {
+                    string buf = T.text; i++;
+                    if (T.kind == TokKind.TK_DOT)
+                    {
+                        i++;
+                        if (Accept(TokKind.TK_STAR)) { rc.star = true; }
+                        else { buf += "." + T.text; i++; rc.col = buf; }
+                    }
+                    else rc.col = buf;
+                }
+                else return -1;
+                st.sel_cols.Add(rc);
+            } while (Accept(TokKind.TK_COMMA));
+            if (!AcceptKw("from")) return -1;
+            if (T.kind != TokKind.TK_ID) return -1;
+            // first table
+            {
+                var tr = new TableRef { tname = T.text }; i++;
+                if (T.kind == TokKind.TK_ID && !PeekKw("on") && !PeekKw("where") && !PeekKw("order") && !PeekKw("inner") && !PeekKw("join"))
+                { tr.alias = T.text; i++; }
+                st.sel_tables.Add(tr);
+            }
+            while (PeekKw("inner") || PeekKw("join"))
+            {
+                if (AcceptKw("inner")) { if (!AcceptKw("join")) return -1; }
+                else AcceptKw("join");
+                if (T.kind != TokKind.TK_ID) return -1;
+                var tr = new TableRef { tname = T.text }; i++;
+                if (T.kind == TokKind.TK_ID && !PeekKw("on") && !PeekKw("where") && !PeekKw("order"))
+                { tr.alias = T.text; i++; }
+                st.sel_tables.Add(tr);
+                if (AcceptKw("on"))
+                {
+                    Expr on = ParseExpr();
+                    if (st.sel_join_on == null) st.sel_join_on = on;
+                    else st.sel_join_on = new Expr { kind = ExprKind.E_BINOP, op = "AND", l = st.sel_join_on, r = on };
+                }
+            }
+            if (AcceptKw("where")) st.sel_where = ParseExpr();
+            if (AcceptKw("order"))
+            {
+                if (!AcceptKw("by")) return -1;
+                if (T.kind != TokKind.TK_ID && T.kind != TokKind.TK_KW) return -1;
+                st.sel_order_col = T.text; i++;
+                if (AcceptKw("desc")) st.sel_order_desc = true;
+                else AcceptKw("asc");
+            }
+            return 0;
+        }
+        public Stmt Parse()
+        {
+            var st = new Stmt();
+            if (PeekKw("begin")) { st.is_begin = true; i++; AcceptKw("transaction"); }
+            else if (PeekKw("commit")) { st.is_commit = true; i++; AcceptKw("transaction"); }
+            else if (AcceptKw("create")) { if (AcceptKw("table")) { if (ParseCreate(st) < 0) return null; } else return null; }
+            else if (AcceptKw("insert")) { if (ParseInsert(st) < 0) return null; }
+            else if (AcceptKw("select")) { if (ParseSelect(st) < 0) return null; }
+            else return null;
+            Accept(TokKind.TK_SEMI);
+            return st;
+        }
+    }
+
+    // ---------- Row context for eval ----------
+    class RowCtx
+    {
+        public List<TableRef> refs;
+        public Table[] tabs;
+        public Row[] rows;
+        public int ColIndex(string col, out int tabidx, out int colidx)
+        {
+            int dot = col.IndexOf('.');
+            if (dot >= 0)
+            {
+                string tname = col.Substring(0, dot);
+                string cname = col.Substring(dot + 1);
+                for (int i = 0; i < refs.Count; i++)
+                {
+                    string tn = refs[i].alias ?? refs[i].tname;
+                    if (tn.Equals(tname, StringComparison.OrdinalIgnoreCase))
+                    {
+                        int ci = Array.FindIndex(tabs[i].cols, c => c.Equals(cname, StringComparison.OrdinalIgnoreCase));
+                        if (ci >= 0) { tabidx = i; colidx = ci; return 0; }
+                    }
+                }
+                tabidx = -1; colidx = -1; return -1;
+            }
+            for (int i = 0; i < refs.Count; i++)
+            {
+                int ci = Array.FindIndex(tabs[i].cols, c => c.Equals(col, StringComparison.OrdinalIgnoreCase));
+                if (ci >= 0) { tabidx = i; colidx = ci; return 0; }
+            }
+            tabidx = -1; colidx = -1; return -1;
+        }
+    }
+
+    // ---------- Database ----------
+    class sqlite3
+    {
+        public List<Table> schema = new List<Table>();
+        public List<RowStore> stores = new List<RowStore>();
+        public string errmsg = "";
+        public int in_txn;
+
+        public Table SchemaFind(string name) => schema.FirstOrDefault(t => t.name.Equals(name, StringComparison.OrdinalIgnoreCase));
+        public int SchemaIndex(string name)
+        {
+            for (int i = 0; i < schema.Count; i++) if (schema[i].name.Equals(name, StringComparison.OrdinalIgnoreCase)) return i;
+            return -1;
+        }
+        public int SchemaAdd(string name, string[] cols)
+        {
+            if (SchemaFind(name) != null) return -1;
+            schema.Add(new Table { name = name, cols = cols });
+            stores.Add(new RowStore());
+            return 0;
+        }
+        static int TableColIndex(Table t, string col) => Array.FindIndex(t.cols, c => c.Equals(col, StringComparison.OrdinalIgnoreCase));
+
+        public int ExecCreate(Stmt st)
+        {
+            if (SchemaAdd(st.ct_name, st.ct_cols.ToArray()) != 0)
+            { errmsg = $"table already exists: {st.ct_name}"; return -1; }
+            st.ct_cols.Clear();
+            return 0;
+        }
+        public int ExecInsert(Stmt st)
+        {
+            int idx = SchemaIndex(st.ins_table);
+            if (idx < 0) { errmsg = $"no such table: {st.ins_table}"; return -1; }
+            var rs = stores[idx];
+            var n = new RowNode { row = new Row { vals = st.ins_vals.Select(v => v.Copy()).ToArray() } };
+            if (rs.tail != null) rs.tail.next = n; else rs.head = n;
+            rs.tail = n; rs.nrows++;
+            return 0;
+        }
+
+        public static Value EvalExpr(Expr e, RowCtx c)
+        {
+            if (e == null) return Value.Null;
+            switch (e.kind)
+            {
+                case ExprKind.E_INT: return Value.Int(e.ival);
+                case ExprKind.E_STR: return Value.Text(e.sval);
+                case ExprKind.E_COL:
+                    if (c.ColIndex(e.col, out int ti, out int ci) < 0) return Value.Null;
+                    return c.rows[ti].vals[ci].Copy();
+                case ExprKind.E_BINOP:
+                    {
+                        Value a = EvalExpr(e.l, c), b = EvalExpr(e.r, c);
+                        Value res;
+                        if (e.op.Equals("AND", StringComparison.OrdinalIgnoreCase))
+                            res = Value.Int(a.Truthy() && b.Truthy() ? 1 : 0);
+                        else if (e.op.Equals("OR", StringComparison.OrdinalIgnoreCase))
+                            res = Value.Int(a.Truthy() || b.Truthy() ? 1 : 0);
+                        else
+                        {
+                            int cmp = Value.Compare(a, b);
+                            res = Value.Int(
+                                e.op == "=" ? (cmp == 0 ? 1 : 0) :
+                                e.op == "<>" ? (cmp != 0 ? 1 : 0) :
+                                e.op == "<" ? (cmp < 0 ? 1 : 0) :
+                                e.op == ">" ? (cmp > 0 ? 1 : 0) :
+                                e.op == "<=" ? (cmp <= 0 ? 1 : 0) :
+                                e.op == ">=" ? (cmp >= 0 ? 1 : 0) : 0);
+                        }
+                        return res;
+                    }
+            }
+            return Value.Null;
+        }
+        static bool RowMatch(Expr where, RowCtx c)
+        {
+            if (where == null) return true;
+            return EvalExpr(where, c).Truthy();
+        }
+    }
+
+    // ---------- Prepared statement ----------
+    class sqlite3_stmt
+    {
+        public sqlite3 db;
+        public Stmt st;
+        public bool started;
+        public int cur_sorted;
+        public List<Row> sorted = new List<Row>();
+        public Value[] outrow;
+        public int nout;
+
+        void CollectMatching()
+        {
+            int n = st.sel_tables.Count;
+            int[] idx = new int[n];
+            Table[] tabs = new Table[n];
+            for (int i = 0; i < n; i++) { idx[i] = db.SchemaIndex(st.sel_tables[i].tname); tabs[i] = db.schema[idx[i]]; }
+            RowNode[] cur = new RowNode[n];
+            for (int i = 0; i < n; i++) cur[i] = idx[i] >= 0 ? db.stores[idx[i]].head : null;
+            while (true)
+            {
+                bool ok = true;
+                for (int i = 0; i < n; i++) if (cur[i] == null) { ok = false; break; }
+                if (!ok) break;
+                var c = new RowCtx { refs = st.sel_tables, tabs = tabs, rows = new Row[n] };
+                for (int i = 0; i < n; i++) c.rows[i] = cur[i].row;
+                if (sqlite3.RowMatch(st.sel_where, c) && (st.sel_join_on == null || sqlite3.RowMatch(st.sel_join_on, c)))
+                {
+                    var vals = new List<Value>();
+                    for (int i = 0; i < n; i++)
+                        for (int j = 0; j < c.rows[i].vals.Length; j++)
+                            vals.Add(c.rows[i].vals[j].Copy());
+                    sorted.Add(new Row { vals = vals.ToArray() });
+                }
+                int k;
+                for (k = n - 1; k >= 0; k--)
+                {
+                    cur[k] = cur[k].next;
+                    if (cur[k] != null) break;
+                    if (k > 0) cur[k] = idx[k] >= 0 ? db.stores[idx[k]].head : null;
+                }
+                if (k < 0) break;
+            }
+            // ORDER BY
+            if (st.sel_order_col != null)
+            {
+                var tabs2 = new Table[st.sel_ntables()];
+                for (int i = 0; i < st.sel_ntables(); i++) tabs2[i] = db.SchemaFind(st.sel_tables[i].tname);
+                if (st.sel_ntables() == 1)
+                {
+                    int cidx = Array.FindIndex(tabs2[0].cols, c2 => c2.Equals(st.sel_order_col, StringComparison.OrdinalIgnoreCase));
+                    if (cidx >= 0)
+                    {
+                        for (int i = 1; i < sorted.Count; i++)
+                        {
+                            for (int j = i; j > 0; j--)
+                            {
+                                var a = sorted[j - 1].vals[cidx];
+                                var b = sorted[j].vals[cidx];
+                                int cmp = Value.Compare(a, b);
+                                if ((st.sel_order_desc && cmp < 0) || (!st.sel_order_desc && cmp > 0))
+                                {
+                                    var t2 = sorted[j - 1]; sorted[j - 1] = sorted[j]; sorted[j] = t2;
+                                }
+                                else break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        public int StepSelect()
+        {
+            if (!started) { started = true; CollectMatching(); }
+            if (cur_sorted >= sorted.Count) return 101;
+            Row r = sorted[cur_sorted++];
+            int n = st.sel_tables.Count;
+            Table[] tabs = new Table[n];
+            for (int i = 0; i < n; i++) tabs[i] = db.SchemaFind(st.sel_tables[i].tname);
+            var c = new RowCtx { refs = st.sel_tables, tabs = tabs, rows = new Row[] { r } };
+            // For projection, combined row r = table0.cols ++ table1.cols ++ ...
+            // But RowCtx expects rows per table. We need to split r back.
+            int[] offsets = new int[n];
+            int off = 0;
+            for (int i = 0; i < n; i++) { offsets[i] = off; off += tabs[i].cols.Length; }
+            // Rebuild rows array for eval
+            var splitRows = new Row[n];
+            for (int i = 0; i < n; i++)
+            {
+                var rv = new Value[tabs[i].cols.Length];
+                for (int j = 0; j < tabs[i].cols.Length; j++) rv[j] = r.vals[offsets[i] + j];
+                splitRows[i] = new Row { vals = rv };
+            }
+            c.rows = splitRows;
+
+            int nout;
+            if (st.sel_star) nout = off;
+            else
+            {
+                nout = 0;
+                for (int k = 0; k < st.sel_cols.Count; k++)
+                    if (st.sel_cols[k].star) { for (int i = 0; i < n; i++) nout += tabs[i].cols.Length; }
+                    else nout++;
+            }
+            outrow = new Value[nout];
+            this.nout = 0;
+            if (st.sel_star)
+            {
+                for (int i = 0; i < n; i++)
+                    for (int j = 0; j < tabs[i].cols.Length; j++)
+                        outrow[this.nout++] = r.vals[offsets[i] + j].Copy();
+            }
+            else
+            {
+                for (int k = 0; k < st.sel_cols.Count; k++)
+                {
+                    var rc = st.sel_cols[k];
+                    if (rc.star)
+                    {
+                        for (int i = 0; i < n; i++)
+                            for (int j = 0; j < tabs[i].cols.Length; j++)
+                                outrow[this.nout++] = r.vals[offsets[i] + j].Copy();
+                    }
+                    else
+                    {
+                        int dot = rc.col.IndexOf('.');
+                        int ti = 0, ci = -1;
+                        if (dot >= 0)
+                        {
+                            string tname = rc.col.Substring(0, dot);
+                            string cname = rc.col.Substring(dot + 1);
+                            for (int i = 0; i < n; i++)
+                            {
+                                string tn = st.sel_tables[i].alias ?? st.sel_tables[i].tname;
+                                if (tn.Equals(tname, StringComparison.OrdinalIgnoreCase))
+                                { ci = Array.FindIndex(tabs[i].cols, c2 => c2.Equals(cname, StringComparison.OrdinalIgnoreCase)); ti = i; break; }
+                            }
+                        }
+                        else
+                        {
+                            for (int i = 0; i < n; i++)
+                            { ci = Array.FindIndex(tabs[i].cols, c2 => c2.Equals(rc.col, StringComparison.OrdinalIgnoreCase)); if (ci >= 0) { ti = i; break; } }
+                        }
+                        if (ci < 0) outrow[this.nout++] = Value.Null;
+                        else outrow[this.nout++] = r.vals[offsets[ti] + ci].Copy();
+                    }
+                }
+            }
+            return 100;
+        }
+    }
+
+    static class Sqlite3Ext
+    {
+        public static int sel_ntables(this Stmt st) => st.sel_tables.Count;
+    }
+
+    // ---------- Public API ----------
+    static class Sqlite3
+    {
+        public static int sqlite3_open(string name, out sqlite3 pp)
+        {
+            pp = new sqlite3();
+            return 0;
+        }
+        public static int sqlite3_close(sqlite3 db) => 0;
+
+        public static string sqlite3_errmsg(sqlite3 db) => db?.errmsg ?? "";
+
+        public delegate void ExecCallback(object arg, int n, string[] vals, string[] cols);
+
+        public static int sqlite3_exec(sqlite3 db, string sql, ExecCallback cb, object arg, out string err)
+        {
+            err = null;
+            var toks = Lexer.Lex(sql);
+            var P = new Parser(toks);
+            int rc = 0;
+            while (P.T.kind != TokKind.TK_EOF)
+            {
+                Stmt st = P.Parse();
+                if (st == null) { err = "parse error"; rc = 1; break; }
+                if (st.is_begin) db.in_txn = 1;
+                else if (st.is_commit) db.in_txn = 0;
+                else if (st.is_create) rc = db.ExecCreate(st);
+                else if (st.is_insert) rc = db.ExecInsert(st);
+                else if (st.is_select)
+                {
+                    var s = new sqlite3_stmt { db = db, st = st };
+                    int r;
+                    while ((r = s.StepSelect()) == 100)
+                    {
+                        var vals = new string[s.nout];
+                        for (int i = 0; i < s.nout; i++) vals[i] = s.outrow[i].ToText();
+                        cb?.Invoke(arg, s.nout, vals, null);
+                    }
+                }
+            }
+            if (rc != 0 && err == null) err = db.errmsg;
+            return rc;
+        }
+
+        public static int sqlite3_prepare_v2(sqlite3 db, string sql, int n, out sqlite3_stmt pp, out string tail)
+        {
+            tail = null;
+            string buf = n < 0 ? sql : sql.Substring(0, Math.Min(n, sql.Length));
+            var toks = Lexer.Lex(buf);
+            var P = new Parser(toks);
+            Stmt st = P.Parse();
+            if (st == null) { pp = null; return 1; }
+            pp = new sqlite3_stmt { db = db, st = st };
+            return 0;
+        }
+
+        public static int sqlite3_step(sqlite3_stmt s)
+        {
+            if (s.st.is_select) return s.StepSelect();
+            return 101;
+        }
+        public static int sqlite3_column_count(sqlite3_stmt s) => s.nout;
+        public static string sqlite3_column_text(sqlite3_stmt s, int i)
+        {
+            if (i < 0 || i >= s.nout) return null;
+            return s.outrow[i].ToText();
+        }
+        public static long sqlite3_column_int64(sqlite3_stmt s, int i)
+        {
+            if (i < 0 || i >= s.nout) return 0;
+            return s.outrow[i].type == VType.V_INT ? s.outrow[i].ival : 0;
+        }
+        public static int sqlite3_finalize(sqlite3_stmt s) => 0;
+
+        // ---------- Demo ----------
+        static void PrintRow(object arg, int n, string[] vals, string[] cols)
+        {
+            for (int i = 0; i < n; i++) Console.Write(vals[i] + (i + 1 < n ? " | " : "\n"));
+        }
+
+        public static void Main()
+        {
+            sqlite3_open(":memory:", out sqlite3 db);
+            string sql =
+                "CREATE TABLE users (id INTEGER, name TEXT);" +
+                "INSERT INTO users VALUES (1, 'ada');" +
+                "INSERT INTO users VALUES (2, 'grace');" +
+                "INSERT INTO users VALUES (3, 'linus');" +
+                "SELECT * FROM users WHERE id > 1 ORDER BY id DESC;";
+            if (sqlite3_exec(db, sql, PrintRow, null, out string err) != 0)
+                Console.Error.WriteLine("err: " + (err ?? "?"));
+            sqlite3_close(db);
+        }
+    }
+}

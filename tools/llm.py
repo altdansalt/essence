@@ -132,14 +132,14 @@ def fireworks_chat(model: str, messages: list[dict], *, max_tokens: int = 8000,
 PORTER_REASONING = os.environ.get("PORTER_REASONING", "low")
 
 
-def porter(messages: list[dict], *, max_tokens: int = 16000, temperature: float = 0.3,
+def porter(messages: list[dict], *, max_tokens: int = 32000, temperature: float = 0.3,
            reasoning_effort: str | None = PORTER_REASONING) -> dict:
     """Run the porter agent (GLM-5.2). Returns raw gateway response."""
     return fireworks_chat(PORTER_MODEL, messages, max_tokens=max_tokens,
                           temperature=temperature, reasoning_effort=reasoning_effort)
 
 
-def porter_text(messages: list[dict], *, max_tokens: int = 16000, temperature: float = 0.3,
+def porter_text(messages: list[dict], *, max_tokens: int = 32000, temperature: float = 0.3,
                 reasoning_effort: str | None = PORTER_REASONING) -> tuple[str, dict]:
     """Run porter and return (assistant_text, usage)."""
     resp = porter(messages, max_tokens=max_tokens, temperature=temperature,
