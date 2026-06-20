@@ -44,8 +44,8 @@ LOGS_DIR = os.path.join(ROOT, "logs")
 PORTER_SYS = """You are an expert polyglot software engineer porting a C codebase to another programming language.
 You port faithfully and completely: every public function, every behavior, every SQL feature supported by the source must appear in the port.
 You prefer idiomatic code in the target language, using that language's strengths to be as concise as possible while preserving behavior.
-Output ONLY the ported source code in a single fenced code block. No prose, no explanations, no commentary before or after the code block.
-The code block fence must be the FIRST and LAST thing in your output."""
+
+CRITICAL OUTPUT RULE: Do NOT show your reasoning. Do NOT write "Let me...", "I will...", or any analysis. Your ENTIRE output must be a single markdown code fence containing the complete ported source file. The opening ``` fence must be the first characters you emit. No prose before or after the fence. If you need to think, think briefly and then output ONLY the code fence."""
 
 def load_languages() -> list[dict]:
     return json.load(open(LANGUAGES_JSON, encoding="utf-8"))
@@ -145,7 +145,7 @@ def record_run(lang: dict, ported_code: str, port_tokens: int, orig_tokens: int,
     meta = {
         "language": lang["name"],
         "slug": slug,
-        "timestamp_utc": dt.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "timestamp_utc": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "elapsed_seconds": round(elapsed, 1),
         "original_tokens": orig_tokens,
         "ported_tokens": port_tokens,
@@ -193,7 +193,7 @@ def commit_push(msg: str, push: bool) -> None:
         git("push")
 
 def log(msg: str) -> None:
-    line = f"[{dt.datetime.utcnow().isoformat(timespec='seconds')}Z] {msg}"
+    line = f"[{dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}] {msg}"
     print(line, flush=True)
     os.makedirs(LOGS_DIR, exist_ok=True)
     with open(os.path.join(LOGS_DIR, "loop.log"), "a") as f:
@@ -204,7 +204,7 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--limit", type=int, default=0, help="max languages to process (0=all)")
     ap.add_argument("--only", help="only run this slug")
     ap.add_argument("--no-push", action="store_true")
-    ap.add_argument("--max-tokens", type=int, default=8000)
+    ap.add_argument("--max-tokens", type=int, default=16000)
     args = ap.parse_args(argv)
 
     langs = load_languages()

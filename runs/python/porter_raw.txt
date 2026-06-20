@@ -1,0 +1,1770 @@
+Let me port the C SQLite-style SQL engine to Python faithfully. I need to implement:
+
+1. Lexer
+2. Parser (recursive descent)
+3. Executor (nested-loop joins, WHERE, ORDER BY, projections)
+4. In-memory table store
+5. Public API: open, exec, prepare, step, finalize, close, column_count, column_text, column_int64, errmsg
+
+Let me write this carefully, matching the C behavior.
+
+Values: NULL / integer / text. Comparisons match C reference (type ordering: V_NULL < V_INT < V_TEXT, then by value).
+
+Let me write the Python port:
+
+```python
+import re
+from dataclasses import dataclass, field
+from typing import Optional
+
+# Value representation
+# NULL = None, INT = int, TEXT = str
+# For comparison: type ordering V_NULL(0) < V_INT(1) < V_TEXT(2)
+
+def v_cmp(a, b):
+    # a, b are Python values: None, int, str
+    ta, tb = v_type(a), v_type(b)
+    if ta != tb:
+        return ta - tb
+    if ta == 1:  # INT
+        return -1 if a < b else (1 if a > b else 0)
+    if ta == 2:  # TEXT
+        sa, sb = a if a else "", b if b else ""
+        return -1 if sa < sb else (1 if sa > sb else 0)
+    return 0
+
+def v_type(v):
+    if v is None: return 0
+    if isinstance(v, int): return 1
+    return 2
+
+def v_truthy(v):
+    return v_cmp(v, 0) != 0
+
+def v_to_text(v):
+    if v is None: return "NULL"
+    if isinstance(v, int): return str(v)
+    return v if v else ""
+```
+
+Now the lexer:
+
+```python
+KEYWORDS = {
+    "create","table","insert","into","values","select","from","where",
+    "order","by","asc","desc","and","or","not","null","begin","commit",
+    "inner","join","on","int","integer","text","primary","key","transaction"
+}
+
+@dataclass
+class Token:
+    kind: str
+    text: str
+
+def lex(sql):
+    toks = []
+    i = 0
+    n = len(sql)
+    while i < n:
+        c = sql[i]
+        if c.isspace():
+            i += 1
+            continue
+        if c == '-' and i+1 < n and sql[i+1] == '-':
+            while i < n and sql[i] != '\n':
+                i += 1
+            continue
+        if c.isalpha() or c == '_':
+            st = i
+            while i < n and (sql[i].isalnum() or sql[i] == '_'):
+                i += 1
+            word = sql[st:i]
+            toks.append(Token("KW" if word.lower() in KEYWORDS else "ID", word))
+            continue
+        if c.isdigit():
+            st = i
+            while i < n and sql[i].isdigit():
+                i += 1
+            toks.append(Token("INT", sql[st:i]))
+            continue
+        if c == "'":
+            i += 1
+            st = i
+            while i < n and sql[i] != "'":
+                i += 1
+            toks.append(Token("STRING", sql[st:i]))
+            if i < n: i += 1
+            continue
+        if c == '"':
+            i += 1
+            st = i
+            while i < n and sql[i] != '"':
+                i += 1
+            toks.append(Token("ID", sql[st:i]))
+            if i < n: i += 1
+            continue
+        if c == '*':
+            toks.append(Token("STAR", "*")); i += 1
+        elif c == ',':
+            toks.append(Token("COMMA", ",")); i += 1
+        elif c == '(':
+            toks.append(Token("LP", "(")); i += 1
+        elif c == ')':
+            toks.append(Token("RP", ")")); i += 1
+        elif c == ';':
+            toks.append(Token("SEMI", ";")); i += 1
+        elif c == '.':
+            toks.append(Token("DOT", ".")); i += 1
+        elif c in "=<>!":
+            st = i
+            if i+1 < n and sql[i+1] == '=':
+                i += 1
+            if c == '<' and i+1 < n and sql[i+1] == '>':
+                i += 1
+            if c == '!' and i+1 < n and sql[i+1] == '=':
+                i += 1
+            i += 1
+            toks.append(Token("OP", sql[st:i]))
+        else:
+            toks.append(Token("PUNCT", c)); i += 1
+    toks.append(Token("EOF", ""))
+    return toks
+```
+
+Now the AST and parser. Let me use simple classes/dicts.
+
+For Expr, I'll use a simple class or tuple. Let me use a class hierarchy or just dicts.
+
+Let me use dataclasses or simple classes:
+
+```python
+@dataclass
+class Expr:
+    kind: str  # "COL", "INT", "STR", "BINOP"
+    col: str = None
+    ival: int = 0
+    sval: str = None
+    op: str = None
+    l: 'Expr' = None
+    r: 'Expr' = None
+
+@dataclass
+class ResultCol:
+    col: str = None
+    star: bool = False
+
+@dataclass
+class TableRef:
+    tname: str
+    alias: str = None
+
+@dataclass
+class Stmt:
+    is_create: bool = False
+    is_insert: bool = False
+    is_select: bool = False
+    is_begin: bool = False
+    is_commit: bool = False
+    ct_name: str = None
+    ct_cols: list = field(default_factory=list)
+    ins_table: str = None
+    ins_vals: list = field(default_factory=list)
+    sel_cols: list = field(default_factory=list)
+    sel_star: bool = False
+    sel_tables: list = field(default_factory=list)
+    sel_where: Expr = None
+    sel_order_col: str = None
+    sel_order_desc: bool = False
+    sel_join_on: Expr = None
+```
+
+Parser:
+
+```python
+class Parser:
+    def __init__(self, toks):
+        self.t = toks
+        self.i = 0
+    
+    def cur(self):
+        return self.t[self.i]
+    
+    def accept(self, kind, text=None):
+        tok = self.t[self.i]
+        if tok.kind != kind:
+            return False
+        if text and tok.text.lower() != text.lower():
+            return False
+        self.i += 1
+        return True
+    
+    def accept_kw(self, kw):
+        return self.accept("KW", kw)
+    
+    def peek_kw(self, kw):
+        tok = self.t[self.i]
+        return tok.kind == "KW" and tok.text.lower() == kw.lower()
+    
+    def parse_primary(self):
+        tok = self.t[self.i]
+        if tok.kind == "INT":
+            e = Expr("INT", ival=int(tok.text))
+            self.i += 1
+            return e
+        if tok.kind == "STRING":
+            e = Expr("STR", sval=tok.text)
+            self.i += 1
+            return e
+        if tok.kind == "ID" or tok.kind == "KW":
+            buf = tok.text
+            self.i += 1
+            if self.t[self.i].kind == "DOT":
+                self.i += 1
+                buf = buf + "." + self.t[self.i].text
+                self.i += 1
+            return Expr("COL", col=buf)
+        if self.accept("LP"):
+            e = self.parse_expr()
+            self.accept("RP")
+            return e
+        return None
+    
+    def parse_cmp(self):
+        l = self.parse_primary()
+        if self.t[self.i].kind == "OP":
+            op = self.t[self.i].text
+            self.i += 1
+            r = self.parse_primary()
+            return Expr("BINOP", op=op, l=l, r=r)
+        return l
+    
+    def parse_expr(self):
+        l = self.parse_cmp()
+        if self.peek_kw("and") or self.peek_kw("or"):
+            op = "AND" if self.peek_kw("and") else "OR"
+            self.i += 1
+            r = self.parse_expr()
+            return Expr("BINOP", op=op, l=l, r=r)
+        return l
+    
+    def parse_create(self, st):
+        st.is_create = True
+        tok = self.t[self.i]
+        if tok.kind != "ID" and tok.kind != "KW":
+            return -1
+        st.ct_name = tok.text
+        self.i += 1
+        if not self.accept("LP"):
+            return -1
+        while self.t[self.i].kind != "RP" and self.t[self.i].kind != "EOF":
+            tok = self.t[self.i]
+            if tok.kind != "ID" and tok.kind != "KW":
+                return -1
+            st.ct_cols.append(tok.text)
+            self.i += 1
+            while self.t[self.i].kind not in ("COMMA", "RP", "EOF"):
+                self.i += 1
+            self.accept("COMMA")
+        self.accept("RP")
+        return 0
+    
+    def parse_insert(self, st):
+        st.is_insert = True
+        if not self.accept_kw("into"):
+            return -1
+        tok = self.t[self.i]
+        if tok.kind != "ID":
+            return -1
+        st.ins_table = tok.text
+        self.i += 1
+        if not self.accept_kw("values"):
+            return -1
+        if not self.accept("LP"):
+            return -1
+        while self.t[self.i].kind != "RP" and self.t[self.i].kind != "EOF":
+            tok = self.t[self.i]
+            if tok.kind == "INT":
+                st.ins_vals.append(int(tok.text))
+            elif tok.kind == "STRING":
+                st.ins_vals.append(tok.text)
+            elif self.accept_kw("null"):
+                st.ins_vals.append(None)
+            else:
+                return -1
+            self.i += 1  # Wait, accept_kw already advances. Let me be careful.
+            ...
+```
+
+Hmm, I need to be careful with the token advancement. When I use `accept_kw("null")`, it already advances `self.i`. But for INT and STRING, I need to advance manually. Let me restructure:
+
+```python
+    def parse_insert(self, st):
+        st.is_insert = True
+        if not self.accept_kw("into"):
+            return -1
+        tok = self.t[self.i]
+        if tok.kind != "ID":
+            return -1
+        st.ins_table = tok.text
+        self.i += 1
+        if not self.accept_kw("values"):
+            return -1
+        if not self.accept("LP"):
+            return -1
+        while self.t[self.i].kind != "RP" and self.t[self.i].kind != "EOF":
+            tok = self.t[self.i]
+            if tok.kind == "INT":
+                st.ins_vals.append(int(tok.text))
+                self.i += 1
+            elif tok.kind == "STRING":
+                st.ins_vals.append(tok.text)
+                self.i += 1
+            elif tok.kind == "KW" and tok.text.lower() == "null":
+                st.ins_vals.append(None)
+                self.i += 1
+            else:
+                return -1
+            if not self.accept("COMMA"):
+                break
+        if not self.accept("RP"):
+            return -1
+        return 0
+```
+
+Now parse_select:
+
+```python
+    def parse_select(self, st):
+        st.is_select = True
+        if self.accept("STAR"):
+            st.sel_star = True
+        else:
+            while True:
+                rc = ResultCol()
+                if self.accept("STAR"):
+                    rc.star = True
+                elif self.t[self.i].kind in ("ID", "KW"):
+                    buf = self.t[self.i].text
+                    self.i += 1
+                    if self.t[self.i].kind == "DOT":
+                        self.i += 1
+                        if self.accept("STAR"):
+                            rc.star = True
+                        else:
+                            buf = buf + "." + self.t[self.i].text
+                            self.i += 1
+                            rc.col = buf
+                    else:
+                        rc.col = buf
+                else:
+                    return -1
+                st.sel_cols.append(rc)
+                if not self.accept("COMMA"):
+                    break
+        if not self.accept_kw("from"):
+            return -1
+        tok = self.t[self.i]
+        if tok.kind != "ID":
+            return -1
+        tr = TableRef(tok.text)
+        self.i += 1
+        # alias check
+        if (self.t[self.i].kind == "ID" and 
+            not self.peek_kw("on") and not self.peek_kw("where") and
+            not self.peek_kw("order") and not self.peek_kw("inner") and
+            not self.peek_kw("join")):
+            tr.alias = self.t[self.i].text
+            self.i += 1
+        st.sel_tables.append(tr)
+        # joins
+        while self.peek_kw("inner") or self.peek_kw("join"):
+            if self.accept_kw("inner"):
+                if not self.accept_kw("join"):
+                    return -1
+            else:
+                self.accept_kw("join")
+            tok = self.t[self.i]
+            if tok.kind != "ID":
+                return -1
+            tr = TableRef(tok.text)
+            self.i += 1
+            if (self.t[self.i].kind == "ID" and 
+                not self.peek_kw("on") and not self.peek_kw("where") and
+                not self.peek_kw("order")):
+                tr.alias = self.t[self.i].text
+                self.i += 1
+            if self.accept_kw("on"):
+                on = self.parse_expr()
+                if st.sel_join_on is None:
+                    st.sel_join_on = on
+                else:
+                    st.sel_join_on = Expr("BINOP", op="AND", l=st.sel_join_on, r=on)
+            st.sel_tables.append(tr)
+        if self.accept_kw("where"):
+            st.sel_where = self.parse_expr()
+        if self.accept_kw("order"):
+            if not self.accept_kw("by"):
+                return -1
+            tok = self.t[self.i]
+            if tok.kind != "ID" and tok.kind != "KW":
+                return -1
+            st.sel_order_col = tok.text
+            self.i += 1
+            if self.accept_kw("desc"):
+                st.sel_order_desc = True
+            else:
+                self.accept_kw("asc")
+        return 0
+```
+
+Wait, there's a subtlety. In the C code, the join loop appends to sel_tables inside the loop, but the ON condition is parsed after the table. Let me re-read the C code...
+
+In the C code:
+```c
+while (p_peek_kw(P,"inner") || p_peek_kw(P,"join")){
+    if (p_accept_kw(P,"inner")){ if (!p_accept_kw(P,"join")) return -1; }
+    else p_accept_kw(P,"join");
+    if (P->t[P->i].kind!=TK_ID) return -1;
+    st->sel_tables=realloc(...);
+    TableRef *tr=&st->sel_tables[st->sel_ntables++]; ...
+    tr->tname=strdup(P->t[P->i].text); P->i++;
+    if (alias...) tr->alias=...;
+    if (p_accept_kw(P,"on")){
+        Expr *on=parse_expr(P);
+        if (!st->sel_join_on) st->sel_join_on=on;
+        else { AND combine }
+    }
+}
+```
+
+So the table is added to sel_tables, then ON is parsed. My Python code does the same. Good.
+
+Now the main parse function:
+
+```python
+    def parse(self):
+        st = Stmt()
+        if self.peek_kw("begin"):
+            st.is_begin = True
+            self.i += 1
+            self.accept_kw("transaction")
+        elif self.peek_kw("commit"):
+            st.is_commit = True
+            self.i += 1
+            self.accept_kw("transaction")
+        elif self.accept_kw("create"):
+            if self.accept_kw("table"):
+                self.parse_create(st)
+            else:
+                return None
+        elif self.accept_kw("insert"):
+            self.parse_insert(st)
+        elif self.accept_kw("select"):
+            self.parse_select(st)
+        else:
+            return None
+        self.accept("SEMI")
+        return st
+```
+
+Now the database and executor:
+
+```python
+class Table:
+    def __init__(self, name, cols):
+        self.name = name
+        self.cols = cols  # list of column names
+
+class Database:
+    def __init__(self):
+        self.tables = {}  # name -> Table
+        self.stores = {}  # name -> list of rows (each row is list of values)
+        self.errmsg = ""
+        self.in_txn = False
+    
+    def schema_find(self, name):
+        for tname, t in self.tables.items():
+            if tname.lower() == name.lower():
+                return t
+        return None
+    
+    def schema_index(self, name):
+        for i, (tname, t) in enumerate(self.tables.items()):
+            if tname.lower() == name.lower():
+                return tname
+        return None
+```
+
+Hmm, the C code uses arrays and indices. In Python, I'll use dicts. But I need to be careful about ordering. Let me use a list of tables and a dict for lookup.
+
+Actually, let me keep it simpler. The stores are keyed by table name. Let me use an ordered dict (Python 3.7+ dicts are ordered).
+
+```python
+class Database:
+    def __init__(self):
+        self.tables = {}  # name_lower -> (name, cols)
+        self.stores = {}  # name_lower -> list of rows
+        self.errmsg = ""
+        self.in_txn = False
+```
+
+Wait, but the C code preserves case in the table name but does case-insensitive lookup. Let me store with original name but look up case-insensitively.
+
+Let me simplify:
+
+```python
+class Database:
+    def __init__(self):
+        self.tables = []  # list of (name, cols)
+        self.stores = []  # list of lists of rows
+        self.errmsg = ""
+        self.in_txn = False
+    
+    def find_table(self, name):
+        for i, (tname, cols) in enumerate(self.tables):
+            if tname.lower() == name.lower():
+                return i
+        return -1
+```
+
+Actually, let me use a dict with lower-case keys:
+
+```python
+class Database:
+    def __init__(self):
+        self.tables = {}  # lower_name -> (name, [cols])
+        self.stores = {}  # lower_name -> [[row_vals]]
+        self.errmsg = ""
+        self.in_txn = False
+```
+
+Now the executor for CREATE and INSERT:
+
+```python
+    def exec_create(self, st):
+        key = st.ct_name.lower()
+        if key in self.tables:
+            self.errmsg = f"table already exists: {st.ct_name}"
+            return -1
+        self.tables[key] = (st.ct_name, list(st.ct_cols))
+        self.stores[key] = []
+        return 0
+    
+    def exec_insert(self, st):
+        key = st.ins_table.lower()
+        if key not in self.tables:
+            self.errmsg = f"no such table: {st.ins_table}"
+            return -1
+        self.stores[key].append(list(st.ins_vals))
+        return 0
+```
+
+Now the expression evaluator:
+
+```python
+def rowctx_colindex(refs, tabs, rows, col):
+    """Find which table and column index a column reference refers to."""
+    dot = col.find('.')
+    if dot >= 0:
+        tname = col[:dot]
+        cname = col[dot+1:]
+        for i in range(len(refs)):
+            tn = refs[i].alias if refs[i].alias else refs[i].tname
+            if tn.lower() == tname.lower():
+                ci = table_colindex(tabs[i], cname)
+                if ci >= 0:
+                    return i, ci
+        return -1, -1
+    for i in range(len(refs)):
+        ci = table_colindex(tabs[i], col)
+        if ci >= 0:
+            return i, ci
+    return -1, -1
+
+def table_colindex(table_cols, col):
+    for i, c in enumerate(table_cols):
+        if c.lower() == col.lower():
+            return i
+    return -1
+```
+
+Wait, I need to pass the table's cols. Let me restructure. In the C code, `tabs` is an array of `Table*` which have `cols` and `ncols`. In Python, I'll pass the list of column-name lists.
+
+Let me define the eval function:
+
+```python
+def eval_expr(e, refs, tabs_cols, rows):
+    """e: Expr, refs: list of TableRef, tabs_cols: list of col-name-lists, rows: list of value-lists"""
+    if e is None:
+        return None
+    if e.kind == "INT":
+        return e.ival
+    if e.kind == "STR":
+        return e.sval
+    if e.kind == "COL":
+        ti, ci = rowctx_colindex(refs, tabs_cols, rows, e.col)
+        if ti < 0:
+            return None
+        return rows[ti][ci]
+    if e.kind == "BINOP":
+        a = eval_expr(e.l, refs, tabs_cols, rows)
+        b = eval_expr(e.r, refs, tabs_cols, rows)
+        op = e.op.upper()
+        if op == "AND":
+            return 1 if v_truthy(a) and v_truthy(b) else 0
+        if op == "OR":
+            return 1 if v_truthy(a) or v_truthy(b) else 0
+        cmp = v_cmp(a, b)
+        if e.op == "=":
+            return 1 if cmp == 0 else 0
+        if e.op == "<>":
+            return 1 if cmp != 0 else 0
+        if e.op == "<":
+            return 1 if cmp < 0 else 0
+        if e.op == ">":
+            return 1 if cmp > 0 else 0
+        if e.op == "<=":
+            return 1 if cmp <= 0 else 0
+        if e.op == ">=":
+            return 1 if cmp >= 0 else 0
+    return None
+
+def row_match(where, refs, tabs_cols, rows):
+    if where is None:
+        return True
+    v = eval_expr(where, refs, tabs_cols, rows)
+    return v_truthy(v)
+```
+
+Now the prepared statement / SELECT executor:
+
+```python
+class Statement:
+    def __init__(self, db, stmt):
+        self.db = db
+        self.st = stmt
+        self.started = False
+        self.done = False
+        self.sorted_rows = []  # list of combined value-lists
+        self.cur = 0
+        self.outrow = []
+        self.nout = 0
+    
+    def collect_matching(self):
+        n = len(self.st.sel_tables)
+        tabs_cols = []
+        stores = []
+        for tr in self.st.sel_tables:
+            key = tr.tname.lower()
+            if key in self.db.tables:
+                _, cols = self.db.tables[key]
+                tabs_cols.append(cols)
+                stores.append(self.db.stores[key])
+            else:
+                tabs_cols.append([])
+                stores.append([])
+        
+        # nested loop
+        # Use itertools.product
+        if n == 0:
+            return
+        
+        # Build the nested loop
+        def recurse(depth, current_rows):
+            if depth == n:
+                if (row_match(self.st.sel_where, self.st.sel_tables, tabs_cols, current_rows) and
+                    (self.st.sel_join_on is None or row_match(self.st.sel_join_on, self.st.sel_tables, tabs_cols, current_rows))):
+                    combined = []
+                    for r in current_rows:
+                        combined.extend(r)
+                    self.sorted_rows.append(combined)
+                return
+            for row in stores[depth]:
+                current_rows.append(row)
+                recurse(depth + 1, current_rows)
+                current_rows.pop()
+        
+        recurse(0, [])
+        
+        # ORDER BY
+        if self.st.sel_order_col and n == 1:
+            cidx = table_colindex(tabs_cols[0], self.st.sel_order_col)
+            if cidx >= 0:
+                self.sorted_rows.sort(
+                    key=lambda r: (v_type(r[cidx]), r[cidx] if r[cidx] is not None else 0),
+                    reverse=self.st.sel_order_desc
+                )
+```
+
+Hmm wait, the sorting needs to match the C comparison. The C code uses `v_cmp` which compares by type first, then by value. Python's sort with a key won't directly handle this because of None values. Let me use a comparison-based sort.
+
+Actually, let me use `functools.cmp_to_key`:
+
+```python
+from functools import cmp_to_key
+
+if self.st.sel_order_col and n == 1:
+    cidx = table_colindex(tabs_cols[0], self.st.sel_order_col)
+    if cidx >= 0:
+        def cmp_func(a, b):
+            return v_cmp(a[cidx], b[cidx])
+        self.sorted_rows.sort(key=cmp_to_key(cmp_func), reverse=self.st.sel_order_desc)
+```
+
+Wait, but `reverse=True` with `cmp_to_key` should work correctly - it reverses the comparison result.
+
+Now the step function:
+
+```python
+    def step(self):
+        if self.st.is_select:
+            return self.step_select()
+        return 101  # DONE
+    
+    def step_select(self):
+        if not self.started:
+            self.started = True
+            self.collect_matching()
+        if self.cur >= len(self.sorted_rows):
+            return 101  # DONE
+        r = self.sorted_rows[self.cur]
+        self.cur += 1
+        n = len(self.st.sel_tables)
+        tabs_cols = []
+        for tr in self.st.sel_tables:
+            key = tr.tname.lower()
+            if key in self.db.tables:
+                _, cols = self.db.tables[key]
+                tabs_cols.append(cols)
+            else:
+                tabs_cols.append([])
+        
+        # build output row
+        offsets = []
+        off = 0
+        for i in range(n):
+            offsets.append(off)
+            off += len(tabs_cols[i])
+        
+        self.outrow = []
+        if self.st.sel_star:
+            for i in range(n):
+                for j in range(len(tabs_cols[i])):
+                    self.outrow.append(r[offsets[i] + j])
+        else:
+            for rc in self.st.sel_cols:
+                if rc.star:
+                    for i in range(n):
+                        for j in range(len(tabs_cols[i])):
+                            self.outrow.append(r[offsets[i] + j])
+                else:
+                    dot = rc.col.find('.')
+                    ti, ci = 0, -1
+                    if dot >= 0:
+                        tname = rc.col[:dot]
+                        cname = rc.col[dot+1:]
+                        for i in range(n):
+                            tn = self.st.sel_tables[i].alias if self.st.sel_tables[i].alias else self.st.sel_tables[i].tname
+                            if tn.lower() == tname.lower():
+                                ci = table_colindex(tabs_cols[i], cname)
+                                ti = i
+                                break
+                    else:
+                        for i in range(n):
+                            ci = table_colindex(tabs_cols[i], rc.col)
+                            if ci >= 0:
+                                ti = i
+                                break
+                    if ci < 0:
+                        self.outrow.append(None)
+                    else:
+                        self.outrow.append(r[offsets[ti] + ci])
+        self.nout = len(self.outrow)
+        return 100  # ROW
+```
+
+Now the public API. The C API has:
+- sqlite3_open(name, &db) -> int
+- sqlite3_exec(db, sql, callback, arg, &err) -> int
+- sqlite3_prepare_v2(db, sql, n, &stmt, &tail) -> int
+- sqlite3_step(stmt) -> int
+- sqlite3_finalize(stmt) -> int
+- sqlite3_close(db) -> int
+- sqlite3_column_count(stmt) -> int
+- sqlite3_column_text(stmt, i) -> const char*
+- sqlite3_column_int64(stmt, i) -> long
+- sqlite3_errmsg(db) -> const char*
+
+In Python, I'll make a class `Sqlite3` with methods. Let me think about the idiomatic API:
+
+```python
+class Sqlite3:
+    @staticmethod
+    def open(name=":memory:"):
+        return Database()
+    
+    @staticmethod  
+    def close(db):
+        pass  # Python GC handles this
+```
+
+Actually, let me make it more like a class instance:
+
+```python
+class Sqlite3:
+    def __init__(self):
+        self.tables = {}
+        self.stores = {}
+        self.errmsg = ""
+        self.in_txn = False
+    
+    @classmethod
+    def open(cls, name=":memory:"):
+        return cls()
+    
+    def close(self):
+        pass
+    
+    def errmsg(self):
+        return self.errmsg
+    
+    def exec(self, sql, callback=None, arg=None):
+        toks = lex(sql)
+        p = Parser(toks)
+        rc = 0
+        err = None
+        while p.t[p.i].kind != "EOF":
+            st = p.parse()
+            if st is None:
+                err = "parse error"
+                rc = 1
+                break
+            if st.is_begin:
+                self.in_txn = True
+            elif st.is_commit:
+                self.in_txn = False
+            elif st.is_create:
+                rc = self.exec_create(st)
+            elif st.is_insert:
+                rc = self.exec_insert(st)
+            elif st.is_select:
+                stmt = Statement(self, st)
+                while stmt.step() == 100:
+                    vals = [v_to_text(v) for v in stmt.outrow]
+                    if callback:
+                        callback(arg, stmt.nout, vals, None)
+        if rc and not err:
+            err = self.errmsg
+        return rc, err
+    
+    def prepare(self, sql, n=-1):
+        buf = sql if n < 0 else sql[:n]
+        toks = lex(buf)
+        p = Parser(toks)
+        st = p.parse()
+        if st is None:
+            return None, "parse error"
+        return Statement(self, st), None
+    
+    def column_count(self, stmt):
+        return stmt.nout
+    
+    def column_text(self, stmt, i):
+        if i < 0 or i >= stmt.nout:
+            return None
+        return v_to_text(stmt.outrow[i])
+    
+    def column_int64(self, stmt, i):
+        if i < 0 or i >= stmt.nout:
+            return 0
+        v = stmt.outrow[i]
+        return v if isinstance(v, int) else 0
+    
+    def step(self, stmt):
+        return stmt.step()
+    
+    def finalize(self, stmt):
+        pass
+```
+
+Wait, but the C API has `sqlite3_step`, `sqlite3_column_count`, etc. as standalone functions taking a stmt. In Python, it's more idiomatic to have these as methods. But the requirement says "Name them as idiomatic for Python (e.g. a class/module Sqlite3 with methods open/exec/prepare/step/finalize/close/column_count/column_text/column_int64/errmsg)".
+
+So I'll put them all on the Sqlite3 class. But step/column_* operate on a statement. In the C API, they're standalone functions. In Python, I could either:
+1. Put them on Sqlite3 and pass the stmt
+2. Put them on the Statement class
+
+The requirement says "a class/module Sqlite3 with methods open/exec/prepare/step/finalize/close/column_count/column_text/column_int64/errmsg". So they should be on Sqlite3.
+
+But that's a bit awkward since step/column_* need a stmt. Let me make them methods on Sqlite3 that take a stmt parameter. Or I could make Statement have these methods too. Let me follow the requirement and put them on Sqlite3.
+
+Actually, looking more carefully at the requirement: "Name them as idiomatic for Python". In Python's sqlite3 module, you do:
+```python
+conn = sqlite3.connect(...)
+cursor = conn.execute(...)
+for row in cursor:
+    ...
+```
+
+But the requirement says to keep the same API surface. Let me make it work both ways - have the methods on Sqlite3 that take stmt, and also have them on Statement for convenience.
+
+Actually, let me just put everything on Sqlite3 as the requirement says. The stmt is passed as a parameter.
+
+Let me also think about the exec callback. In C:
+```c
+void (*cb)(void*,int,char**,char**)
+```
+In Python, the callback would be `callback(arg, n, vals, cols)` where vals is a list of strings.
+
+Let me also handle the `err` return. In C, `sqlite3_exec` returns rc and sets `*err`. In Python, I'll return `(rc, err)` or just rc and have errmsg accessible.
+
+Actually, looking at the C code more carefully:
+
+```c
+int sqlite3_exec(sqlite3 *db, const char *sql, void (*cb)(void*,int,char**,char**), void *arg, char **err)
+```
+
+It returns an int (0 for success, 1 for error). The err is set via pointer. In Python, I'll have exec return the rc and set self.errmsg. Or return (rc, err_str).
+
+Let me make exec return rc (0 or 1) and store error in self.errmsg. The caller can check errmsg.
+
+Actually, let me look at the demo:
+```c
+if (sqlite3_exec(db, sql, print_row, NULL, &err)){ fprintf(stderr,"err: %s\n", err?err:"?"); free(err); }
+```
+
+So exec returns non-zero on error, and err is set. In Python, I'll do:
+```python
+rc, err = db.exec(sql, callback, arg)
+if rc:
+    print(f"err: {err or '?'}")
+```
+
+Or I could make exec return just rc and have a separate errmsg method. Let me do both - return rc and also store errmsg.
+
+Let me finalize the design. I'll make it clean:
+
+```python
+class Sqlite3:
+    def open(self, name=":memory:"): -> self (classmethod/staticmethod)
+    def exec(self, sql, callback=None, arg=None): -> int rc
+    def prepare(self, sql, n=-1): -> Statement or None
+    def step(self, stmt): -> int
+    def finalize(self, stmt): -> int
+    def close(self): -> int
+    def column_count(self, stmt): -> int
+    def column_text(self, stmt, i): -> str
+    def column_int64(self, stmt, i): -> int
+    def errmsg(self): -> str
+```
+
+Wait, but `open` should be a classmethod since it creates a new instance. Let me use `__init__` for that and have a staticmethod `open`:
+
+```python
+class Sqlite3:
+    @staticmethod
+    def open(name=":memory:"):
+        return Sqlite3()
+```
+
+Or just use the constructor. But the C API is `sqlite3_open(name, &db)`. Let me keep `open` as a staticmethod.
+
+Now let me also think about the Statement class. It needs to be returned by `prepare` and used by `step`, `column_count`, etc.
+
+Let me also think about whether `step`, `column_count`, etc. should be on Sqlite3 or Statement. The requirement says they should be on Sqlite3. But in Python, it's more natural to have them on Statement. Let me put them on both - the Sqlite3 methods delegate to the Statement.
+
+Actually, let me just put them on Sqlite3 as the requirement says, taking stmt as first arg after self.
+
+Hmm, but that's really awkward. Let me re-read the requirement:
+
+"Name them as idiomatic for Python (e.g. a class/module Sqlite3 with methods open/exec/prepare/step/finalize/close/column_count/column_text/column_int64/errmsg) but keep the same behavior."
+
+OK so they want all methods on Sqlite3. Let me do that. The step/column_* methods take a stmt parameter.
+
+Actually, I think the most idiomatic Python would be to have Statement be a separate class with its own step/column methods, and Sqlite3 delegates. But the requirement is clear - put them on Sqlite3. Let me do that.
+
+Wait, actually, I think having them on both is fine. The Statement can have step/column_text/etc., and Sqlite3 can delegate. Let me keep it simple and just put everything on Sqlite3.
+
+Let me now write the complete code:
+
+```python
+"""sqlite_core.py -- a compact, in-memory SQLite-style SQL engine (Python port)."""
+
+from functools import cmp_to_key
+from dataclasses import dataclass, field
+
+# ---------- Value helpers ----------
+# Values: None (NULL), int (INT), str (TEXT)
+
+def v_type(v):
+    if v is None: return 0
+    if isinstance(v, int): return 1
+    return 2
+
+def v_cmp(a, b):
+    ta, tb = v_type(a), v_type(b)
+    if ta != tb: return ta - tb
+    if ta == 1: return (a > b) - (a < b)
+    if ta == 2:
+        sa, sb = a or "", b or ""
+        return (sa > sb) - (sa < sb)
+    return 0
+
+def v_truthy(v):
+    return v_cmp(v, 0) != 0
+
+def v_to_text(v):
+    if v is None: return "NULL"
+    if isinstance(v, int): return str(v)
+    return v if v else ""
+
+# ---------- Lexer ----------
+KEYWORDS = {
+    "create","table","insert","into","values","select","from","where",
+    "order","by","asc","desc","and","or","not","null","begin","commit",
+    "inner","join","on","int","integer","text","primary","key","transaction"
+}
+
+@dataclass
+class Token:
+    kind: str
+    text: str
+
+def lex(sql):
+    toks = []
+    i, n = 0, len(sql)
+    while i < n:
+        c = sql[i]
+        if c.isspace():
+            i += 1; continue
+        if c == '-' and i+1 < n and sql[i+1] == '-':
+            while i < n and sql[i] != '\n': i += 1
+            continue
+        if c.isalpha() or c == '_':
+            st = i
+            while i < n and (sql[i].isalnum() or sql[i] == '_'): i += 1
+            w = sql[st:i]
+            toks.append(Token("KW" if w.lower() in KEYWORDS else "ID", w))
+            continue
+        if c.isdigit():
+            st = i
+            while i < n and sql[i].isdigit(): i += 1
+            toks.append(Token("INT", sql[st:i])); continue
+        if c == "'":
+            i += 1; st = i
+            while i < n and sql[i] != "'": i += 1
+            toks.append(Token("STRING", sql[st:i]))
+            if i < n: i += 1
+            continue
+        if c == '"':
+            i += 1; st = i
+            while i < n and sql[i] != '"': i += 1
+            toks.append(Token("ID", sql[st:i]))
+            if i < n: i += 1
+            continue
+        single = {'*':'STAR',',':'COMMA','(':'LP',')':'RP',';':'SEMI','.':'DOT'}
+        if c in single:
+            toks.append(Token(single[c], c)); i += 1; continue
+        if c in "=<>!":
+            st = i
+            if i+1 < n and sql[i+1] == '=': i += 1
+            if c == '<' and i+1 < n and sql[i+1] == '>': i += 1
+            if c == '!' and i+1 < n and sql[i+1] == '=': i += 1
+            i += 1
+            toks.append(Token("OP", sql[st:i])); continue
+        toks.append(Token("PUNCT", c)); i += 1
+    toks.append(Token("EOF", ""))
+    return toks
+
+# ---------- AST ----------
+@dataclass
+class Expr:
+    kind: str
+    col: str = None
+    ival: int = 0
+    sval: str = None
+    op: str = None
+    l: 'Expr' = None
+    r: 'Expr' = None
+
+@dataclass
+class ResultCol:
+    col: str = None
+    star: bool = False
+
+@dataclass
+class TableRef:
+    tname: str
+    alias: str = None
+
+@dataclass
+class Stmt:
+    is_create: bool = False
+    is_insert: bool = False
+    is_select: bool = False
+    is_begin: bool = False
+    is_commit: bool = False
+    ct_name: str = None
+    ct_cols: list = field(default_factory=list)
+    ins_table: str = None
+    ins_vals: list = field(default_factory=list)
+    sel_cols: list = field(default_factory=list)
+    sel_star: bool = False
+    sel_tables: list = field(default_factory=list)
+    sel_where: Expr = None
+    sel_order_col: str = None
+    sel_order_desc: bool = False
+    sel_join_on: Expr = None
+
+# ---------- Parser ----------
+class Parser:
+    def __init__(self, toks):
+        self.t = toks
+        self.i = 0
+
+    def accept(self, kind, text=None):
+        tok = self.t[self.i]
+        if tok.kind != kind: return False
+        if text and tok.text.lower() != text.lower(): return False
+        self.i += 1; return True
+
+    def accept_kw(self, kw): return self.accept("KW", kw)
+    def peek_kw(self, kw):
+        tok = self.t[self.i]
+        return tok.kind == "KW" and tok.text.lower() == kw.lower()
+
+    def parse_primary(self):
+        tok = self.t[self.i]
+        if tok.kind == "INT":
+            self.i += 1; return Expr("INT", ival=int(tok.text))
+        if tok.kind == "STRING":
+            self.i += 1; return Expr("STR", sval=tok.text)
+        if tok.kind in ("ID", "KW"):
+            buf = tok.text; self.i += 1
+            if self.t[self.i].kind == "DOT":
+                self.i += 1
+                buf = f"{buf}.{self.t[self.i].text}"; self.i += 1
+            return Expr("COL", col=buf)
+        if self.accept("LP"):
+            e = self.parse_expr(); self.accept("RP"); return e
+        return None
+
+    def parse_cmp(self):
+        l = self.parse_primary()
+        if self.t[self.i].kind == "OP":
+            op = self.t[self.i].text; self.i += 1
+            r = self.parse_primary()
+            return Expr("BINOP", op=op, l=l, r=r)
+        return l
+
+    def parse_expr(self):
+        l = self.parse_cmp()
+        if self.peek_kw("and") or self.peek_kw("or"):
+            op = "AND" if self.peek_kw("and") else "OR"
+            self.i += 1
+            r = self.parse_expr()
+            return Expr("BINOP", op=op, l=l, r=r)
+        return l
+
+    def parse_create(self, st):
+        st.is_create = True
+        tok = self.t[self.i]
+        if tok.kind not in ("ID", "KW"): return -1
+        st.ct_name = tok.text; self.i += 1
+        if not self.accept("LP"): return -1
+        while self.t[self.i].kind not in ("RP", "EOF"):
+            tok = self.t[self.i]
+            if tok.kind not in ("ID", "KW"): return -1
+            st.ct_cols.append(tok.text); self.i += 1
+            while self.t[self.i].kind not in ("COMMA", "RP", "EOF"): self.i += 1
+            self.accept("COMMA")
+        self.accept("RP")
+        return 0
+
+    def parse_insert(self, st):
+        st.is_insert = True
+        if not self.accept_kw("into"): return -1
+        tok = self.t[self.i]
+        if tok.kind != "ID": return -1
+        st.ins_table = tok.text; self.i += 1
+        if not self.accept_kw("values"): return -1
+        if not self.accept("LP"): return -1
+        while self.t[self.i].kind not in ("RP", "EOF"):
+            tok = self.t[self.i]
+            if tok.kind == "INT":
+                st.ins_vals.append(int(tok.text)); self.i += 1
+            elif tok.kind == "STRING":
+                st.ins_vals.append(tok.text); self.i += 1
+            elif tok.kind == "KW" and tok.text.lower() == "null":
+                st.ins_vals.append(None); self.i += 1
+            else:
+                return -1
+            if not self.accept("COMMA"): break
+        if not self.accept("RP"): return -1
+        return 0
+
+    def parse_select(self, st):
+        st.is_select = True
+        if self.accept("STAR"):
+            st.sel_star = True
+        else:
+            while True:
+                rc = ResultCol()
+                if self.accept("STAR"):
+                    rc.star = True
+                elif self.t[self.i].kind in ("ID", "KW"):
+                    buf = self.t[self.i].text; self.i += 1
+                    if self.t[self.i].kind == "DOT":
+                        self.i += 1
+                        if self.accept("STAR"):
+                            rc.star = True
+                        else:
+                            rc.col = f"{buf}.{self.t[self.i].text}"; self.i += 1
+                    else:
+                        rc.col = buf
+                else:
+                    return -1
+                st.sel_cols.append(rc)
+                if not self.accept("COMMA"): break
+        if not self.accept_kw("from"): return -1
+        tok = self.t[self.i]
+        if tok.kind != "ID": return -1
+        tr = TableRef(tok.text); self.i += 1
+        if (self.t[self.i].kind == "ID" and not any(self.peek_kw(k) for k in ("on","where","order","inner","join"))):
+            tr.alias = self.t[self.i].text; self.i += 1
+        st.sel_tables.append(tr)
+        while self.peek_kw("inner") or self.peek_kw("join"):
+            if self.accept_kw("inner"):
+                if not self.accept_kw("join"): return -1
+            else:
+                self.accept_kw("join")
+            tok = self.t[self.i]
+            if tok.kind != "ID": return -1
+            tr = TableRef(tok.text); self.i += 1
+            if (self.t[self.i].kind == "ID" and not any(self.peek_kw(k) for k in ("on","where","order"))):
+                tr.alias = self.t[self.i].text; self.i += 1
+            if self.accept_kw("on"):
+                on = self.parse_expr()
+                if st.sel_join_on is None:
+                    st.sel_join_on = on
+                else:
+                    st.sel_join_on = Expr("BINOP", op="AND", l=st.sel_join_on, r=on)
+            st.sel_tables.append(tr)
+        if self.accept_kw("where"):
+            st.sel_where = self.parse_expr()
+        if self.accept_kw("order"):
+            if not self.accept_kw("by"): return -1
+            tok = self.t[self.i]
+            if tok.kind not in ("ID", "KW"): return -1
+            st.sel_order_col = tok.text; self.i += 1
+            if self.accept_kw("desc"): st.sel_order_desc = True
+            else: self.accept_kw("asc")
+        return 0
+
+    def parse(self):
+        st = Stmt()
+        if self.peek_kw("begin"):
+            st.is_begin = True; self.i += 1; self.accept_kw("transaction")
+        elif self.peek_kw("commit"):
+            st.is_commit = True; self.i += 1; self.accept_kw("transaction")
+        elif self.accept_kw("create"):
+            if self.accept_kw("table"):
+                if self.parse_create(st) < 0: return None
+            else:
+                return None
+        elif self.accept_kw("insert"):
+            if self.parse_insert(st) < 0: return None
+        elif self.accept_kw("select"):
+            if self.parse_select(st) < 0: return None
+        else:
+            return None
+        self.accept("SEMI")
+        return st
+
+# ---------- Executor helpers ----------
+def table_colindex(cols, col):
+    for i, c in enumerate(cols):
+        if c.lower() == col.lower(): return i
+    return -1
+
+def rowctx_colindex(refs, tabs_cols, col):
+    dot = col.find('.')
+    if dot >= 0:
+        tname, cname = col[:dot], col[dot+1:]
+        for i, ref in enumerate(refs):
+            tn = ref.alias or ref.tname
+            if tn.lower() == tname.lower():
+                ci = table_colindex(tabs_cols[i], cname)
+                if ci >= 0: return i, ci
+        return -1, -1
+    for i in range(len(refs)):
+        ci = table_colindex(tabs_cols[i], col)
+        if ci >= 0: return i, ci
+    return -1, -1
+
+def eval_expr(e, refs, tabs_cols, rows):
+    if e is None: return None
+    if e.kind == "INT": return e.ival
+    if e.kind == "STR": return e.sval
+    if e.kind == "COL":
+        ti, ci = rowctx_colindex(refs, tabs_cols, e.col)
+        if ti < 0: return None
+        return rows[ti][ci]
+    if e.kind == "BINOP":
+        a = eval_expr(e.l, refs, tabs_cols, rows)
+        b = eval_expr(e.r, refs, tabs_cols, rows)
+        op = e.op.upper()
+        if op == "AND": return 1 if v_truthy(a) and v_truthy(b) else 0
+        if op == "OR": return 1 if v_truthy(a) or v_truthy(b) else 0
+        c = v_cmp(a, b)
+        return {"=":c==0,"<>":c!=0,"<":c<0,">":c>0,"<=":c<=0,">=":c>=0}.get(e.op, 0) and 1 or 0
+    return None
+
+def row_match(where, refs, tabs_cols, rows):
+    if where is None: return True
+    return v_truthy(eval_expr(where, refs, tabs_cols, rows))
+
+# ---------- Statement ----------
+class Statement:
+    def __init__(self, db, stmt):
+        self.db = db
+        self.st = stmt
+        self.started = False
+        self.sorted_rows = []
+        self.cur = 0
+        self.outrow = []
+        self.nout = 0
+
+    def _collect(self):
+        n = len(self.st.sel_tables)
+        tabs_cols = []
+        stores = []
+        for tr in self.st.sel_tables:
+            key = tr.tname.lower()
+            if key in self.db.tables:
+                _, cols = self.db.tables[key]
+                tabs_cols.append(cols)
+                stores.append(self.db.stores[key])
+            else:
+                tabs_cols.append([])
+                stores.append([])
+        
+        def recurse(depth, current):
+            if depth == n:
+                if (row_match(self.st.sel_where, self.st.sel_tables, tabs_cols, current) and
+                    (self.st.sel_join_on is None or row_match(self.st.sel_join_on, self.st.sel_tables, tabs_cols, current))):
+                    self.sorted_rows.append([v for row in current for v in row])
+                return
+            for row in stores[depth]:
+                current.append(row)
+                recurse(depth + 1, current)
+                current.pop()
+        recurse(0, [])
+        
+        if self.st.sel_order_col and n == 1:
+            cidx = table_colindex(tabs_cols[0], self.st.sel_order_col)
+            if cidx >= 0:
+                self.sorted_rows.sort(key=cmp_to_key(lambda a, b: v_cmp(a[cidx], b[cidx])),
+                                      reverse=self.st.sel_order_desc)
+
+    def step(self):
+        if not self.st.is_select:
+            return 101
+        if not self.started:
+            self.started = True
+            self._collect()
+        if self.cur >= len(self.sorted_rows):
+            return 101
+        r = self.sorted_rows[self.cur]
+        self.cur += 1
+        n = len(self.st.sel_tables)
+        tabs_cols = []
+        for tr in self.st.sel_tables:
+            key = tr.tname.lower()
+            if key in self.db.tables:
+                _, cols = self.db.tables[key]
+                tabs_cols.append(cols)
+            else:
+                tabs_cols.append([])
+        
+        offsets = []
+        off = 0
+        for i in range(n):
+            offsets.append(off)
+            off += len(tabs_cols[i])
+        
+        self.outrow = []
+        if self.st.sel_star:
+            for i in range(n):
+                for j in range(len(tabs_cols[i])):
+                    self.outrow.append(r[offsets[i] + j])
+        else:
+            for rc in self.st.sel_cols:
+                if rc.star:
+                    for i in range(n):
+                        for j in range(len(tabs_cols[i])):
+                            self.outrow.append(r[offsets[i] + j])
+                else:
+                    dot = rc.col.find('.')
+                    ti, ci = 0, -1
+                    if dot >= 0:
+                        tname, cname = rc.col[:dot], rc.col[dot+1:]
+                        for i in range(n):
+                            tn = self.st.sel_tables[i].alias or self.st.sel_tables[i].tname
+                            if tn.lower() == tname.lower():
+                                ci = table_colindex(tabs_cols[i], cname)
+                                ti = i; break
+                    else:
+                        for i in range(n):
+                            ci = table_colindex(tabs_cols[i], rc.col)
+                            if ci >= 0: ti = i; break
+                    if ci < 0:
+                        self.outrow.append(None)
+                    else:
+                        self.outrow.append(r[offsets[ti] + ci])
+        self.nout = len(self.outrow)
+        return 100
+
+# ---------- Public API ----------
+class Sqlite3:
+    def __init__(self):
+        self.tables = {}  # lower_name -> (name, [cols])
+        self.stores = {}  # lower_name -> [[vals]]
+        self._errmsg = ""
+        self.in_txn = False
+
+    @staticmethod
+    def open(name=":memory:"):
+        return Sqlite3()
+
+    def close(self):
+        return 0
+
+    def errmsg(self):
+        return self._errmsg
+
+    def _exec_create(self, st):
+        key = st.ct_name.lower()
+        if key in self.tables:
+            self._errmsg = f"table already exists: {st.ct_name}"
+            return -1
+        self.tables[key] = (st.ct_name, list(st.ct_cols))
+        self.stores[key] = []
+        return 0
+
+    def _exec_insert(self, st):
+        key = st.ins_table.lower()
+        if key not in self.tables:
+            self._errmsg = f"no such table: {st.ins_table}"
+            return -1
+        self.stores[key].append(list(st.ins_vals))
+        return 0
+
+    def exec(self, sql, callback=None, arg=None):
+        toks = lex(sql)
+        p = Parser(toks)
+        rc = 0
+        while p.t[p.i].kind != "EOF":
+            st = p.parse()
+            if st is None:
+                self._errmsg = "parse error"
+                rc = 1; break
+            if st.is_begin:
+                self.in_txn = True
+            elif st.is_commit:
+                self.in_txn = False
+            elif st.is_create:
+                rc = self._exec_create(st)
+                if rc: break
+            elif st.is_insert:
+                rc = self._exec_insert(st)
+                if rc: break
+            elif st.is_select:
+                stmt = Statement(self, st)
+                while stmt.step() == 100:
+                    vals = [v_to_text(v) for v in stmt.outrow]
+                    if callback:
+                        callback(arg, stmt.nout, vals, None)
+        return rc
+
+    def prepare(self, sql, n=-1):
+        buf = sql if n < 0 else sql[:n]
+        toks = lex(buf)
+        p = Parser(toks)
+        st = p.parse()
+        if st is None:
+            self._errmsg = "parse error"
+            return None
+        return Statement(self, st)
+
+    def step(self, stmt):
+        return stmt.step()
+
+    def finalize(self, stmt):
+        return 0
+
+    def column_count(self, stmt):
+        return stmt.nout
+
+    def column_text(self, stmt, i):
+        if i < 0 or i >= stmt.nout: return None
+        return v_to_text(stmt.outrow[i])
+
+    def column_int64(self, stmt, i):
+        if i < 0 or i >= stmt.nout: return 0
+        v = stmt.outrow[i]
+        return v if isinstance(v, int) else 0
+
+# ---------- Demo ----------
+def print_row(arg, n, vals, cols):
+    print(" | ".join(vals))
+
+if __name__ == "__main__":
+    db = Sqlite3.open(":memory:")
+    sql = (
+        "CREATE TABLE users (id INTEGER, name TEXT);"
+        "INSERT INTO users VALUES (1, 'ada');"
+        "INSERT INTO users VALUES (2, 'grace');"
+        "INSERT INTO users VALUES (3, 'linus');"
+        "SELECT * FROM users WHERE id > 1 ORDER BY id DESC;"
+    )
+    rc = db.exec(sql, print_row, None)
+    if rc:
+        print(f"err: {db.errmsg() or '?'}")
+    db.close()
+```
+
+Wait, I have a bug in the eval_expr for comparison operators. Let me fix:
+
+```python
+        return 1 if {"=":c==0,"<>":c!=0,"<":c<0,">":c>0,"<=":c<=0,">=":c>=0}.get(e.op, False) else 0
+```
+
+Actually, let me simplify:
+
+```python
+        if e.op == "=": return 1 if c == 0 else 0
+        if e.op == "<>": return 1 if c != 0 else 0
+        if e.op == "<": return 1 if c < 0 else 0
+        if e.op == ">": return 1 if c > 0 else 0
+        if e.op == "<=": return 1 if c <= 0 else 0
+        if e.op == ">=": return 1 if c >= 0 else 0
+        return 0
+```
+
+That's clearer.
+
+Also, I need to check the `v_cmp` function. In C:
+```c
+static int v_cmp(const Value *a, const Value *b){
+    if (a->type!=b->type) return (int)a->type-(int)b->type;
+    if (a->type==V_INT)  return (a->ival<b->ival)?-1:(a->ival>b->ival);
+    if (a->type==V_TEXT) return strcmp(a->sval?a->sval:"", b->sval?b->sval:"");
+    return 0;
+}
+```
+
+So for NULL vs NULL, it returns 0. For NULL vs INT, it returns 0-1 = -1. For INT vs TEXT, it returns 1-2 = -1. Etc.
+
+My Python version:
+```python
+def v_cmp(a, b):
+    ta, tb = v_type(a), v_type(b)
+    if ta != tb: return ta - tb
+    if ta == 1: return (a > b) - (a < b)
+    if ta == 2:
+        sa, sb = a or "", b or ""
+        return (sa > sb) - (sa < sb)
+    return 0
+```
+
+This looks correct. `(a > b) - (a < b)` gives -1, 0, or 1 for integers. For strings, `(sa > sb) - (sa < sb)` gives the same.
+
+Wait, but `a or ""` - if `a` is an empty string, `a or ""` would be `""`, which is correct. If `a` is `None`, `a or ""` would be `""`. But we only reach this branch when `ta == 2`, which means `a` is a string. So `a or ""` handles the case where `a` is an empty string (which is falsy in Python). Actually, `"" or ""` is `""`, so it's fine. But what if `a` is a non-empty string? `"hello" or ""` is `"hello"`. Good.
+
+Actually wait, there's a subtle issue. In the C code, `v_cmp` is called with `Value` structs that have type V_TEXT and sval could be NULL (though in practice it's always set to a strdup'd string). The `a->sval?a->sval:""` handles the NULL case. In Python, if `a` is a string, it's never None (None would be type 0). So `a or ""` is just for the empty string case, which is fine.
+
+Let me also double-check the `v_truthy` function:
+```c
+static int v_truthy(const Value *v){ Value z=v_int(0); return v_cmp(v,&z)!=0; }
+```
+
+So it compares the value to integer 0. If they're different (including type difference), it's truthy. So:
+- NULL vs INT(0): type mismatch, returns -1, truthy
+- INT(0) vs INT(0): equal, returns 0, not truthy
+- INT(5) vs INT(0): returns 1, truthy
+- TEXT("") vs INT(0): type mismatch, returns -1, truthy
+- TEXT("hello") vs INT(0): type mismatch, returns -1, truthy
+
+My Python:
+```python
+def v_truthy(v):
+    return v_cmp(v, 0) != 0
+```
+
+This should work the same way.
+
+Now let me also check the `v_to_text` function:
+```c
+static const char *v_to_text(const Value *v, char *buf, size_t n){
+    if (v->type==V_INT)  { snprintf(buf,n,"%ld",v->ival); return buf; }
+    if (v->type==V_TEXT) return v->sval;
+    return "NULL";
+}
+```
+
+My Python:
+```python
+def v_to_text(v):
+    if v is None: return "NULL"
+    if isinstance(v, int): return str(v)
+    return v if v else ""
+```
+
+Wait, `v if v else ""` - if v is an empty string, this returns "". If v is a non-empty string, it returns v. But what if v is 0 (int)? We already handled int above. What if v is False? We don't have bool values. So this should be fine.
+
+Actually, wait. `v if v else ""` for a string - if the string is empty, `"" if "" else ""` is `""`. If the string is "hello", `"hello" if "hello" else ""` is `"hello"`. Good.
+
+But actually, there's a subtle issue. In the C code, `v_to_text` for V_TEXT returns `v->sval` which could be an empty string. In Python, `v if v else ""` for an empty string returns `""`, which is the same. So it's fine.
+
+Hmm, but actually `v if v else ""` is redundant for strings since `v` is already a string. Let me just return `v`:
+
+```python
+def v_to_text(v):
+    if v is None: return "NULL"
+    if isinstance(v, int): return str(v)
+    return v
+```
+
+Wait, but what if v is an empty string? The C code returns `v->sval` which is `""`. So returning `v` (which is `""`) is correct. Let me keep it simple:
+
+```python
+def v_to_text(v):
+    if v is None: return "NULL"
+    if isinstance(v, int): return str(v)
+    return v
+```
+
+Actually, I realize there might be an issue with `v if v else ""`. If `v` is the string `"0"`, then `"0" if "0" else ""` is `"0"` (since non-empty strings are truthy). So it's fine. But if `v` is `""`, then `"" if "" else ""` is `""`. So it's the same as just returning `v`. Let me just return `v`.
+
+Now let me also think about the `exec` return value. In C, `sqlite3_exec` returns 0 on success, 1 on parse error, and the return value of `db_exec_create` or `db_exec_insert` (which is -1 on error). But then the C code checks `if (rc && err && !*err) *err=strdup(db->errmsg);`. So rc could be -1 or 1.
+
+In my Python code, I return `rc` which could be -1 or 1. The demo checks `if rc:` which is true for both -1 and 1. That's fine.
+
+Wait, actually in the C code, `sqlite3_exec` returns `rc` which is set to 1 on parse error, or the return value of `db_exec_create`/`db_exec_insert` which is -1 on error. But then the caller checks `if (sqlite3_exec(...))` which is true for any non-zero value. So my Python code is consistent.
+
+Let me also check the `prepare` function. In C:
+```c
+int sqlite3_prepare_v2(sqlite3 *db, const char *sql, int n, sqlite3_stmt **pp, const char **tail){
+    char *buf = n<0 ? strdup(sql) : strndup(sql,n);
+    ...
+    if (parse(&P,&st)<0){ ...; return 1; }
+    ...
+    *pp=s; ...; return 0;
+}
+```
+
+In Python, I return `None` on error and `Statement` on success. The caller can check `if stmt is None`. But the C API returns 1 on error and 0 on success, with the stmt pointer set. Let me return a tuple `(rc, stmt)` or just return `stmt` (None on error). The requirement says "keep the same behavior" but "idiomatic for Python". In Python, returning None on error is idiomatic. Let me do that.
+
+Actually, let me also provide the error via errmsg. So:
+```python
+def prepare(self, sql, n=-1):
+    buf = sql if n < 0 else sql[:n]
+    toks = lex(buf)
+    p = Parser(toks)
+    st = p.parse()
+    if st is None:
+        self._errmsg = "parse error"
+        return None
+    return Statement(self, st)
+```
+
+This is fine.
+
+Now let me also think about the `exec` callback. In C:
+```c
+void (*cb)(void*,int,char**,char**)
+```
+The callback receives (arg, n, vals, cols). In the demo:
+```c
+static void print_row(void *arg, int n, char **vals, char **cols){
+    (void)arg;(void)cols;
+    for (int i=0;i<n;i++) printf("%s%s", vals[i], i+1<n?" | ":"\n");
+}
+```
+
+In Python:
+```python
+def print_row(arg, n, vals, cols):
+    print(" | ".join(vals))
+```
+
+This should produce the same output. The C code prints `vals[i]` separated by ` | ` and ending with `\n`. The Python `print(" | ".join(vals))` does the same (print adds a newline).
+
+Let me trace through the demo:
+- CREATE TABLE users (id INTEGER, name TEXT)
+- INSERT (1, 'ada')
+- INSERT (2, 'grace')
+- INSERT (3, 'linus')
+- SELECT * FROM users WHERE id > 1 ORDER BY id DESC
+
+Expected output:
+```
+3 | linus
+2 | grace
+```
+
+Let me verify my code produces this. The SELECT has `sel_star=True`, `sel_where` is `Expr("BINOP", op=">", l=Expr("COL", col="id"), r=Expr("INT", ival=1))`, `sel_order_col="id"`, `sel_order_desc=True`.
+
+In `_collect`:
+- tabs_cols = [["id", "name"]]
+- stores = [[[1, "ada"], [2, "grace"], [3, "linus"]]]
+- recurse: for each row, check where: id > 1
+  - [1, "ada"]: 1 > 1 → v_cmp(1, 1) = 0, 0 > 0 is False → not matched
+  - [2, "grace"]: 2 > 1 → v_cmp(2, 1) = 1, 1 > 0 is True → matched, append [2, "grace"]
+  - [3, "linus"]: 3 > 1 → v_cmp(3, 1) = 1, 1 > 0 is True → matched, append [3, "linus"]
+- sorted_rows = [[2, "grace"], [3, "linus"]]
+- ORDER BY id DESC: cidx = 0, sort by v_cmp(a[0], b[0]) reversed
+  - v_cmp(2, 3) = -1, reversed → 1, so [3, "linus"] comes before [2, "grace"]
+  - sorted_rows = [[3, "linus"], [2, "grace"]]
+
+In step:
+- First step: r = [3, "linus"], sel_star → outrow = [3, "linus"], nout = 2
+  - vals = ["3", "linus"], print "3 | linus"
+- Second step: r = [2, "grace"], outrow = [2, "grace"]
+  - vals = ["2", "grace"], print "2 | grace"
+- Third step: cur >= len(sorted_rows), return 101 (DONE)
+
+Output:
+```
+3 | linus
+2 | grace
+```
+
+This matches the expected output.
+
+Now let me also think about edge cases and make sure the code is complete. Let me also add the `prepare_v2` alias since the C API has `sqlite3_prepare_v2`.
+
+Actually, the requirement says "prepare_v2" should be named as `prepare` in Python. Let me check: "Name them as idiomatic for Python (e.g. a class/module Sqlite3 with methods open/exec/prepare/step/finalize/close/column_count/column_text/column_int64/errmsg)". So `prepare` is the name.
+
+Let me also make sure I handle the `n` parameter in prepare. In C, `n` is the number of bytes to read from sql. If n < 0, read the whole string. In Python, `sql[:n]` if n >= 0, else `sql`.
+
+Wait, `sql[:n]` in Python when n is negative would give a different result than C's `strndup`. In C, `strndup(sql, n)` with n < 0 would be... actually, the C code checks `n<0 ? strdup(sql) : strndup(sql,n)`. So if n < 0, it uses the whole string. If n >= 0, it uses at most n bytes. In Python, `sql[:n]` for n >= 0 gives the first n characters. For n < 0, `sql[:n]` gives all but the last |n| characters, which is wrong. So I need:
+
+```python
+buf = sql if n < 0 else sql[:n]
+```
+
+This is what I have. Good.
+
+Let me also think about whether I need to handle multiple statements in `prepare`. In C, `prepare_v2` only parses the first statement and sets `tail` to point to the rest. In my Python code, I only parse one statement. The `tail` is not used in the demo, so I'll ignore it.
+
+Now let me also think about the `exec` function handling multiple statements. In C:
+```c
+while (P.t[P.i].kind!=TK_EOF){
+    Stmt st;
+    if (parse(&P,&st)<0){ ...; rc=1; break; }
+    ...
+}
+```
+
+My Python code
