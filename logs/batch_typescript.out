@@ -2,3 +2,17 @@
 [2026-06-20T17:43:02Z]   >>> porting typescript (TypeScript)
 [2026-06-20T17:44:02Z]       porter done: 21100 bytes, 6291 tokens, 60.1s
 [2026-06-20T17:44:04Z]       judge: completeness=78 notes=TypeScript port captures the core API surface and SQL features well, but has inc
+[main cc93892] port: typescript (TypeScript) completeness=78
+ 13 files changed, 1317 insertions(+)
+ create mode 100644 logs/batch_elixir.out
+ create mode 100644 logs/batch_erlang.out
+ create mode 100644 logs/batch_gleam.out
+ create mode 100644 logs/batch_haskell.out
+ create mode 100644 logs/batch_ocaml.out
+ create mode 100644 logs/batch_scala.out
+ create mode 100644 logs/batch_swift.out
+ create mode 100644 logs/batch_typescript.out
+ create mode 100644 runs/typescript/judge_raw.txt
+ create mode 100644 runs/typescript/meta.json
+ create mode 100644 runs/typescript/porter_raw.txt
+ create mode 100644 runs/typescript/sqlite_core.ts

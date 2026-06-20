@@ -1,0 +1,625 @@
+```swift
+import Foundation
+
+// MARK: - Value
+
+enum VType: Int { case null, int, text }
+
+indirect enum Value: Equatable {
+    case null
+    case int(Int64)
+    case text(String)
+
+    var type: VType {
+        switch self {
+        case .null: return .null
+        case .int: return .int
+        case .text: return .text
+        }
+    }
+
+    func cmp(_ b: Value) -> Int {
+        if type != b.type { return type.rawValue - b.type.rawValue }
+        switch (self, b) {
+        case (.int(let a), .int(let b)): return a < b ? -1 : (a > b ? 1 : 0)
+        case (.text(let a), .text(let b)): return a < b ? -1 : (a > b ? 1 : 0)
+        default: return 0
+        }
+    }
+
+    var truthy: Bool { cmp(.int(0)) != 0 }
+
+    var toText: String {
+        switch self {
+        case .int(let i): return "\(i)"
+        case .text(let s): return s
+        case .null: return "NULL"
+        }
+    }
+}
+
+// MARK: - Schema
+
+struct Table {
+    var name: String
+    var cols: [String]
+    func colIndex(_ col: String) -> Int? {
+        cols.firstIndex { $0.lowercased() == col.lowercased() }
+    }
+}
+
+struct Schema {
+    var tables: [Table] = []
+    func find(_ name: String) -> Table? {
+        tables.first { $0.name.lowercased() == name.lowercased() }
+    }
+    func index(_ name: String) -> Int? {
+        tables.firstIndex { $0.name.lowercased() == name.lowercased() }
+    }
+    mutating func add(_ name: String, _ cols: [String]) -> Bool {
+        if find(name) != nil { return false }
+        tables.append(Table(name: name, cols: cols))
+        return true
+    }
+}
+
+// MARK: - Row / Store
+
+struct Row {
+    var vals: [Value]
+}
+
+final class RowStore {
+    var rows: [Row] = []
+}
+
+// MARK: - Lexer
+
+enum TokKind { case eof, id, int, string, kw, punct, star, comma, lp, rp, semi, op, dot }
+struct Token { let kind: TokKind; let text: String }
+
+let KEYWORDS: Set<String> = [
+    "create","table","insert","into","values","select","from","where",
+    "order","by","asc","desc","and","or","not","null","begin","commit",
+    "inner","join","on","int","integer","text","primary","key","transaction"
+]
+
+func lex(_ sql: String) -> [Token] {
+    var toks: [Token] = []
+    let chars = Array(sql)
+    var pos = 0
+    func push(_ k: TokKind, _ s: String) { toks.append(Token(kind: k, text: s)) }
+    func isKW(_ s: String) -> Bool { KEYWORDS.contains(s.lowercased()) }
+
+    while pos < chars.count {
+        let c = chars[pos]
+        if c.isWhitespace { pos += 1; continue }
+        if c == "-" && pos + 1 < chars.count && chars[pos+1] == "-" {
+            while pos < chars.count && chars[pos] != "\n" { pos += 1 }
+            continue
+        }
+        if c.isLetter || c == "_" {
+            let st = pos
+            while pos < chars.count && (chars[pos].isNumber || chars[pos].isLetter || chars[pos] == "_") { pos += 1 }
+            let s = String(chars[st..<pos])
+            push(isKW(s) ? .kw : .id, s)
+            continue
+        }
+        if c.isNumber {
+            let st = pos
+            while pos < chars.count && chars[pos].isNumber { pos += 1 }
+            push(.int, String(chars[st..<pos]))
+            continue
+        }
+        if c == "'" {
+            pos += 1; let st = pos
+            while pos < chars.count && chars[pos] != "'" { pos += 1 }
+            push(.string, String(chars[st..<pos]))
+            if pos < chars.count { pos += 1 }
+            continue
+        }
+        if c == "\"" {
+            pos += 1; let st = pos
+            while pos < chars.count && chars[pos] != "\"" { pos += 1 }
+            push(.id, String(chars[st..<pos]))
+            if pos < chars.count { pos += 1 }
+            continue
+        }
+        switch c {
+        case "*": push(.star, "*"); pos += 1
+        case ",": push(.comma, ","); pos += 1
+        case "(": push(.lp, "("); pos += 1
+        case ")": push(.rp, ")"); pos += 1
+        case ";": push(.semi, ";"); pos += 1
+        case ".": push(.dot, "."); pos += 1
+        default:
+            if "=<>!".contains(c) {
+                let st = pos
+                if pos + 1 < chars.count && chars[pos+1] == "=" { pos += 1 }
+                if c == "<" && pos + 1 < chars.count && chars[pos+1] == ">" { pos += 1 }
+                if c == "!" && pos + 1 < chars.count && chars[pos+1] == "=" { pos += 1 }
+                pos += 1
+                push(.op, String(chars[st..<pos]))
+            } else {
+                push(.punct, String(c)); pos += 1
+            }
+        }
+    }
+    push(.eof, "")
+    return toks
+}
+
+// MARK: - AST
+
+indirect enum Expr {
+    case col(String)
+    case int(Int64)
+    case str(String)
+    case binop(String, Expr, Expr)
+}
+
+struct ResultCol { var col: String?; var star: Bool }
+struct TableRef { var tname: String; var alias: String? }
+
+struct Stmt {
+    enum Kind { case create, insert, select, begin, commit }
+    var kind: Kind = .select
+    // create
+    var ctName: String = ""
+    var ctCols: [String] = []
+    // insert
+    var insTable: String = ""
+    var insVals: [Value] = []
+    // select
+    var selCols: [ResultCol] = []
+    var selStar: Bool = false
+    var selTables: [TableRef] = []
+    var selWhere: Expr? = nil
+    var selOrderCol: String? = nil
+    var selOrderDesc: Bool = false
+    var selJoinOn: Expr? = nil
+}
+
+// MARK: - Parser
+
+final class Parser {
+    let toks: [Token]
+    var i = 0
+    init(_ toks: [Token]) { self.toks = toks }
+    var cur: Token { toks[i] }
+
+    func accept(_ k: TokKind, _ text: String? = nil) -> Bool {
+        if cur.kind != k { return false }
+        if let t = text, cur.text.lowercased() != t.lowercased() { return false }
+        i += 1; return true
+    }
+    func acceptKW(_ kw: String) -> Bool { accept(.kw, kw) }
+    func peekKW(_ kw: String) -> Bool { cur.kind == .kw && cur.text.lowercased() == kw.lowercased() }
+
+    func parsePrimary() -> Expr? {
+        let t = cur
+        if t.kind == .int { i += 1; return .int(Int64(t.text) ?? 0) }
+        if t.kind == .string { i += 1; return .str(t.text) }
+        if t.kind == .id || t.kind == .kw {
+            var name = t.text; i += 1
+            if cur.kind == .dot {
+                i += 1; name += ".\(cur.text)"; i += 1
+            }
+            return .col(name)
+        }
+        if accept(.lp) { let e = parseExpr(); accept(.rp); return e }
+        return nil
+    }
+
+    func parseCmp() -> Expr? {
+        guard let l = parsePrimary() else { return nil }
+        if cur.kind == .op {
+            let op = cur.text; i += 1
+            guard let r = parsePrimary() else { return nil }
+            return .binop(op, l, r)
+        }
+        return l
+    }
+
+    func parseExpr() -> Expr? {
+        guard let l = parseCmp() else { return nil }
+        if peekKW("and") || peekKW("or") {
+            let op = peekKW("and") ? "AND" : "OR"
+            i += 1
+            guard let r = parseExpr() else { return nil }
+            return .binop(op, l, r)
+        }
+        return l
+    }
+
+    func parseCreate() -> Stmt? {
+        var st = Stmt(); st.kind = .create
+        guard cur.kind == .id || cur.kind == .kw else { return nil }
+        st.ctName = cur.text; i += 1
+        guard accept(.lp) else { return nil }
+        while cur.kind != .rp && cur.kind != .eof {
+            guard cur.kind == .id || cur.kind == .kw else { return nil }
+            st.ctCols.append(cur.text); i += 1
+            while cur.kind != .comma && cur.kind != .rp && cur.kind != .eof { i += 1 }
+            accept(.comma)
+        }
+        accept(.rp)
+        return st
+    }
+
+    func parseInsert() -> Stmt? {
+        var st = Stmt(); st.kind = .insert
+        guard acceptKW("into") else { return nil }
+        guard cur.kind == .id else { return nil }
+        st.insTable = cur.text; i += 1
+        guard acceptKW("values") else { return nil }
+        guard accept(.lp) else { return nil }
+        while cur.kind != .rp && cur.kind != .eof {
+            if cur.kind == .int { st.insVals.append(.int(Int64(cur.text) ?? 0)) }
+            else if cur.kind == .string { st.insVals.append(.text(cur.text)) }
+            else if acceptKW("null") { st.insVals.append(.null) }
+            else { return nil }
+            i += 1
+            if !accept(.comma) { break }
+        }
+        guard accept(.rp) else { return nil }
+        return st
+    }
+
+    func parseSelect() -> Stmt? {
+        var st = Stmt(); st.kind = .select
+        if accept(.star) { st.selStar = true }
+        else {
+            repeat {
+                var rc = ResultCol(col: nil, star: false)
+                if accept(.star) { rc.star = true }
+                else if cur.kind == .id || cur.kind == .kw {
+                    var name = cur.text; i += 1
+                    if cur.kind == .dot {
+                        i += 1
+                        if accept(.star) { rc.star = true }
+                        else { name += ".\(cur.text)"; i += 1; rc.col = name }
+                    } else { rc.col = name }
+                } else { return nil }
+                st.selCols.append(rc)
+            } while accept(.comma)
+        }
+        guard acceptKW("from") else { return nil }
+        guard cur.kind == .id else { return nil }
+        // first table
+        var tr = TableRef(tname: cur.text, alias: nil); i += 1
+        if cur.kind == .id && !peekKW("on") && !peekKW("where") && !peekKW("order") && !peekKW("inner") && !peekKW("join") {
+            tr.alias = cur.text; i += 1
+        }
+        st.selTables.append(tr)
+        // joins
+        while peekKW("inner") || peekKW("join") {
+            if acceptKW("inner") { guard acceptKW("join") else { return nil } }
+            else { acceptKW("join") }
+            guard cur.kind == .id else { return nil }
+            var tr2 = TableRef(tname: cur.text, alias: nil); i += 1
+            if cur.kind == .id && !peekKW("on") && !peekKW("where") && !peekKW("order") {
+                tr2.alias = cur.text; i += 1
+            }
+            st.selTables.append(tr2)
+            if acceptKW("on") {
+                guard let on = parseExpr() else { return nil }
+                if st.selJoinOn == nil { st.selJoinOn = on }
+                else { st.selJoinOn = .binop("AND", st.selJoinOn!, on) }
+            }
+        }
+        if acceptKW("where") { st.selWhere = parseExpr() }
+        if acceptKW("order") {
+            guard acceptKW("by") else { return nil }
+            guard cur.kind == .id || cur.kind == .kw else { return nil }
+            st.selOrderCol = cur.text; i += 1
+            if acceptKW("desc") { st.selOrderDesc = true }
+            else { acceptKW("asc") }
+        }
+        return st
+    }
+
+    func parse() -> Stmt? {
+        if peekKW("begin") { i += 1; acceptKW("transaction"); return Stmt(kind: .begin) }
+        if peekKW("commit") { i += 1; acceptKW("transaction"); return Stmt(kind: .commit) }
+        if acceptKW("create") {
+            if acceptKW("table") { return parseCreate() }
+            return nil
+        }
+        if acceptKW("insert") { return parseInsert() }
+        if acceptKW("select") { return parseSelect() }
+        return nil
+    }
+}
+
+// MARK: - Row context for eval
+
+struct RowCtx {
+    let refs: [TableRef]
+    let tabs: [Table]
+    let rows: [Row]
+}
+
+func rowctxColIndex(_ c: RowCtx, _ col: String) -> (Int, Int)? {
+    if let dot = col.firstIndex(of: ".") {
+        let tname = String(col[col.startIndex..<dot])
+        let cname = String(col[col.index(after: dot)...])
+        for i in 0..<c.n {
+            let tn = c.refs[i].alias ?? c.refs[i].tname
+            if tn.lowercased() == tname.lowercased() {
+                if let ci = c.tabs[i].colIndex(cname) { return (i, ci) }
+            }
+        }
+        return nil
+    }
+    for i in 0..<c.n {
+        if let ci = c.tabs[i].colIndex(col) { return (i, ci) }
+    }
+    return nil
+}
+
+extension RowCtx {
+    var n: Int { refs.count }
+}
+
+func evalExpr(_ e: Expr, _ c: RowCtx) -> Value {
+    switch e {
+    case .int(let v): return .int(v)
+    case .str(let s): return .text(s)
+    case .col(let col):
+        guard let (ti, ci) = rowctxColIndex(c, col) else { return .null }
+        return c.rows[ti].vals[ci]
+    case .binop(let op, let l, let r):
+        let a = evalExpr(l, c), b = evalExpr(r, c)
+        if op.uppercased() == "AND" { return .int((a.truthy && b.truthy) ? 1 : 0) }
+        if op.uppercased() == "OR" { return .int((a.truthy || b.truthy) ? 1 : 0) }
+        let cmp = a.cmp(b)
+        switch op {
+        case "=": return .int(cmp == 0 ? 1 : 0)
+        case "<>": return .int(cmp != 0 ? 1 : 0)
+        case "<": return .int(cmp < 0 ? 1 : 0)
+        case ">": return .int(cmp > 0 ? 1 : 0)
+        case "<=": return .int(cmp <= 0 ? 1 : 0)
+        case ">=": return .int(cmp >= 0 ? 1 : 0)
+        default: return .null
+        }
+    }
+}
+
+func rowMatch(_ where_: Expr?, _ c: RowCtx) -> Bool {
+    guard let w = where_ else { return true }
+    return evalExpr(w, c).truthy
+}
+
+// MARK: - Database
+
+public final class Sqlite3 {
+    var schema = Schema()
+    var stores: [RowStore] = []
+    var errmsg: String = ""
+    var inTxn = false
+
+    public init() {}
+
+    func execCreate(_ st: Stmt) -> Int {
+        if !schema.add(st.ctName, st.ctCols) {
+            errmsg = "table already exists: \(st.ctName)"
+            return -1
+        }
+        stores.append(RowStore())
+        return 0
+    }
+
+    func execInsert(_ st: Stmt) -> Int {
+        guard let idx = schema.index(st.insTable) else {
+            errmsg = "no such table: \(st.insTable)"
+            return -1
+        }
+        stores[idx].rows.append(Row(vals: st.insVals))
+        return 0
+    }
+}
+
+// MARK: - Prepared Statement
+
+public final class Sqlite3Stmt {
+    let db: Sqlite3
+    var st: Stmt
+    var started = false
+    var done = false
+    var outrow: [Value] = []
+    var sorted: [Row] = []
+    var curSorted = 0
+
+    init(_ db: Sqlite3, _ st: Stmt) { self.db = db; self.st = st }
+
+    func collectMatching() {
+        let n = st.selTables.count
+        let idxs = st.selTables.map { db.schema.index($0.tname) }
+        let tabs = st.selTables.compactMap { db.schema.find($0.tname) }
+        guard tabs.count == n else { return }
+
+        // nested loop
+        var cursors: [Int] = idxs.map { $0.map { 0 } ?? -1 }
+
+        func rowsAt() -> [Row]? {
+            var rows: [Row] = []
+            for i in 0..<n {
+                guard let idx = idxs[i], cursors[i] >= 0, cursors[i] < db.stores[idx].rows.count else { return nil }
+                rows.append(db.stores[idx].rows[cursors[i]])
+            }
+            return rows
+        }
+
+        while true {
+            guard let rows = rowsAt() else { break }
+            let ctx = RowCtx(refs: st.selTables, tabs: tabs, rows: rows)
+            if rowMatch(st.selWhere, ctx) && rowMatch(st.selJoinOn, ctx) {
+                var combined: [Value] = []
+                for r in rows { combined.append(contentsOf: r.vals) }
+                sorted.append(Row(vals: combined))
+            }
+            // advance innermost
+            var k = n - 1
+            var advanced = false
+            while k >= 0 {
+                guard let idx = idxs[k] else { k -= 1; continue }
+                cursors[k] += 1
+                if cursors[k] < db.stores[idx].rows.count { advanced = true; break }
+                cursors[k] = 0
+                k -= 1
+            }
+            if !advanced { break }
+        }
+
+        // ORDER BY (single-table case)
+        if let orderCol = st.selOrderCol, n == 1 {
+            if let cidx = tabs[0].colIndex(orderCol) {
+                sorted.sort { a, b in
+                    let cmp = a.vals[cidx].cmp(b.vals[cidx])
+                    return st.selOrderDesc ? cmp > 0 : cmp < 0
+                }
+            }
+        }
+    }
+
+    func stepSelect() -> Int {
+        if !started { started = true; collectMatching() }
+        if curSorted >= sorted.count { return 101 }
+        let r = sorted[curSorted]; curSorted += 1
+        let n = st.selTables.count
+        let tabs = st.selTables.compactMap { db.schema.find($0.tname) }
+        guard tabs.count == n else { return 101 }
+
+        var offsets = [Int](); var off = 0
+        for i in 0..<n { offsets.append(off); off += tabs[i].cols.count }
+
+        let ctx = RowCtx(refs: st.selTables, tabs: tabs, rows: [Row](repeating: Row(vals: []), count: n))
+        // We need a RowCtx where rows is the combined row split per table — but for projection
+        // we just use offsets directly on r.vals
+        outrow = []
+        if st.selStar {
+            for i in 0..<n {
+                for j in 0..<tabs[i].cols.count {
+                    outrow.append(r.vals[offsets[i] + j])
+                }
+            }
+        } else {
+            for rc in st.selCols {
+                if rc.star {
+                    for i in 0..<n {
+                        for j in 0..<tabs[i].cols.count {
+                            outrow.append(r.vals[offsets[i] + j])
+                        }
+                    }
+                } else if let col = rc.col {
+                    if let dot = col.firstIndex(of: ".") {
+                        let tname = String(col[col.startIndex..<dot])
+                        let cname = String(col[col.index(after: dot)...])
+                        var found = false
+                        for i in 0..<n {
+                            let tn = st.selTables[i].alias ?? st.selTables[i].tname
+                            if tn.lowercased() == tname.lowercased() {
+                                if let ci = tabs[i].colIndex(cname) {
+                                    outrow.append(r.vals[offsets[i] + ci]); found = true; break
+                                }
+                            }
+                        }
+                        if !found { outrow.append(.null) }
+                    } else {
+                        var found = false
+                        for i in 0..<n {
+                            if let ci = tabs[i].colIndex(col) {
+                                outrow.append(r.vals[offsets[i] + ci]); found = true; break
+                            }
+                        }
+                        if !found { outrow.append(.null) }
+                    }
+                }
+            }
+        }
+        return 100
+    }
+}
+
+// MARK: - Public API
+
+public func sqlite3_open(_ name: String) -> Sqlite3 { Sqlite3() }
+
+public func sqlite3_close(_ db: Sqlite3) {}
+
+public func sqlite3_errmsg(_ db: Sqlite3) -> String { db.errmsg }
+
+public typealias ExecCallback = (_ n: Int, _ vals: [String], _ cols: [String]?) -> Void
+
+public func sqlite3_exec(_ db: Sqlite3, _ sql: String, cb: ExecCallback? = nil) -> Int {
+    let toks = lex(sql)
+    var p = Parser(toks)
+    var rc = 0
+    while p.cur.kind != .eof {
+        guard let st = p.parse() else { rc = 1; db.errmsg = "parse error"; break }
+        p.accept(.semi)
+        switch st.kind {
+        case .begin: db.inTxn = true
+        case .commit: db.inTxn = false
+        case .create: rc = db.execCreate(st)
+        case .insert: rc = db.execInsert(st)
+        case .select:
+            let s = Sqlite3Stmt(db, st)
+            while s.stepSelect() == 100 {
+                let vals = s.outrow.map { $0.toText }
+                cb?(s.outrow.count, vals, nil)
+            }
+        }
+        if rc != 0 { break }
+    }
+    return rc
+}
+
+public func sqlite3_prepare_v2(_ db: Sqlite3, _ sql: String) -> Sqlite3Stmt? {
+    let toks = lex(sql)
+    var p = Parser(toks)
+    guard let st = p.parse() else { return nil }
+    return Sqlite3Stmt(db, st)
+}
+
+public func sqlite3_step(_ s: Sqlite3Stmt) -> Int {
+    if s.st.kind == .select { return s.stepSelect() }
+    return 101
+}
+
+public func sqlite3_column_count(_ s: Sqlite3Stmt) -> Int { s.outrow.count }
+
+public func sqlite3_column_text(_ s: Sqlite3Stmt, _ i: Int) -> String? {
+    guard i >= 0, i < s.outrow.count else { return nil }
+    return s.outrow[i].toText
+}
+
+public func sqlite3_column_int64(_ s: Sqlite3Stmt, _ i: Int) -> Int64 {
+    guard i >= 0, i < s.outrow.count else { return 0 }
+    if case .int(let v) = s.outrow[i] { return v }
+    return 0
+}
+
+public func sqlite3_finalize(_ s: Sqlite3Stmt) {}
+
+// MARK: - Demo
+
+func printRow(_ n: Int, _ vals: [String], _ cols: [String]?) {
+    for i in 0..<n {
+        print(vals[i], terminator: i + 1 < n ? " | " : "\n")
+    }
+}
+
+let db = sqlite3_open(":memory:")
+let sql = """
+CREATE TABLE users (id INTEGER, name TEXT);
+INSERT INTO users VALUES (1, 'ada');
+INSERT INTO users VALUES (2, 'grace');
+INSERT INTO users VALUES (3, 'linus');
+SELECT * FROM users WHERE id > 1 ORDER BY id DESC;
+"""
+let rc = sqlite3_exec(db, sql, cb: printRow)
+if rc != 0 { FileHandle.standardError.write("err: \(sqlite3_errmsg(db))\n".data(using: .utf8)!) }
+sqlite3_close(db)
+```

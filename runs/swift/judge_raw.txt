@@ -1,0 +1,9 @@
+```json
+{
+  "completeness": 72,
+  "api_surface": 85,
+  "sql_features": 75,
+  "architecture": 65,
+  "notes": "Swift port successfully translates core lexer, parser, and executor logic with good API coverage. Major gaps: nested-loop join execution is incomplete (cursors logic broken), ORDER BY only works single-table, transaction support is stubbed, and several internal data structure patterns diverge from the C semantics."
+}
+```

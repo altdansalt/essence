@@ -1,0 +1,40 @@
+{
+  "language": "Swift",
+  "slug": "swift",
+  "timestamp_utc": "2026-06-20T17:44:05Z",
+  "elapsed_seconds": 60.4,
+  "porter_finish_reason": "stop",
+  "original_tokens": 8805,
+  "ported_tokens": 5578,
+  "token_ratio": 0.6335,
+  "reduction_factor": 1.58,
+  "porter_model": "accounts/fireworks/models/glm-5p2",
+  "judge_model": "claude-haiku-4-5",
+  "porter_usage": {
+    "prompt_tokens": 14266,
+    "total_tokens": 19966,
+    "completion_tokens": 5700,
+    "prompt_tokens_details": {
+      "cached_tokens": 177
+    }
+  },
+  "judge_usage": {
+    "input_tokens": 18620,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "cache_creation": {
+      "ephemeral_5m_input_tokens": 0,
+      "ephemeral_1h_input_tokens": 0
+    },
+    "output_tokens": 117,
+    "service_tier": "standard",
+    "inference_geo": "not_available"
+  },
+  "judge_score": {
+    "completeness": 72,
+    "api_surface": 85,
+    "sql_features": 75,
+    "architecture": 65,
+    "notes": "Swift port successfully translates core lexer, parser, and executor logic with good API coverage. Major gaps: nested-loop join execution is incomplete (cursors logic broken), ORDER BY only works single-table, transaction support is stubbed, and several internal data structure patterns diverge from the C semantics."
+  }
+}
