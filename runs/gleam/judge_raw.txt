@@ -1,0 +1,9 @@
+```json
+{
+  "completeness": 12,
+  "api_surface": 5,
+  "sql_features": 0,
+  "architecture": 8,
+  "notes": "The port shows only a single utility function (v_cmp) with no database, parser, executor, or API implementation. While the function is correctly adapted to Gleam's pattern matching, the vast majority of the C codebase—lexer, parser, AST, row storage, statement execution, and all public API functions—is completely absent."
+}
+```

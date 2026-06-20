@@ -155,3 +155,10 @@ subprocess.CalledProcessError: Command '['git', 'push']' returned non-zero exit 
 [2026-06-20T17:44:27Z]       porter done: 23367 bytes, 6752 tokens, 85.3s
 [2026-06-20T17:44:30Z]       judge: completeness=42 notes=The Scala port captures core SQL parsing and execution logic but has significant
 [2026-06-20T17:44:31Z] loop done: 1 runs
+[2026-06-20T17:45:52Z]       porter length-capped (16000 tok); retry high effort
+[2026-06-20T17:46:21Z]       porter length-capped (16000 tok); retry high effort
+[2026-06-20T17:46:22Z]       porter length-capped (16000 tok); retry high effort
+[2026-06-20T17:46:56Z]       porter length-capped (16000 tok); retry high effort
+[2026-06-20T17:47:10Z]       porter length-capped (16000 tok); retry high effort
+[2026-06-20T17:49:04Z]       porter done: 407 bytes, 180 tokens, 362.6s
+[2026-06-20T17:49:07Z]       judge: completeness=12 notes=The port shows only a single utility function (v_cmp) with no database, parser, 

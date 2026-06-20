@@ -1,0 +1,1818 @@
+Let me port this C SQLite-style engine to Gleam. I need to implement:
+
+1. Value type (NULL, INT, TEXT)
+2. Lexer
+3. Parser (recursive descent)
+4. Executor (nested-loop joins, WHERE, ORDER BY, projections)
+5. In-memory table store
+6. Public API: open, exec, prepare_v2, step, finalize, close, column_count, column_text, column_int64, errmsg
+7. Demo main
+
+Let me write this in idiomatic Gleam.
+
+Gleam doesn't have mutable state, so I'll use a mutable reference (like a Dict or a custom type with internal state). Actually, Gleam on BEAM can use `gleam/otp` or just use a process/dict approach. But for simplicity, I'll use a type that holds the database state and pass it around. Since Gleam is immutable, I'll need to thread state through.
+
+Actually, for the API to work like SQLite (where you call step repeatedly), I need some form of mutable state. In Gleam, I can use `gleam/dict` and thread the state, or use Erlang's process dictionary, or use a mutable cell.
+
+Let me think about this more carefully. The C API has:
+- `sqlite3_open` returns a db handle
+- `sqlite3_exec` executes SQL with a callback
+- `sqlite3_prepare_v2` creates a prepared statement
+- `sqlite3_step` advances the statement, returning ROW or DONE
+- `sqlite3_column_count/text/int64` get column values from current row
+- `sqlite3_finalize` cleans up
+- `sqlite3_close` closes the db
+
+In Gleam, since there's no mutation, I'll model this with types that carry state. The statement will hold materialized rows (like the C code does with `sorted`), and step will return the next row along with an updated statement.
+
+Actually, looking at the C code more carefully, `stmt_step_select` materializes all matching rows in `collect_matching`, then iterates through them. So I can do the same: collect all rows, then step through them.
+
+For the API, I'll make the statement hold the materialized rows and an index. Since Gleam is immutable, `step` will return a result with the new statement state.
+
+Let me design the types:
+
+```gleam
+pub type Value {
+  VNull
+  VInt(Int)
+  VText(String)
+}
+
+pub type Table {
+  Table(name: String, cols: List(String))
+}
+
+pub type Row {
+  Row(vals: List(Value))
+}
+
+pub type Database {
+  Database(
+    tables: List(Table),
+    stores: Dict(String, List(Row)),  // table name -> rows
+    errmsg: String,
+  )
+}
+```
+
+Wait, but table names are case-insensitive in the C code. I'll normalize to lowercase for lookups.
+
+Let me think about the statement type. The C code has `sqlite3_stmt` which holds the parsed statement and materialized rows. In Gleam:
+
+```gleam
+pub type Statement {
+  Statement(
+    db: Database,
+    stmt: ParsedStmt,
+    rows: List(Row),  // materialized
+    cursor: Int,
+    outrow: List(Value),
+    done: Bool,
+  )
+}
+```
+
+For `step`, I'll return `#(Statement, Int)` or a result type.
+
+Let me think about the API more carefully. In Gleam, since we can't mutate, the typical pattern would be:
+
+```gleam
+pub fn step(stmt) -> StepResult
+```
+
+where `StepResult` is either `Row(stmt, values)` or `Done(stmt)`.
+
+But to match the C API more closely, I could use a mutable reference. Gleam doesn't have built-in mutable references, but on BEAM we could use process dictionary or actors. For simplicity and idiomatic Gleam, let me use a result-based approach.
+
+Actually, let me reconsider. The requirement says "Name them as idiomatic for Gleam (e.g. a class/module Sqlite3 with methods open/exec/prepare/step/finalize/close) but keep the same behavior."
+
+In Gleam, the idiomatic way would be to have functions that take and return state. Let me design:
+
+```gleam
+pub fn open() -> Database
+pub fn exec(db, sql, callback) -> Database  // returns updated db
+pub fn prepare(db, sql) -> Result(Statement, String)
+pub fn step(stmt) -> StepResult  // Row or Done
+pub fn column_count(stmt) -> Int
+pub fn column_text(stmt, i) -> String
+pub fn column_int64(stmt, i) -> Int
+pub fn finalize(stmt) -> Nil
+pub fn close(db) -> Nil
+pub fn errmsg(db) -> String
+```
+
+For step, since the statement holds materialized rows, I can return:
+```gleam
+pub type StepResult {
+  Row(Statement)  // new statement state with current row
+  Done
+}
+```
+
+Actually, let me think about this differently. The statement needs to track which row we're on. Since Gleam is immutable, step returns a new statement with the cursor advanced, plus the result.
+
+Let me use:
+```gleam
+pub type StepResult {
+  StepRow(stmt: Statement)
+  StepDone
+}
+```
+
+And `column_text`/`column_int64` read from the current row in the statement.
+
+Let me now write the full implementation.
+
+For the lexer, I'll produce a list of tokens.
+
+For the parser, I'll use recursive descent with a position index.
+
+For the executor, I'll do nested loops for joins, filter with WHERE, sort with ORDER BY, and project columns.
+
+Let me write this out:
+
+```gleam
+import gleam/io
+import gleam/int
+import gleam/list
+import gleam/string
+import gleam/dict
+import gleam/result
+```
+
+Let me think about the token types:
+
+```gleam
+pub type TokenKind {
+  TkEof
+  TkId
+  TkInt
+  TkString
+  TkKw
+  TkPunct
+  TkStar
+  TkComma
+  TkLp
+  TkRp
+  TkSemi
+  TkOp
+  TkDot
+}
+
+pub type Token {
+  Token(kind: TokenKind, text: String)
+}
+```
+
+Keywords list from the C code.
+
+For the AST:
+
+```gleam
+pub type Expr {
+  ECol(col: String)
+  EInt(val: Int)
+  EStr(val: String)
+  EBinop(op: String, l: Expr, r: Expr)
+}
+
+pub type ResultCol {
+  ResultCol(col: Option(String), star: Bool)
+}
+
+pub type TableRef {
+  TableRef(tname: String, alias: Option(String))
+}
+
+pub type ParsedStmt {
+  SCreate(name: String, cols: List(String))
+  SInsert(table: String, vals: List(Value))
+  SSelect(cols: List(ResultCol), star: Bool, tables: List(TableRef), where: Option(Expr), order_col: Option(String), order_desc: Bool, join_on: Option(Expr))
+  SBegin
+  SCommit
+}
+```
+
+Now let me implement the lexer. The C code is character-by-character. In Gleam, I'll work with the string and an index.
+
+Actually, Gleam strings are UTF-8. For simplicity, I'll use `string.graphemes` or work with byte indices. Actually, let me use a simpler approach - convert to a list of characters or use string functions.
+
+Hmm, Gleam's string module has `string.pop_grapheme` and such. Let me think about the most concise approach.
+
+Actually, I think the cleanest approach is to work with a list of graphemes (characters). Let me convert the input string to a list of strings (each a single character) and process that.
+
+Wait, actually in Gleam, I can use `string.to_graphemes(s)` to get a list of single-character strings. Then I can pattern match on them.
+
+Let me write the lexer recursively over the character list.
+
+Actually, let me think about what's most concise. I'll use a recursive function that takes the remaining string and produces tokens.
+
+Let me use `string.pop_grapheme` which returns `#(String, String)` - the first grapheme and the rest. Or I can use `string.slice` with indices.
+
+Actually, for a lexer, working with an index into the string is probably cleanest. Let me use a recursive function with position tracking.
+
+Hmm, but Gleam doesn't have great support for random access into strings. Let me convert to a list of characters first.
+
+```gleam
+let chars = string.to_graphemes(sql)
+```
+
+Then I can pattern match on the list.
+
+Let me write the lexer:
+
+```gleam
+fn lex(sql: String) -> List(Token) {
+  let chars = string.to_graphemes(sql)
+  lex_chars(chars, [])
+  |> list.reverse
+  |> fn(toks) { list.append(toks, [Token(TkEof, "")]) }
+}
+
+fn lex_chars(chars: List(String), acc: List(Token)) -> List(Token) {
+  case chars {
+    [] -> acc
+    [c, ..rest] -> {
+      // skip whitespace
+      if is_space(c) { lex_chars(rest, acc) }
+      else if c == "-" && rest starts with "-" { skip comment }
+      ...
+    }
+  }
+}
+```
+
+This is getting complex. Let me think of a cleaner approach.
+
+Actually, let me use a more direct approach. I'll write a helper that peeks at the first character and dispatches.
+
+Let me write it more carefully:
+
+```gleam
+fn lex(sql: String) -> List(Token) {
+  do_lex(string.to_graphemes(sql), [])
+  |> list.reverse
+  |> fn(t) { list.append(t, [Token(TkEof, "")]) }
+}
+
+fn do_lex(chars: List(String), acc: List(Token)) -> List(Token) {
+  case chars {
+    [] -> acc
+    [c, ..rest] -> {
+      case c {
+        " " | "\t" | "\n" | "\r" -> do_lex(rest, acc)
+        "-" -> {
+          case rest {
+            ["-", ..r2] -> do_lex(skip_to_newline(r2), acc)
+            _ -> do_lex(rest, [Token(TkPunct, c), ..acc])
+          }
+        }
+        _ -> {
+          if is_alpha(c) || c == "_" {
+            let #(id, rest2) = take_while(chars, is_alnum_or_underscore)
+            let kind = case is_keyword(id) { True -> TkKw; False -> TkId }
+            do_lex(rest2, [Token(kind, id), ..acc])
+          } else if is_digit(c) {
+            let #(num, rest2) = take_while(chars, is_digit)
+            do_lex(rest2, [Token(TkInt, num), ..acc])
+          } else if c == "'" {
+            let #(s, rest2) = take_until(rest, "'")
+            do_lex(skip_quote(rest2), [Token(TkString, s), ..acc])
+          } else if c == "\"" {
+            let #(s, rest2) = take_until(rest, "\"")
+            do_lex(skip_quote(rest2), [Token(TkId, s), ..acc])
+          } else {
+            case c {
+              "*" -> do_lex(rest, [Token(TkStar, c), ..acc])
+              "," -> do_lex(rest, [Token(TkComma, c), ..acc])
+              "(" -> do_lex(rest, [Token(TkLp, c), ..acc])
+              ")" -> do_lex(rest, [Token(TkRp, c), ..acc])
+              ";" -> do_lex(rest, [Token(TkSemi, c), ..acc])
+              "." -> do_lex(rest, [Token(TkDot, c), ..acc])
+              "=" | "<" | ">" | "!" -> {
+                // handle multi-char operators
+                case rest {
+                  ["=", ..r2] -> do_lex(r2, [Token(TkOp, c <> "="), ..acc])
+                  _ -> {
+                    case c {
+                      "<" -> {
+                        case rest {
+                          [">", ..r2] -> do_lex(r2, [Token(TkOp, "<>"), ..acc])
+                          _ -> do_lex(rest, [Token(TkOp, c), ..acc])
+                        }
+                      }
+                      _ -> do_lex(rest, [Token(TkOp, c), ..acc])
+                    }
+                  }
+                }
+              }
+              _ -> do_lex(rest, [Token(TkPunct, c), ..acc])
+            }
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+Wait, I need to handle the operator logic more carefully. Looking at the C code:
+
+```c
+if (strchr("=<>!",c)){
+    size_t st=L->pos;
+    if (L->src[L->pos+1]=='=') L->pos++;
+    if (c=='<' && L->src[L->pos+1]=='>') L->pos++;
+    if (c=='!' && L->src[L->pos+1]=='=') L->pos++;
+    L->pos++;
+    lex_push(L,TK_OP,L->src+st,L->pos-st);
+}
+```
+
+So the logic is:
+1. Start at position of c
+2. If next char is '=', advance (so we include '=')
+3. If c=='<' and next char is '>', advance (so we include '>')
+4. If c=='!' and next char is '=', advance (so we include '=')
+5. Advance past the current char
+
+Wait, this is sequential. After step 2, if we advanced for '=', then in step 3 we check the char after '='. So:
+- For `<=`: c='<', next='=', advance. Now at '='. Check c=='<' and next='>'? next is whatever follows '=', not '>'. So no. Then advance past '='. Result: "<="
+- For `<>`: c='<', next='>', not '=', so don't advance in step 2. Check c=='<' and next='>': yes, advance. Now at '>'. Check c=='!' and next='=': no. Advance past '>'. Result: "<>"
+- For `<`: c='<', next is not '=' or '>'. Don't advance in steps 2-3. Advance past '<'. Result: "<"
+- For `=`: c='=', next maybe '='. If next is '=', advance. Result: "==". Otherwise just "=".
+- For `!=`: c='!', next='=', not '=' in step 2? Wait, step 2 checks if next is '='. c='!', next='=', so yes, advance. Then step 3: c=='<'? No. Step 4: c=='!' and next is whatever follows '='. If the original was `!=`, after step 2 we're at '=', and next is whatever follows. Step 4 checks c=='!' and next=='='. But c is still '!' (the original char), and next is the char after the '='. So for `!=`, after step 2 we consumed '!', now at '='. Next char is whatever follows. Step 4: c=='!' (yes) and next=='='? Only if there's another '='. For `!=` alone, next is not '=', so no. Then advance past '='. Result: "!=".
+
+Wait, I'm confused. Let me re-read:
+
+```c
+size_t st=L->pos;  // position of c
+if (L->src[L->pos+1]=='=') L->pos++;  // if next is '=', advance to include it
+if (c=='<' && L->src[L->pos+1]=='>') L->pos++;  // if c=='<' and (new) next is '>', advance
+if (c=='!' && L->src[L->pos+1]=='=') L->pos++;  // if c=='!' and (new) next is '=', advance
+L->pos++;  // advance past last char
+lex_push(L,TK_OP,L->src+st,L->pos-st);
+```
+
+So for `!=`:
+- st = pos of '!'
+- L->src[pos+1] is '=', so pos++ (now at '=')
+- c=='<' ? No
+- c=='!' and L->src[pos+1]=='='? pos is now at '=', so pos+1 is the char after '='. For `!=` followed by something else, this is not '='. So no advance.
+- pos++ (advance past '=')
+- Result: "!="
+
+For `!==`:
+- st = pos of '!'
+- L->src[pos+1] is '=', so pos++ (now at first '=')
+- c=='<' ? No
+- c=='!' and L->src[pos+1]=='='? pos is at first '=', pos+1 is second '='. Yes! pos++ (now at second '=')
+- pos++ (advance past second '=')
+- Result: "!=="
+
+But `!==` is not a valid operator in this SQL. The C code would produce it but the parser wouldn't handle it. Let me just match the C behavior.
+
+For `<=`:
+- st = pos of '<'
+- L->src[pos+1] is '=', so pos++ (now at '=')
+- c=='<' and L->src[pos+1]=='>'? pos is at '=', pos+1 is char after '='. Not '>'. No.
+- c=='!' ? No
+- pos++ (advance past '=')
+- Result: "<="
+
+For `<>`:
+- st = pos of '<'
+- L->src[pos+1] is '>', not '='. No advance.
+- c=='<' and L->src[pos+1]=='>'? Yes! pos++ (now at '>')
+- c=='!' ? No
+- pos++ (advance past '>')
+- Result: "<>"
+
+For `>=`:
+- st = pos of '>'
+- L->src[pos+1] is '=', so pos++ (now at '=')
+- c=='<' ? No
+- c=='!' ? No
+- pos++ (advance past '=')
+- Result: ">="
+
+For `>`:
+- st = pos of '>'
+- L->src[pos+1] is not '='. No advance.
+- c=='<' ? No
+- c=='!' ? No
+- pos++ (advance past '>')
+- Result: ">"
+
+For `=`:
+- st = pos of '='
+- L->src[pos+1] is maybe '='. If so, pos++ (now at second '=')
+- c=='<' ? No
+- c=='!' ? No
+- pos++ (advance past)
+- Result: "=" or "=="
+
+OK so `==` is also possible. The parser uses `=` for equality. `==` would not match. But let me just match the C behavior.
+
+Let me simplify the operator lexing in Gleam:
+
+```gleam
+fn lex_op(c: String, rest: List(String)) -> #(Token, List(String)) {
+  // c is one of =, <, >, !
+  case rest {
+    ["=", ..r2] -> {
+      // After consuming c and '=', check for more
+      case c {
+        "<" -> {
+          case r2 {
+            [">", ..r3] -> #(Token(TkOp, "<=>"), r3)  // This shouldn't happen in practice
+            _ -> #(Token(TkOp, c <> "="), r2)
+          }
+        }
+        "!" -> {
+          case r2 {
+            ["=", ..r3] -> #(Token(TkOp, "!=="), r3)
+            _ -> #(Token(TkOp, "!="), r2)
+          }
+        }
+        _ -> #(Token(TkOp, c <> "="), r2)
+      }
+    }
+    _ -> {
+      case c {
+        "<" -> {
+          case rest {
+            [">", ..r2] -> #(Token(TkOp, "<>"), r2)
+            _ -> #(Token(TkOp, "<"), rest)
+          }
+        }
+        _ -> #(Token(TkOp, c), rest)
+      }
+    }
+  }
+}
+```
+
+Wait, I'm overcomplicating this. Let me re-read the C code more carefully.
+
+The C code does sequential checks:
+1. If next char is '=', advance (consume '=')
+2. If c=='<' and (new) next is '>', advance (consume '>')
+3. If c=='!' and (new) next is '=', advance (consume '=')
+4. Advance one more (consume current char)
+
+So the order matters. After step 1, we might have consumed '='. Then step 2 checks the char after that '='.
+
+Let me trace through more carefully with the Gleam list approach:
+
+```gleam
+fn lex_op(c, rest) {
+  // c is the first char, rest is what follows
+  case rest {
+    ["=", ..r2] -> {
+      // Step 1: next is '=', consume it
+      // Now check step 2 and 3 with r2 as the "rest after ="
+      case c {
+        "<" -> {
+          case r2 {
+            [">", ..r3] -> #(Token(TkOp, "<=>"), r3) // <=>
+            _ -> #(Token(TkOp, "<="), r2)
+          }
+        }
+        "!" -> {
+          case r2 {
+            ["=", ..r3] -> #(Token(TkOp, "!=="), r3)
+            _ => #(Token(TkOp, "!="), r2)
+          }
+        }
+        _ -> #(Token(TkOp, c <> "="), r2)  // ==, >=
+      }
+    }
+    _ -> {
+      // Step 1: next is not '=', don't consume
+      // Step 2: c=='<' and next is '>'?
+      case c {
+        "<" -> {
+          case rest {
+            [">", ..r2] -> #(Token(TkOp, "<>"), r2)
+            _ -> #(Token(TkOp, "<"), rest)
+          }
+        }
+        _ -> #(Token(TkOp, c), rest)  // >, !, =
+      }
+    }
+  }
+}
+```
+
+This matches the C behavior. The `<=>` and `!==` cases are edge cases that won't appear in valid SQL but match the C behavior.
+
+OK, let me now write the full implementation. I'll try to be concise but complete.
+
+For the parser, I'll use a recursive approach with a position into the token list.
+
+For the executor, I'll materialize all matching rows (like the C code), then iterate.
+
+Let me think about the Database type. Since Gleam is immutable, `exec` will return a new Database. But for the callback-based API, I need to handle SELECT specially.
+
+Actually, looking at the C `sqlite3_exec`, it handles SELECT by creating a temporary statement, stepping through it, and calling the callback for each row. For non-SELECT statements, it modifies the database.
+
+So `exec` needs to return the updated database (for CREATE/INSERT) and also call the callback for SELECT results.
+
+Let me design:
+
+```gleam
+pub fn exec(db: Database, sql: String, callback: fn(List(String)) -> Nil) -> Database
+```
+
+The callback receives the text values of each row.
+
+For `prepare`, it returns a Statement that holds materialized rows.
+
+For `step`, it returns the next row or Done.
+
+Let me think about how to handle the statement state. Since Gleam is immutable, I'll make Statement hold all materialized rows and a cursor index. `step` returns `#(Statement, StepResult)` or similar.
+
+Actually, let me make step return a result type:
+
+```gleam
+pub type StepResult {
+  StepRow
+  StepDone
+}
+```
+
+And step takes a Statement and returns `#(Statement, StepResult)`. The current row is stored in the statement. Then `column_text` and `column_int64` read from the current row.
+
+Wait, but that means the caller needs to use the returned statement for subsequent calls. That's the Gleam way.
+
+Let me define:
+
+```gleam
+pub type Statement {
+  Statement(
+    rows: List(List(Value)),  // materialized result rows
+    cursor: Int,
+    current: List(Value),  // current row values
+    nout: Int,
+  )
+}
+
+pub fn step(stmt: Statement) -> #(Statement, StepResult) {
+  case list.at(stmt.rows, stmt.cursor) {
+    Ok(row) -> #(Statement(..stmt, cursor: stmt.cursor + 1, current: row, nout: list.length(row)), StepRow)
+    Error(_) -> #(stmt, StepDone)
+  }
+}
+```
+
+Hmm, but `list.at` is O(n). For a small in-memory engine, that's fine.
+
+Actually, let me use a different approach - store the remaining rows as a list:
+
+```gleam
+pub type Statement {
+  Statement(
+    remaining: List(List(Value)),
+    current: List(Value),
+    nout: Int,
+  )
+}
+
+pub fn step(stmt: Statement) -> #(Statement, StepResult) {
+  case stmt.remaining {
+    [row, ..rest] -> #(Statement(remaining: rest, current: row, nout: list.length(row)), StepRow)
+    [] -> #(stmt, StepDone)
+  }
+}
+```
+
+This is cleaner and O(1).
+
+Now let me think about the full implementation. I need to handle:
+1. Lexer
+2. Parser
+3. Executor (for SELECT: nested loop join, WHERE filter, ORDER BY, projections)
+4. CREATE TABLE
+5. INSERT
+6. The demo
+
+Let me write it all out now.
+
+For case-insensitive comparison, I'll use `string.lowercase` for table and column name lookups.
+
+Let me think about the Value comparison. The C code:
+- Different types: compare by type enum value (V_NULL=0, V_INT=1, V_TEXT=2)
+- Same type INT: numeric comparison
+- Same type TEXT: string comparison
+- Same type NULL: equal (0)
+
+For truthiness: compare to v_int(0), so NULL and 0 are falsy, everything else is truthy.
+
+Wait, let me check: `v_truthy` compares the value to `v_int(0)`. If they're different types, the type comparison gives non-zero (V_NULL=0 vs V_INT=1 gives -1, V_TEXT=2 vs V_INT=1 gives 1). So NULL is falsy (cmp != 0 is true... wait).
+
+`v_truthy` returns `v_cmp(v, &z) != 0` where z = v_int(0).
+
+For V_NULL vs V_INT(0): type comparison gives 0-1 = -1, so cmp = -1, truthy = (-1 != 0) = true.
+
+Wait, that means NULL is truthy? Let me re-check.
+
+```c
+static int v_truthy(const Value *v){ Value z=v_int(0); return v_cmp(v,&z)!=0; }
+```
+
+```c
+static int v_cmp(const Value *a, const Value *b){
+    if (a->type!=b->type) return (int)a->type-(int)b->type;
+    ...
+}
+```
+
+V_NULL=0, V_INT=1. So for NULL vs INT(0): 0-1 = -1. cmp = -1. truthy = (-1 != 0) = 1 (true).
+
+So NULL IS truthy in this engine! That's... unusual but it's what the C code does.
+
+For INT(0) vs INT(0): same type, 0 == 0, cmp = 0. truthy = 0 (false).
+For INT(1) vs INT(0): same type, 1 > 0, cmp = 1. truthy = 1 (true).
+For TEXT("") vs INT(0): different types, 2-1 = 1. truthy = 1 (true).
+For TEXT("hello") vs INT(0): different types, 2-1 = 1. truthy = 1 (true).
+
+So any non-zero integer is truthy, any text is truthy, NULL is truthy, and only 0 is falsy.
+
+OK, I'll match this behavior.
+
+Now let me write the full code. I'll try to be concise.
+
+For the parser, I'll use a recursive function that takes a list of tokens and a position, and returns the parsed expression and the new position. Actually, in Gleam, I can use a mutable-like approach with a wrapper, or just thread the position through.
+
+Let me use a Parser type that holds the token list and position, and return updated positions.
+
+Actually, the cleanest Gleam approach for a parser is to use a function that takes the token list and returns `#(parsed_value, remaining_tokens)`. This is the functional parser combinator approach.
+
+Let me use this approach:
+
+```gleam
+fn parse_expr(tokens: List(Token)) -> #(Expr, List(Token))
+```
+
+This threads the remaining tokens through. It's clean and idiomatic.
+
+Let me write the full code now.
+
+For the lexer, I need helper functions:
+- `is_alpha(c)` - check if character is a letter
+- `is_digit(c)` - check if character is a digit
+- `is_alnum_underscore(c)` - alphanumeric or underscore
+- `is_space(c)` - whitespace
+
+In Gleam, I can use pattern matching or string functions.
+
+Let me use `string.contains` or direct comparison. Actually, for single characters, direct comparison is fine.
+
+Let me write helper functions:
+
+```gleam
+fn is_space(c: String) -> Bool {
+  c == " " || c == "\t" || c == "\n" || c == "\r"
+}
+
+fn is_alpha(c: String) -> Bool {
+  string.contains("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_", c)
+}
+
+fn is_digit(c: String) -> Bool {
+  string.contains("0123456789", c)
+}
+
+fn is_alnum_us(c: String) -> Bool {
+  is_alpha(c) || is_digit(c)
+}
+```
+
+Wait, `string.contains` takes a string and a substring. For single characters, this should work. But it's not the most efficient. For a demo, it's fine.
+
+Actually, `is_alpha` should only match single characters. `string.contains("abc", "ab")` would return True, which is wrong. But since we're dealing with graphemes (single characters), it should be fine as long as we only pass single characters.
+
+Hmm, but `string.contains("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_", "_")` - the underscore is in the string, so it would return True. That's correct.
+
+But what about multi-byte characters? `string.to_graphemes` should give us single graphemes. For ASCII, each grapheme is one character. This should be fine.
+
+Actually, let me be more careful. `string.contains` checks if the second string is a substring of the first. If `c` is a single character like "a", then `string.contains("abc..._", "a")` returns True. If `c` is "ab", it would also return True if "ab" is in the string. But since we're iterating over graphemes, `c` should always be a single grapheme. So this should be safe.
+
+Let me now write the full implementation.
+
+For `take_while`, I need a function that takes characters while a predicate is true:
+
+```gleam
+fn take_while(chars: List(String), pred: fn(String) -> Bool) -> #(String, List(String)) {
+  case chars {
+    [c, ..rest] if pred(c) -> {
+      let #(s, r) = take_while(rest, pred)
+      #(c <> s, r)
+    }
+    _ -> #("", chars)
+  }
+}
+```
+
+For `take_until`, take characters until a specific character:
+
+```gleam
+fn take_until(chars: List(String), delim: String) -> #(String, List(String)) {
+  case chars {
+    [c, ..rest] if c != delim -> {
+      let #(s, r) = take_until(rest, delim)
+      #(c <> s, r)
+    }
+    _ -> #("", chars)
+  }
+}
+```
+
+Now for the keywords:
+
+```gleam
+const keywords = [
+  "create", "table", "insert", "into", "values", "select", "from", "where",
+  "order", "by", "asc", "desc", "and", "or", "not", "null", "begin", "commit",
+  "inner", "join", "on", "int", "integer", "text", "primary", "key", "transaction",
+]
+
+fn is_keyword(s: String) -> Bool {
+  list.member(keywords, string.lowercase(s))
+}
+```
+
+Now let me write the parser. I'll use the token list threading approach.
+
+```gleam
+fn parse_primary(tokens: List(Token)) -> #(Expr, List(Token)) {
+  case tokens {
+    [Token(TkInt, text), ..rest] -> 
+      #(EInt(int.parse(text) |> result.unwrap(0)), rest)
+    [Token(TkString, text), ..rest] -> 
+      #(EStr(text), rest)
+    [Token(TkKw, text), ..rest] | [Token(TkId, text), ..rest] -> {
+      // Could be a column reference, possibly with dot notation
+      case rest {
+        [Token(TkDot, _), ..r2] -> {
+          case r2 {
+            [Token(kind2, text2), ..r3] if kind2 == TkId || kind2 == TkKw -> 
+              #(ECol(text <> "." <> text2), r3)
+            _ -> #(ECol(text), rest)
+          }
+        }
+        _ -> #(ECol(text), rest)
+      }
+    }
+    [Token(TkLp, _), ..rest] -> {
+      let #(e, r) = parse_expr(rest)
+      let r2 = skip_token(r, TkRp)
+      #(e, r2)
+    }
+    _ -> #(EInt(0), tokens)  // error case
+  }
+}
+```
+
+Wait, I need to handle the case where the column name is a keyword. In the C code, both TkId and TkKw are accepted as column names in parse_primary.
+
+Let me also handle the `NULL` keyword in parse_primary - actually, in the C code, NULL is only handled in parse_insert, not in parse_primary. In parse_primary, NULL would be treated as a column reference (since it's a TkKw). But in the executor, if the column isn't found, it returns V_NULL. So `NULL` as a column would evaluate to V_NULL if there's no column named "null".
+
+Actually wait, looking at the C code more carefully, `parse_primary` handles `TK_ID || TK_KW` as column references. So `NULL` in a WHERE clause would be treated as a column reference. That's a bit odd but matches the C behavior.
+
+Let me continue with the parser.
+
+For `parse_cmp`:
+
+```gleam
+fn parse_cmp(tokens: List(Token)) -> #(Expr, List(Token)) {
+  let #(l, rest) = parse_primary(tokens)
+  case rest {
+    [Token(TkOp, op), ..r] -> {
+      let #(r_expr, r2) = parse_primary(r)
+      #(EBinop(op, l, r_expr), r2)
+    }
+    _ -> #(l, rest)
+  }
+}
+```
+
+For `parse_expr`:
+
+```gleam
+fn parse_expr(tokens: List(Token)) -> #(Expr, List(Token)) {
+  let #(l, rest) = parse_cmp(tokens)
+  case rest {
+    [Token(TkKw, kw), ..r] if kw == "and" || kw == "AND" || kw == "or" || kw == "OR" -> {
+      let op = case string.lowercase(kw) {
+        "and" -> "AND"
+        _ -> "OR"
+      }
+      let #(r_expr, r2) = parse_expr(r)
+      #(EBinop(op, l, r_expr), r2)
+    }
+    _ -> #(l, rest)
+  }
+}
+```
+
+Wait, keywords are stored as-is from the source. The C code uses `strcasecmp` for comparison. So I need case-insensitive comparison. Let me use `string.lowercase` for comparison.
+
+Actually, looking at the lexer, keywords are detected with `is_kw_n` which uses `strncasecmp`. But the token text is the original text from the source. So "AND", "and", "And" would all be TkKw tokens with their original casing.
+
+In the parser, `p_peek_kw` uses `strcasecmp`, so it's case-insensitive. I need to do the same.
+
+Let me use a helper:
+
+```gleam
+fn eq_ci(a: String, b: String) -> Bool {
+  string.lowercase(a) == string.lowercase(b)
+}
+```
+
+Now for the statement parser. I need to parse CREATE, INSERT, SELECT, BEGIN, COMMIT.
+
+Let me write a function that parses one statement from a token list:
+
+```gleam
+fn parse_statement(tokens: List(Token)) -> #(ParsedStmt, List(Token)) {
+  case tokens {
+    [Token(TkKw, kw), ..rest] if eq_ci(kw, "begin") -> {
+      let r = skip_kw(rest, "transaction")
+      #(SBegin, r)
+    }
+    [Token(TkKw, kw), ..rest] if eq_ci(kw, "commit") -> {
+      let r = skip_kw(rest, "transaction")
+      #(SCommit, r)
+    }
+    [Token(TkKw, kw), ..rest] if eq_ci(kw, "create") -> {
+      let r = skip_kw(rest, "table")
+      parse_create(r)
+    }
+    [Token(TkKw, kw), ..rest] if eq_ci(kw, "insert") -> {
+      parse_insert(rest)
+    }
+    [Token(TkKw, kw), ..rest] if eq_ci(kw, "select") -> {
+      parse_select(rest)
+    }
+    _ -> #(SBegin, tokens)  // error
+  }
+}
+```
+
+Hmm, I need to handle errors. In the C code, parse returns -1 on error. In Gleam, I could use Result type. But to keep it simple, let me use a result type for the top-level parse.
+
+Actually, let me think about this differently. The C code's `sqlite3_exec` loops through statements, parsing each one. If parse fails, it sets an error and breaks.
+
+Let me use Result for parse:
+
+```gleam
+fn parse_statement(tokens: List(Token)) -> Result(#(ParsedStmt, List(Token)), String) {
+  ...
+}
+```
+
+But this adds complexity. Let me think about what's most concise while preserving behavior.
+
+Actually, for the demo to work, I just need to handle the valid SQL. Let me use Result for error handling but keep it simple.
+
+Let me now think about the overall structure. I'll have:
+
+1. Value type and operations
+2. Token types
+3. Lexer
+4. AST types
+5. Parser
+6. Database type
+7. Executor
+8. Public API functions
+9. Demo main
+
+Let me write it all now, trying to be as concise as possible.
+
+For the Database, I'll store tables as a dict from lowercase name to Table, and rows as a dict from lowercase name to List(List(Value)).
+
+```gleam
+pub type Database {
+  Database(
+    tables: dict.Dict(String, Table),  // key: lowercase name
+    errmsg: String,
+  )
+}
+
+pub type Table {
+  Table(name: String, cols: List(String))  // name: original case, cols: original case
+}
+```
+
+For column lookup, I'll use case-insensitive comparison.
+
+Let me now write the complete code.
+
+Actually, I realize I should think about how `exec` works with the callback. In Gleam, the callback would be a function that takes a list of strings (the text values of the row).
+
+```gleam
+pub fn exec(db: Database, sql: String, callback: fn(List(String)) -> Nil) -> Database
+```
+
+For SELECT statements, it creates a temporary statement, steps through all rows, and calls the callback for each. For other statements, it modifies the database.
+
+Let me also think about `prepare_v2`. In the C code, it parses one statement and creates a prepared statement. The prepared statement for SELECT holds materialized rows.
+
+In Gleam:
+
+```gleam
+pub fn prepare(db: Database, sql: String) -> Result(Statement, String)
+```
+
+The Statement holds the materialized rows for SELECT.
+
+For non-SELECT statements, `step` returns Done immediately (like the C code).
+
+Let me now write the full implementation. I'll be as concise as possible.
+
+Let me think about the nested loop join. The C code uses a nested loop over all tables. For each combination of rows, it checks WHERE and JOIN ON conditions. If both pass, it collects the combined row.
+
+In Gleam, I can use `list.fold` or recursive functions to generate the cross product and filter.
+
+Actually, the cleanest way in Gleam is to use a recursive function that generates all combinations:
+
+```gleam
+fn cross_product(tables: List(TableRef), db: Database) -> List(List(Value)) {
+  // For each table, get its rows
+  // Generate all combinations
+}
+```
+
+Let me think about this. For a single table, it's just the rows. For two tables, it's the cartesian product. For n tables, it's the n-fold cartesian product.
+
+```gleam
+fn nested_loop(table_refs: List(TableRef), db: Database) -> List(List(Value)) {
+  case table_refs {
+    [] -> [[]]  // one empty combination
+    [tr, ..rest] -> {
+      let rows = get_rows(db, tr.tname)
+      let rest_combos = nested_loop(rest, db)
+      list.flat_map(rows, fn(row) {
+        list.map(rest_combos, fn(combo) {
+          list.append(row, combo)
+        })
+      })
+    }
+  }
+}
+```
+
+Wait, but the order matters. The C code does nested loops with the first table as the outermost loop. So the order of rows in the result should be: for each row in table0, for each row in table1, ...
+
+The above code does: for each row in the first table, for each combo of the rest, append. This gives the correct order.
+
+But wait, I need to handle the case where a table doesn't exist. In the C code, if a table doesn't exist, `idx[i]` is -1 and `cur[i]` is NULL, which causes the loop to break (no rows). So if any table doesn't exist, the result is empty.
+
+Let me handle that:
+
+```gleam
+fn get_rows(db: Database, tname: String) -> List(List(Value)) {
+  case dict.get(db.tables, string.lowercase(tname)) {
+    Ok(table) -> table.rows  // or however I store rows
+    Error(_) -> []  // table doesn't exist, no rows
+  }
+}
+```
+
+Hmm, I need to store rows somewhere. Let me include rows in the Table type or in the Database.
+
+Let me restructure:
+
+```gleam
+pub type Table {
+  Table(name: String, cols: List(String), rows: List(List(Value)))
+}
+
+pub type Database {
+  Database(tables: List(Table), errmsg: String)
+}
+```
+
+Using a list of tables. For lookup, I'll search case-insensitively.
+
+Actually, using a dict is more efficient, but a list is simpler. For a demo, a list is fine.
+
+Let me use a list:
+
+```gleam
+pub type Database {
+  Database(tables: List(Table), errmsg: String)
+}
+
+pub type Table {
+  Table(name: String, cols: List(String), rows: List(List(Value)))
+}
+```
+
+For finding a table:
+
+```gleam
+fn find_table(db: Database, name: String) -> Result(Table, Nil) {
+  db.tables
+  |> list.find(fn(t) { eq_ci(t.name, name) })
+}
+```
+
+For adding a table:
+
+```gleam
+fn add_table(db: Database, name: String, cols: List(String)) -> Result(Database, String) {
+  case find_table(db, name) {
+    Ok(_) -> Error("table already exists: " <> name)
+    Error(_) -> {
+      let table = Table(name: name, cols: cols, rows: [])
+      Ok(Database(..db, tables: list.append(db.tables, [table])))
+    }
+  }
+}
+```
+
+For inserting a row:
+
+```gleam
+fn insert_row(db: Database, table_name: String, vals: List(Value)) -> Result(Database, String) {
+  case find_table(db, table_name) {
+    Error(_) -> Error("no such table: " <> table_name)
+    Ok(table) -> {
+      let new_table = Table(..table, rows: list.append(table.rows, [vals]))
+      let new_tables = list.map(db.tables, fn(t) {
+        case eq_ci(t.name, table_name) {
+          True -> new_table
+          False -> t
+        }
+      })
+      Ok(Database(..db, tables: new_tables))
+    }
+  }
+}
+```
+
+Now for the executor. I need to:
+1. Generate all row combinations (nested loop)
+2. Filter by WHERE and JOIN ON
+3. Sort by ORDER BY
+4. Project columns
+
+For the RowCtx, I need to map column names to values in the combined row. The combined row is table0.cols ++ table1.cols ++ ...
+
+I need to know the column offsets for each table. Let me compute them:
+
+```gleam
+fn compute_offsets(tables: List(Table)) -> List(Int) {
+  // Returns the starting offset for each table's columns in the combined row
+  tables
+  |> list.scan(0, fn(acc, t) { acc + list.length(t.cols) })
+  // Wait, scan gives the accumulated values, but I need the starting offsets
+}
+```
+
+Actually, let me compute offsets differently:
+
+```gleam
+fn compute_offsets(tables: List(Table)) -> List(Int) {
+  tables
+  |> list.index_fold([], fn(acc, t, i) {
+    let offset = case i {
+      0 -> 0
+      _ -> {
+        let prev_tables = list.take(tables, i)
+        prev_tables |> list.map(fn(t) { list.length(t.cols) }) |> int.sum
+      }
+    }
+    [offset, ..acc]
+  })
+  |> list.reverse
+}
+```
+
+Hmm, this is getting complex. Let me use a simpler approach.
+
+Actually, for the executor, I need to evaluate expressions against a combined row. The expression can reference columns by name (possibly qualified with table name/alias).
+
+Let me create a context that maps column references to values:
+
+```gleam
+type RowCtx {
+  RowCtx(refs: List(TableRef), tables: List(Table), row: List(Value))
+}
+```
+
+To find a column in the context:
+
+```gleam
+fn ctx_colindex(ctx: RowCtx, col: String) -> Option(Int) {
+  // Check if col contains a dot
+  case string.split(col, ".") {
+    [tname, cname] -> {
+      // Qualified: find table by alias or name, then find column
+      ctx.refs
+      |> list.index_find(fn(ref) {
+        let tn = case ref.alias {
+          Some(a) -> a
+          None -> ref.tname
+        }
+        eq_ci(tn, tname)
+      })
+      |> result.try(fn(idx) {
+        let table = list.at(ctx.tables, idx) |> result.unwrap(Table("", [], []))
+        table.cols
+        |> list.index_find(fn(c) { eq_ci(c, cname) })
+        |> result.map(fn(ci) {
+          // Compute offset
+          let offsets = compute_offsets(ctx.tables)
+          let offset = list.at(offsets, idx) |> result.unwrap(0)
+          offset + ci
+        })
+      })
+      |> result.to_option
+    }
+    _ -> {
+      // Unqualified: search all tables
+      // ...
+    }
+  }
+}
+```
+
+This is getting verbose. Let me think of a more concise approach.
+
+Actually, let me precompute a mapping from column name to index in the combined row. This would be a dict from lowercase "table.col" or "col" to index.
+
+```gleam
+fn build_col_map(refs: List(TableRef), tables: List(Table)) -> dict.Dict(String, Int) {
+  // For each table, for each column, add entries
+  // "table.col" -> offset + ci
+  // "col" -> offset + ci (first match wins)
+  // "alias.col" -> offset + ci
+}
+```
+
+This would make expression evaluation simpler. Let me build this map.
+
+Actually, let me take a step back and think about the most concise way to implement this in Gleam.
+
+I think the key insight is that for the executor, I need to:
+1. Get all table refs and their corresponding Table objects
+2. For each combination of rows (nested loop), create a combined row
+3. Evaluate WHERE and JOIN ON against the combined row
+4. If both pass, project the result columns
+5. Sort by ORDER BY
+
+For expression evaluation, I need to resolve column references. Let me build a lookup function that takes the refs, tables, and combined row, and resolves a column name to a value.
+
+Let me try a more direct approach:
+
+```gleam
+fn resolve_col(refs: List(TableRef), tables: List(Table), row: List(Value), col: String) -> Value {
+  // Parse col into optional table prefix and column name
+  let parts = string.split(col, ".")
+  case parts {
+    [tname, cname] -> {
+      // Find table by alias or name
+      find_qualified(refs, tables, row, tname, cname)
+    }
+    [cname] -> {
+      // Search all tables
+      find_unqualified(refs, tables, row, cname)
+    }
+    _ -> VNull
+  }
+}
+```
+
+For `find_qualified`:
+
+```gleam
+fn find_qualified(refs, tables, row, tname, cname) -> Value {
+  // Iterate through refs and tables in parallel
+  // Find the one where alias or tname matches tname
+  // Then find the column index in that table
+  // Compute the offset and return the value
+  do_find_qualified(refs, tables, row, tname, cname, 0)
+}
+
+fn do_find_qualified(refs, tables, row, tname, cname, offset) -> Value {
+  case refs, tables {
+    [ref, ..r_rest], [table, ..t_rest] -> {
+      let tn = case ref.alias { Some(a) -> a; None -> ref.tname }
+      case eq_ci(tn, tname) {
+        True -> {
+          case find_col_index(table.cols, cname) {
+            Some(ci) -> list.at(row, offset + ci) |> result.unwrap(VNull)
+            None -> do_find_qualified(r_rest, t_rest, row, tname, cname, offset + list.length(table.cols))
+          }
+        }
+        False -> do_find_qualified(r_rest, t_rest, row, tname, cname, offset + list.length(table.cols))
+      }
+    }
+    _, _ -> VNull
+  }
+}
+```
+
+Similarly for `find_unqualified`:
+
+```gleam
+fn do_find_unqualified(refs, tables, row, cname, offset) -> Value {
+  case refs, tables {
+    [ref, ..r_rest], [table, ..t_rest] -> {
+      case find_col_index(table.cols, cname) {
+        Some(ci) -> list.at(row, offset + ci) |> result.unwrap(VNull)
+        None -> do_find_unqualified(r_rest, t_rest, row, cname, offset + list.length(table.cols))
+      }
+    }
+    _, _ -> VNull
+  }
+}
+```
+
+Wait, but `refs` and `tables` should always have the same length. Let me just use `list.zip` or iterate in parallel.
+
+Actually, in Gleam, I can pattern match on two lists simultaneously:
+
+```gleam
+fn do_find_qualified(refs: List(TableRef), tables: List(Table), row: List(Value), tname: String, cname: String, offset: Int) -> Value {
+  case refs, tables {
+    [ref, ..r_rest], [table, ..t_rest] -> {
+      let tn = option.unwrap(ref.alias, ref.tname)
+      case eq_ci(tn, tname) {
+        True -> {
+          case find_col_index(table.cols, cname) {
+            Some(ci) -> list.at(row, offset + ci) |> result.unwrap(VNull)
+            None -> do_find_qualified(r_rest, t_rest, row, tname, cname, offset + list.length(table.cols))
+          }
+        }
+        False -> do_find_qualified(r_rest, t_rest, row, tname, cname, offset + list.length(table.cols))
+      }
+    }
+    _, _ -> VNull
+  }
+}
+```
+
+Hmm, can Gleam pattern match on two lists in one case? Let me check... Yes, Gleam supports multiple subjects in case expressions:
+
+```gleam
+case refs, tables {
+  [ref, ..r_rest], [table, ..t_rest] -> ...
+  _, _ -> VNull
+}
+```
+
+Great.
+
+Now for expression evaluation:
+
+```gleam
+fn eval_expr(e: Expr, refs: List(TableRef), tables: List(Table), row: List(Value)) -> Value {
+  case e {
+    EInt(v) -> VInt(v)
+    EStr(v) -> VText(v)
+    ECol(col) -> resolve_col(refs, tables, row, col)
+    EBinop(op, l, r) -> {
+      let a = eval_expr(l, refs, tables, row)
+      let b = eval_expr(r, refs, tables, row)
+      case string.uppercase(op) {
+        "AND" -> VInt(bool_to_int(v_truthy(a) && v_truthy(b)))
+        "OR" -> VInt(bool_to_int(v_truthy(a) || v_truthy(b)))
+        _ -> {
+          let cmp = v_cmp(a, b)
+          VInt(case op {
+            "=" -> bool_to_int(cmp == 0)
+            "<>" -> bool_to_int(cmp != 0)
+            "<" -> bool_to_int(cmp < 0)
+            ">" -> bool_to_int(cmp > 0)
+            "<=" -> bool_to_int(cmp <= 0)
+            ">=" -> bool_to_int(cmp >= 0)
+            _ -> 0
+          })
+        }
+      }
+    }
+  }
+}
+```
+
+Now for the nested loop. Let me generate all row combinations:
+
+```gleam
+fn nested_loop(refs: List(TableRef), tables: List(Table)) -> List(List(Value)) {
+  case refs, tables {
+    [], [] -> [[]]
+    [ref, ..r_rest], [table, ..t_rest] -> {
+      let rest_combos = nested_loop(r_rest, t_rest)
+      list.flat_map(table.rows, fn(row) {
+        list.map(rest_combos, fn(combo) {
+          list.append(row, combo)
+        })
+      })
+    }
+    _, _ -> []
+  }
+}
+```
+
+Wait, but the order matters. The C code has the first table as the outermost loop. In my code, I'm iterating over the first table's rows and for each, iterating over the rest. This gives the correct order: first table rows are the outer loop.
+
+But actually, `list.flat_map(table.rows, ...)` iterates over table.rows in order, and for each row, generates all combinations with the rest. This is correct.
+
+Now for the full SELECT execution:
+
+```gleam
+fn exec_select(db: Database, stmt: ParsedStmt) -> List(List(Value)) {
+  // Get table refs and corresponding Table objects
+  let tables = list.map(stmt.tables, fn(ref) {
+    find_table(db, ref.tname) |> result.unwrap(Table("", [], []))
+  })
+  
+  // Generate all row combinations
+  let all_combos = nested_loop(stmt.tables, tables)
+  
+  // Filter by WHERE and JOIN ON
+  let filtered = list.filter(all_combos, fn(row) {
+    let where_match = case stmt.where {
+      Some(e) -> v_truthy(eval_expr(e, stmt.tables, tables, row))
+      None -> True
+    }
+    let join_match = case stmt.join_on {
+      Some(e) -> v_truthy(eval_expr(e, stmt.tables, tables, row))
+      None -> True
+    }
+    where_match && join_match
+  })
+  
+  // Sort by ORDER BY
+  let sorted = case stmt.order_col {
+    Some(col) -> sort_rows(filtered, tables, stmt.tables, col, stmt.order_desc)
+    None -> filtered
+  }
+  
+  // Project columns
+  list.map(sorted, fn(row) {
+    project(stmt, tables, row)
+  })
+}
+```
+
+For sorting, I need to find the order column in the combined row and sort by it. The C code only handles single-table ORDER BY (for joins, it gives up if the column isn't found in the first table).
+
+```gleam
+fn sort_rows(rows: List(List(Value)), tables: List(Table), refs: List(TableRef), col: String, desc: Bool) -> List(List(Value)) {
+  // Find the column index
+  // For single table, find in that table
+  // For multiple tables, the C code only handles single table
+  let col_idx = case tables {
+    [table] -> find_col_index(table.cols, col)
+    _ -> None
+  }
+  case col_idx {
+    Some(ci) -> {
+      list.sort(rows, fn(a, b) {
+        let va = list.at(a, ci) |> result.unwrap(VNull)
+        let vb = list.at(b, ci) |> result.unwrap(VNull)
+        let cmp = v_cmp(va, vb)
+        case desc {
+          True -> -cmp
+          False -> cmp
+        }
+      })
+    }
+    None -> rows  // no sort
+  }
+}
+```
+
+Wait, `list.sort` in Gleam takes a comparison function that returns `Order` (Lt, Eq, Gt), not an Int. Let me check...
+
+Actually, in Gleam, `list.sort` takes a `fn(a, b) -> Order` where `Order` is `Lt | Eq | Gt`. Let me use that:
+
+```gleam
+list.sort(rows, fn(a, b) {
+  let va = list.at(a, ci) |> result.unwrap(VNull)
+  let vb = list.at(b, ci) |> result.unwrap(VNull)
+  let cmp = v_cmp(va, vb)
+  case desc {
+    True -> case cmp { 
+      n if n < 0 -> Gt 
+      n if n > 0 -> Lt 
+      _ -> Eq 
+    }
+    False -> case cmp { 
+      n if n < 0 -> Lt 
+      n if n > 0 -> Gt 
+      _ -> Eq 
+    }
+  }
+})
+```
+
+Hmm, this is getting verbose. Let me write a helper:
+
+```gleam
+fn int_to_order(n: Int) -> Order {
+  case n {
+    n if n < 0 -> Lt
+    n if n > 0 -> Gt
+    _ -> Eq
+  }
+}
+```
+
+Then:
+
+```gleam
+list.sort(rows, fn(a, b) {
+  let cmp = v_cmp(list.at(a, ci) |> result.unwrap(VNull), list.at(b, ci) |> result.unwrap(VNull))
+  case desc {
+    True -> int_to_order(-cmp)
+    False -> int_to_order(cmp)
+  }
+})
+```
+
+Wait, but Gleam's `list.sort` might not be stable. The C code uses insertion sort which is stable. But for the demo, it should be fine.
+
+Actually, looking at the Gleam stdlib, `list.sort` uses merge sort which is stable. Good.
+
+Now for projection:
+
+```gleam
+fn project(stmt: ParsedStmt, tables: List(Table), row: List(Value)) -> List(Value) {
+  case stmt.star {
+    True -> {
+      // SELECT * - all columns from all tables
+      let offsets = compute_offsets(tables)
+      // For each table, get its columns
+      list.index_fold(tables, [], fn(acc, table, i) {
+        let offset = list.at(offsets, i) |> result.unwrap(0)
+        let cols = list.map(list.range(0, list.length(table.cols) - 1), fn(j) {
+          list.at(row, offset + j) |> result.unwrap(VNull)
+        })
+        list.append(acc, cols)
+      })
+    }
+    False -> {
+      // Specific columns
+      list.flat_map(stmt.cols, fn(rc) {
+        case rc.star {
+          True -> {
+            // table.* - all columns from all tables
+            let offsets = compute_offsets(tables)
+            list.index_fold(tables, [], fn(acc, table, i) {
+              let offset = list.at(offsets, i) |> result.unwrap(0)
+              let cols = list.map(list.range(0, list.length(table.cols) - 1), fn(j) {
+                list.at(row, offset + j) |> result.unwrap(VNull)
+              })
+              list.append(acc, cols)
+            })
+          }
+          False -> {
+            case rc.col {
+              Some(col) -> [resolve_col(stmt.tables, tables, row, col)]
+              None -> []
+            }
+          }
+        }
+      })
+    }
+  }
+}
+```
+
+Hmm, this is getting long. Let me think about how to make it more concise.
+
+Actually, for `compute_offsets`, I can compute it more simply:
+
+```gleam
+fn compute_offsets(tables: List(Table)) -> List(Int) {
+  tables
+  |> list.scan(0, fn(acc, t) { acc })  // This gives the offset before each table
+  // Wait, scan gives [0, len(t0), len(t0)+len(t1), ...]
+  // Actually, I need to think about what scan does
+}
+```
+
+Hmm, `list.scan` in Gleam... let me check. Actually, I'm not sure about the exact semantics. Let me just write a recursive function:
+
+```gleam
+fn compute_offsets(tables: List(Table), acc: Int) -> List(Int) {
+  case tables {
+    [] -> []
+    [table, ..rest] -> [acc, ..compute_offsets(rest, acc + list.length(table.cols))]
+  }
+}
+```
+
+This gives the starting offset for each table. Good.
+
+Now let me think about the overall structure and try to write the complete code.
+
+Actually, let me reconsider the design. I want to be concise. Let me see if I can merge some layers.
+
+For the lexer, I'll produce a list of tokens.
+For the parser, I'll thread tokens through.
+For the executor, I'll work with the parsed AST and database.
+
+Let me also think about the public API. The requirement says:
+- open, exec (with callback), prepare_v2, step, finalize, close, column_count, column_text, column_int64, errmsg
+
+In Gleam, these would be functions in a module. Let me name the module `sqlite3` (or `sqlite_core`).
+
+For `exec` with callback, the callback receives the row values as strings.
+
+For `prepare_v2`, it returns a Statement.
+
+For `step`, it returns a result indicating Row or Done, and updates the statement.
+
+Since Gleam is immutable, `step` needs to return the updated statement. Let me use:
+
+```gleam
+pub type StepResult {
+  StepRow
+  StepDone
+}
+
+pub fn step(stmt: Statement) -> #(Statement, StepResult)
+```
+
+And `column_text`, `column_int64` read from the current row in the statement.
+
+Let me now write the complete code. I'll aim for conciseness while preserving all behavior.
+
+Let me also think about the `exec` function. It needs to:
+1. Lex the SQL
+2. Parse statements one by one
+3. For each statement:
+   - CREATE TABLE: add table to db
+   - INSERT: add row to db
+   - SELECT: execute and call callback for each row
+   - BEGIN/COMMIT: no-op (just track transaction state)
+4. Return the updated db
+
+Since Gleam is immutable, I need to thread the db through. Let me use a fold-like approach:
+
+```gleam
+pub fn exec(db: Database, sql: String, callback: fn(List(String)) -> Nil) -> Database {
+  let tokens = lex(sql)
+  exec_tokens(db, tokens, callback)
+}
+
+fn exec_tokens(db: Database, tokens: List(Token), callback: fn(List(String)) -> Nil) -> Database {
+  case parse_statement(tokens) {
+    Ok(#(stmt, rest)) -> {
+      let new_db = case stmt {
+        SCreate(name, cols) -> {
+          case add_table(db, name, cols) {
+            Ok(d) -> d
+            Error(e) -> Database(..db, errmsg: e)
+          }
+        }
+        SInsert(table, vals) -> {
+          case insert_row(db, table, vals) {
+            Ok(d) -> d
+            Error(e) -> Database(..db, errmsg: e)
+          }
+        }
+        SSelect(..) -> {
+          let rows = exec_select(db, stmt)
+          list.each(rows, fn(row) {
+            callback(list.map(row, v_to_text))
+          })
+          db  // SELECT doesn't modify db
+        }
+        SBegin -> db
+        SCommit -> db
+      }
+      // Check if there are more statements
+      case rest {
+        [Token(TkEof, _)] -> new_db
+        [Token(TkSemi, _), ..r] -> exec_tokens(new_db, r, callback)
+        _ -> exec_tokens(new_db, rest, callback)
+      }
+    }
+    Error(e) -> Database(..db, errmsg: e)
+  }
+}
+```
+
+Hmm, I need to handle the semicolon properly. In the C code, `p_accept(P, TK_SEMI, NULL)` consumes a semicolon after each statement. Then the loop checks for EOF.
+
+Let me adjust:
+
+```gleam
+fn exec_tokens(db: Database, tokens: List(Token), callback: fn(List(String)) -> Nil) -> Database {
+  case tokens {
+    [Token(TkEof, _)] -> db
+    _ -> {
+      case parse_statement(tokens) {
+        Ok(#(stmt, rest)) -> {
+          let new_db = execute_stmt(db, stmt, callback)
+          // Skip semicolon
+          let rest2 = case rest {
+            [Token(TkSemi, _), ..r] -> r
+            _ -> rest
+          }
+          exec_tokens(new_db, rest2, callback)
+        }
+        Error(e) -> Database(..db, errmsg: e)
+      }
+    }
+  }
+}
+```
+
+Now let me think about the Statement type for prepared statements:
+
+```gleam
+pub type Statement {
+  Statement(
+    rows: List(List(Value)),  // materialized result rows (for SELECT)
+    current: List(Value),     // current row
+    nout: Int,                // number of output columns
+  )
+}
+```
+
+For `prepare`:
+
+```gleam
+pub fn prepare(db: Database, sql: String) -> Result(Statement, String) {
+  let tokens = lex(sql)
+  case parse_statement(tokens) {
+    Ok(#(stmt, _)) -> {
+      case stmt {
+        SSelect(..) -> {
+          let rows = exec_select(db, stmt)
+          Ok(Statement(rows: rows, current: [], nout: ...))
+        }
+        _ -> Ok(Statement(rows: [], current: [], nout: 0))
+      }
+    }
+    Error(e) -> Error(e)
+  }
+}
+```
+
+Wait, I need to compute nout. For SELECT *, nout is the total number of columns. For specific columns, it's the number of projected columns.
+
+Let me compute nout during projection. Actually, since all rows have the same number of columns, I can compute it from the first row.
+
+For `step`:
+
+```gleam
+pub fn step(stmt: Statement) -> #(Statement, StepResult) {
+  case stmt.rows {
+    [row, ..rest] -> #(Statement(rows: rest, current: row, nout: list.length(row)), StepRow)
+    [] -> #(stmt, StepDone)
+  }
+}
+```
+
+For `column_count`:
+
+```gleam
+pub fn column_count(stmt: Statement) -> Int {
+  stmt.nout
+}
+```
+
+For `column_text`:
+
+```gleam
+pub fn column_text(stmt: Statement, i: Int) -> String {
+  case list.at(stmt.current, i) {
+    Ok(v) -> v_to_text(v)
+    Error(_) -> ""
+  }
+}
+```
+
+For `column_int64`:
+
+```gleam
+pub fn column_int64(stmt: Statement, i: Int) -> Int {
+  case list.at(stmt.current, i) {
+    Ok(VInt(v)) -> v
+    _ -> 0
+  }
+}
+```
+
+Now let me think about the demo. The C demo:
+
+```c
+sqlite3 *db; sqlite3_open(":memory:",&db);
+char *err=NULL;
+const char *sql =
+    "CREATE TABLE users (id INTEGER, name TEXT);"
+    "INSERT INTO users VALUES (1, 'ada');"
+    "INSERT INTO users VALUES (2, 'grace');"
+    "INSERT INTO users VALUES (3, 'linus');"
+    "SELECT * FROM users WHERE id > 1 ORDER BY id DESC;";
+if (sqlite3_exec(db, sql, print_row, NULL, &err)){ fprintf(stderr,"err: %s\n", err?err:"?"); free(err); }
+sqlite3_close(db);
+```
+
+The print_row callback prints values separated by " | ".
+
+In Gleam:
+
+```gleam
+pub fn main() {
+  let db = open()
+  let sql = "CREATE TABLE users (id INTEGER, name TEXT);
+    INSERT INTO users VALUES (1, 'ada');
+    INSERT INTO users VALUES (2, 'grace');
+    INSERT INTO users VALUES (3, 'linus');
+    SELECT * FROM users WHERE id > 1 ORDER BY id DESC;"
+  let db = exec(db, sql, fn(row) {
+    io.println(string.join(row, " | "))
+  })
+  close(db)
+}
+```
+
+Wait, but `exec` returns the updated db. And if there's an error, I should print it. Let me check the errmsg.
+
+Actually, in the C code, `sqlite3_exec` returns non-zero on error, and `err` is set. In my Gleam version, `exec` returns the updated db, and I can check `errmsg(db)`.
+
+Let me add error checking:
+
+```gleam
+pub fn main() {
+  let db = open()
+  let sql = "..."
+  let db = exec(db, sql, fn(row) {
+    io.println(string.join(row, " | "))
+  })
+  let msg = errmsg(db)
+  case msg {
+    "" -> Nil
+    _ -> io.println("err: " <> msg)
+  }
+  close(db)
+}
+```
+
+Hmm, but `errmsg` returns the last error message. If there's no error, it should be empty. Let me make sure the initial errmsg is "".
+
+Now let me put it all together. I need to be careful about the Gleam syntax and make sure everything compiles.
+
+Let me also think about what imports I need:
+- `gleam/io` for printing
+- `gleam/int` for int operations
+- `gleam/list` for list operations
+- `gleam/string` for string operations
+- `gleam/dict` for dict (if I use it)
+- `gleam/result` for result operations
+- `gleam/option` for Option type
+- `gleam/order` for Order type (used in sorting)
+
+Actually, in Gleam, `Option` is built-in as `Option(a)` with `Some(a)` and `None`. And `Result` is built-in as `Result(a, b)` with `Ok(a)` and `Error(b)`.
+
+Let me also check: does Gleam have `list.index_find`? Let me check the stdlib... I think it's `list.find` with index, or I might need to use `list.index_map` and filter.
+
+Actually, looking at the Gleam stdlib, there's `list.find` which returns `Result(a, Nil)`, and `list.find_map` which applies a function and finds the first Some. There might not be an `index_find` directly. Let me implement it if needed.
+
+Actually, for my use case, I don't need the index - I need the offset. Let me just use recursive functions.
+
+Let me also think about `list.at`. In Gleam, it returns `Result(a, Nil)`. I can use `result.unwrap` to get a default.
+
+Wait, does `result.unwrap` exist in Gleam? Let me check... I think it's `result.unwrap(result, default)`.
+
+Actually, looking at the Gleam stdlib, `result.unwrap` takes the result and a default. But I'm not sure of the exact signature. Let me use pattern matching instead to be safe.
+
+Actually, let me just use `result.unwrap` - it should be `result.unwrap(r, default)`.
+
+Hmm, let me also check if `int.sum` exists. I think it's `int.sum(list)`.
+
+Let me also think about `string.to_graphemes`. I think it exists in the Gleam stdlib.
+
+OK, let me now write the complete code. I'll try to be as concise as possible while being correct.
+
+One more thing: the C code uses `strcasecmp` for case-insensitive comparison. In Gleam, I'll use `string.lowercase(a) == string.lowercase(b)`.
+
+Let me also think about the `v_cmp` function:
+
+```gleam
+fn v_cmp(a: Value, b: Value) -> Int {
+  case a, b {
+    VNull, VNull -> 0
+    VInt(x), VInt(y) -> case x < y { True -> -1; False -> case x > y { True -> 1; False -> 0 } }
+    VText(x), VText(y) -> string.compare(x, y) |> order_to_int
+    VNull, _ -> -1  // V_NULL=0, V_INT=1, V_TEXT=2, so 0-1=-1 or 0-2=-2
+    _, VNull -> 1
+    VInt(_), VText(_) -> -1  // 1-2=-1
+    VText(_), VInt(_) -> 1   // 2-1=1
+  }
+}
+```
+
+Wait, the C code does `(int)a->
