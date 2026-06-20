@@ -18,3 +18,4 @@ Reduction >1 means the port is smaller than the C reference by token count.
 | 11 | Odin | 15 | n/a | 136/8805 | Port is severely incomplete: only two small cleanup procedures shown ( ⚠️ capped/incomplete |
 | 12 | Gleam | 12 | n/a | 180/8805 | The port shows only a single utility function (v_cmp) with no database ⚠️ capped/incomplete |
 | 13 | Vim9 script | 8 | n/a | 132/8805 | Port is essentially a stub demo that calls nonexistent Sqlite3 class m ⚠️ capped/incomplete |
+| 14 | Erlang | 8 | n/a | 167/8805 | The Erlang port provides only a single `project/6` function for column ⚠️ capped/incomplete |

@@ -3,3 +3,12 @@
 [2026-06-20T17:46:22Z]       porter length-capped (16000 tok); retry high effort
 [2026-06-20T17:49:20Z]       porter done: 923 bytes, 167 tokens, 378.8s
 [2026-06-20T17:49:23Z]       judge: completeness=8 notes=The Erlang port provides only a single `project/6` function for column projectio
+[main de9bb29] port: erlang (Erlang) completeness=8
+ 8 files changed, 1523 insertions(+)
+ create mode 100644 runs/erlang/judge_raw.txt
+ create mode 100644 runs/erlang/meta.json
+ create mode 100644 runs/erlang/porter_raw.txt
+ create mode 100644 runs/erlang/sqlite_core.erl
+To https://github.com/altdansalt/essence.git
+   162b8f5..de9bb29  main -> main
+[2026-06-20T17:49:24Z] loop done: 1 runs
