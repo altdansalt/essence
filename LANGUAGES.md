@@ -13,6 +13,7 @@ Reduction >1 means the port is smaller than the C reference by token count.
 | 6 | C# | 72 | 1.27x | 6931/8805 | Port captures most API surface (sqlite3_open/close/exec/prepare_v2/ste |
 | 7 | Haxe | 72 | 1.23x | 7182/8805 | Port captures core lexer, parser, and executor structure with correct  |
 | 8 | Nostos | 42 | 1.35x | 6506/8805 | The port captures core architectural elements (lexer, parser, AST, sch |
-| 9 | F# | 32 | 1.4x | 6298/8805 | The F# port has significant structural issues: Parser class lacks prop |
-| 10 | Odin | 15 | n/a | 136/8805 | Port is severely incomplete: only two small cleanup procedures shown ( ⚠️ capped/incomplete |
-| 11 | Vim9 script | 8 | n/a | 132/8805 | Port is essentially a stub demo that calls nonexistent Sqlite3 class m ⚠️ capped/incomplete |
+| 9 | Scala | 42 | 1.3x | 6752/8805 | The Scala port captures core SQL parsing and execution logic but has s |
+| 10 | F# | 32 | 1.4x | 6298/8805 | The F# port has significant structural issues: Parser class lacks prop |
+| 11 | Odin | 15 | n/a | 136/8805 | Port is severely incomplete: only two small cleanup procedures shown ( ⚠️ capped/incomplete |
+| 12 | Vim9 script | 8 | n/a | 132/8805 | Port is essentially a stub demo that calls nonexistent Sqlite3 class m ⚠️ capped/incomplete |

@@ -2,3 +2,12 @@
 [2026-06-20T17:43:02Z]   >>> porting scala (Scala)
 [2026-06-20T17:44:27Z]       porter done: 23367 bytes, 6752 tokens, 85.3s
 [2026-06-20T17:44:30Z]       judge: completeness=42 notes=The Scala port captures core SQL parsing and execution logic but has significant
+[main 72b1888] port: scala (Scala) completeness=42
+ 8 files changed, 1319 insertions(+)
+ create mode 100644 runs/scala/judge_raw.txt
+ create mode 100644 runs/scala/meta.json
+ create mode 100644 runs/scala/porter_raw.txt
+ create mode 100644 runs/scala/sqlite_core.scala
+To https://github.com/altdansalt/essence.git
+   0b17a5c..72b1888  main -> main
+[2026-06-20T17:44:31Z] loop done: 1 runs
