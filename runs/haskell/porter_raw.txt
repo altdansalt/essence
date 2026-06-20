@@ -1,0 +1,1485 @@
+Let me port the C SQLite-style engine to Haskell faithfully.
+
+I need to implement:
+- Value type (NULL/INT/TEXT)
+- Lexer
+- Parser (recursive descent)
+- Executor (nested-loop joins, WHERE, ORDER BY, projections)
+- In-memory table store
+- Public API: open, exec, prepare, step, finalize, close, column_count, column_text, column_int64, errmsg
+- Demo main
+
+Let me design this in Haskell using IORef for mutable state (the database needs to be mutable).
+
+Let me structure:
+
+```haskell
+module Sqlite3 where
+
+import Data.IORef
+import Data.Char
+import Data.List
+import Data.Maybe
+import System.IO
+import Text.Printf
+```
+
+Value type:
+```haskell
+data Value = VNull | VInt Integer | VText String
+```
+
+Comparison: type ordering first (V_NULL < V_INT < V_TEXT), then value.
+
+Let me write the whole thing.
+
+For the database, I'll use IORef-based mutable state.
+
+```haskell
+data Table = Table { tName :: String, tCols :: [String] }
+data Row = Row [Value]
+data RowStore = RowStore [Row]  -- list of rows
+data DB = DB { dbTables :: [(Table, RowStore)], dbErrmsg :: String, dbInTxn :: Bool }
+```
+
+Actually, let me use IORef for the DB state.
+
+Let me think about the API. In Haskell, I'll create a module with functions that work on IORef DB.
+
+Let me write it:
+
+```haskell
+data Sqlite3 = Sqlite3 (IORef DBState)
+data Sqlite3Stmt = Sqlite3Stmt Sqlite3 Stmt (IORef StmtState)
+```
+
+Let me think about what StmtState needs for SELECT execution:
+- materialized sorted rows
+- current index
+- output row
+
+Let me write the full code now.
+
+For the lexer, I'll produce a list of tokens.
+
+```haskell
+data TokKind = TKEOF | TKId | TKInt | TKString | TKKW | TKPunct | TKStar | TKComma | TKLP | TKRP | TKSemi | TKOp | TKDot
+data Token = Token TokKind String
+```
+
+Keywords list.
+
+For parsing, I'll use a simple state monad or just pass around the token list with an index.
+
+Let me use a simple approach with a Parser state:
+
+```haskell
+data Parser = Parser [Token] Int
+```
+
+Actually, let me just use a list-based parser with pattern matching, consuming tokens.
+
+Let me use a simpler approach: parse functions take `[Token]` and return `(Maybe a, [Token])`.
+
+Actually, for faithfulness, let me use an IORef-based index or just use the list directly.
+
+Let me use a state-passing approach where the parser state is `[Token]` (remaining tokens).
+
+```haskell
+type PState = [Token]
+```
+
+Parser functions: `PState -> (Maybe a, PState)`
+
+Let me write the AST:
+
+```haskell
+data Expr = ECol String | EInt Integer | EStr String | EBinOp String Expr Expr
+data ResultCol = ResultCol (Maybe String) Bool  -- col name, isStar
+data TableRef = TableRef String (Maybe String)  -- tname, alias
+data Stmt = Stmt
+  { isCreate :: Bool, isInsert :: Bool, isSelect :: Bool, isBegin :: Bool, isCommit :: Bool
+  , ctName :: Maybe String, ctCols :: [String]
+  , insTable :: Maybe String, insVals :: [Value]
+  , selCols :: [ResultCol], selStar :: Bool
+  , selTables :: [TableRef]
+  , selWhere :: Maybe Expr
+  , selOrderCol :: Maybe String, selOrderDesc :: Bool
+  , selJoinOn :: Maybe Expr
+  }
+```
+
+Let me write everything now. I'll be concise but complete.
+
+For exec with callback, the callback in C is `void (*cb)(void*,int,char**,char**)`. In Haskell, I'll make it `Maybe (Int -> [String] -> IO ())`.
+
+Let me write the full code:
+
+```haskell
+module Sqlite3 (..) where
+
+import Data.IORef
+import Data.Char
+import Data.List
+import Data.Maybe
+import System.IO
+import Numeric
+
+-- Value
+data Value = VNull | VInt Integer | VText String
+
+vCmp :: Value -> Value -> Ordering
+vCmp VNull VNull = EQ
+vCmp VNull _ = LT
+vCmp _ VNull = GT
+vCmp (VInt a) (VInt b) = compare a b
+vCmp (VText a) (VText b) = compare a b
+vCmp (VInt _) (VText _) = LT
+vCmp (VText _) (VInt _) = GT
+
+-- Actually, the C code compares by type enum: V_NULL=0, V_INT=1, V_TEXT=2
+-- So V_NULL < V_INT < V_TEXT
+vCmp a b = case (a, b) of
+  (VNull, VNull) -> EQ
+  (VNull, _) -> LT
+  (_, VNull) -> GT
+  (VInt x, VInt y) -> compare x y
+  (VText x, VText y) -> compare x y
+  (VInt _, VText _) -> LT
+  (VText _, VInt _) -> GT
+
+vTruthy :: Value -> Bool
+vTruthy v = vCmp v (VInt 0) /= EQ
+
+vToText :: Value -> String
+vToText (VInt i) = show i
+vToText (VText s) = s
+vToText VNull = "NULL"
+```
+
+Now the lexer:
+
+```haskell
+keywords :: [String]
+keywords = ["create","table","insert","into","values","select","from","where",
+            "order","by","asc","desc","and","or","not","null","begin","commit",
+            "inner","join","on","int","integer","text","primary","key","transaction"]
+
+isKW :: String -> Bool
+isKW s = s `elem` keywords
+
+data TokKind = TKEOF | TKId | TKInt | TKString | TKKW | TKPunct | TKStar | TKComma | TKLP | TKRP | TKSemi | TKOp | TKDot
+data Token = Token TokKind String
+
+lexSql :: String -> [Token]
+lexSql s = go s
+  where
+    go [] = [Token TKEOF ""]
+    go (c:cs)
+      | isSpace c = go cs
+      -- comment
+      | c == '-' && head' cs == Just '-' = go $ dropWhile (/= '\n') (c:cs)
+      | isAlpha c || c == '_' = 
+          let (ident, rest) = span (\x -> isAlphaNum x || x == '_') (c:cs)
+          in (if isKW ident then Token TKKW else Token TKId) ident : go rest
+      | isDigit c =
+          let (num, rest) = span isDigit (c:cs)
+          in Token TKInt num : go rest
+      | c == '\'' =
+          let (str, rest) = break (== '\'') cs
+          in Token TKString str : go (drop 1 rest)  -- drop closing quote
+      | c == '"' =
+          let (str, rest) = break (== '"') cs
+          in Token TKId str : go (drop 1 rest)
+      | c == '*' = Token TKStar "*" : go cs
+      | c == ',' = Token TKComma "," : go cs
+      | c == '(' = Token TKLP "(" : go cs
+      | c == ')' = Token TKRP ")" : go cs
+      | c == ';' = Token TKSemi ";" : go cs
+      | c == '.' = Token TKDot "." : go cs
+      | c `elem` "=<>!" =
+          let opChars = takeWhile (`elem` "=<>!") (c:cs)
+              -- Need to handle multi-char ops: <=, <>, !=, >=, =, <, >
+              ...
+```
+
+Wait, the C lexer for operators is a bit tricky. Let me re-read:
+
+```c
+if (strchr("=<>!",c)){
+    size_t st=L->pos;
+    if (L->src[L->pos+1]=='=') L->pos++;
+    if (c=='<' && L->src[L->pos+1]=='>') L->pos++;
+    if (c=='!' && L->src[L->pos+1]=='=') L->pos++;
+    L->pos++;
+    lex_push(L,TK_OP,L->src+st,L->pos-st);
+}
+```
+
+So for `=`: checks if next is `=` -> `==`. But wait, that would make `==` an operator. Let me trace:
+- c = '=', pos at '='
+- if src[pos+1]=='=' -> pos++ (now pos at second '=')
+- c is not '<' or '!', so skip those
+- pos++ (now past second '=')
+- text is "=="
+
+Hmm, but `==` isn't used in SQL. Let me check... Actually the C code would produce `==` as an operator, but the parser only checks for `=`, `<>`, `<`, `>`, `<=`, `>=`. So `==` would not match any of those and would fall through. But in practice, the SQL uses `=` not `==`.
+
+For `<`:
+- c = '<', pos at '<'
+- if src[pos+1]=='=' -> pos++ (now at '=')
+- c=='<' && src[pos+1]=='>' -> only if after the first check, pos+1 is '>'. If first check didn't match (next wasn't '='), pos still at '<', so pos+1 is the char after '<'. If that's '>', pos++ (now at '>').
+- pos++ (past the last char)
+- So: `<` -> `<`, `<=` -> `<=`, `<>` -> `<>`
+
+For `>`:
+- c = '>'
+- if src[pos+1]=='=' -> pos++
+- not '<' or '!'
+- pos++
+- So: `>` -> `>`, `>=` -> `>=`
+
+For `!`:
+- c = '!'
+- if src[pos+1]=='=' -> pos++ (but only if next is '=')
+  Wait, this checks if src[pos+1]=='=' first. If c=='!' and next is '=', then pos++ (now at '=')
+- c=='!' && src[pos+1]=='=' -> pos++ (now past '=')
+  Wait, but we already advanced pos. Let me re-trace:
+  - c='!', pos at '!'
+  - if src[pos+1]=='=' -> yes, pos++ (now pos at '=')
+  - if c=='!' && src[pos+1]=='=' -> src[pos+1] is now the char after '=', which may or may not be '='. Hmm, this seems like it could double-consume.
+  
+  Actually wait, after the first `if`, pos is now at '='. Then `src[pos+1]` is the char after '='. The condition `c=='!' && src[pos+1]=='='` would only be true if there are two '=' after '!'. That seems like a bug, but in practice `!=` is the only case.
+  
+  Let me trace `!=`:
+  - c='!', pos at '!'
+  - src[pos+1]=='=' -> yes, pos++ (pos at '=')
+  - c=='!' && src[pos+1]=='=' -> src[pos+1] is char after '=', probably not '='. So no.
+  - pos++ (past '=')
+  - text is "!="
+  
+  OK so `!=` works. And `!` alone:
+  - c='!', pos at '!'
+  - src[pos+1]=='=' -> no
+  - c=='!' && src[pos+1]=='=' -> no
+  - pos++
+  - text is "!"
+
+OK, let me implement this faithfully:
+
+```haskell
+lexOp :: String -> [Token]
+lexOp (c:cs) | c `elem` "=<>!" =
+  let cs1 = if not (null cs) && head cs == '=' then cs else ... 
+  ...
+```
+
+Actually let me just implement it step by step:
+
+```haskell
+-- Operator lexing matching C behavior
+lexOp :: Char -> String -> (String, String)
+lexOp c rest0 =
+  let step1 = if not (null rest0) && head rest0 == '=' then rest0 else rest0  -- consume '=' if present
+      -- After step1, if c=='<' and next is '>'
+      ...
+```
+
+Hmm, this is getting complicated. Let me just do it more directly:
+
+```haskell
+lexOp :: String -> (String, String)
+lexOp (c:rest) 
+  | c == '=' = if not (null rest) && head rest == '=' then ("==", drop 1 rest) else ("=", rest)
+  | c == '<' = case rest of
+      ('=':r) -> ("<=", r)
+      ('>':r) -> ("<>", r)
+      _ -> ("<", rest)
+  | c == '>' = case rest of
+      ('=':r) -> (">=", r)
+      _ -> (">", rest)
+  | c == '!' = case rest of
+      ('=':r) -> ("!=", r)
+      _ -> ("!", rest)
+```
+
+Wait, but the C code for `=` checks `if (src[pos+1]=='=')` which means `==` would be produced. But then for `<`, it first checks `=`, then checks `>`. So `<=` is produced by the first check, and `<>` by the second. But what about `<>=`? That would be `<>` then `=`. Let me not worry about edge cases.
+
+Actually wait, re-reading the C code more carefully:
+
+```c
+if (strchr("=<>!",c)){
+    size_t st=L->pos;
+    if (L->src[L->pos+1]=='=') L->pos++;   // check 1: next is '='
+    if (c=='<' && L->src[L->pos+1]=='>') L->pos++;  // check 2: c=='<' and (new) next is '>'
+    if (c=='!' && L->src[L->pos+1]=='=') L->pos++;  // check 3: c=='!' and (new) next is '='
+    L->pos++;
+    lex_push(L,TK_OP,L->src+st,L->pos-st);
+}
+```
+
+For `<`:
+- check 1: if next is '=', advance (so `<=` -> pos at `=`)
+- check 2: if c=='<' and new next is '>', advance. But if we already consumed `=`, the new next is whatever is after `=`. So `<=` won't trigger check 2. But `<>` (no `=`) will: check 1 fails (next is `>` not `=`), check 2: c=='<' and next is '>', advance. So pos at `>`. Then pos++ -> past `>`. Text is `<>`.
+
+For `=`:
+- check 1: if next is '=', advance. So `==` -> text is `==`.
+- But `=` alone -> text is `=`.
+
+OK my Haskell implementation above is correct. Let me also handle `==` for `=`:
+
+Actually, I realize the C code would produce `==` for `==` input, but the parser only checks `strcmp(e->op,"=")` etc., so `==` would not match any comparison and would produce V_NULL. But in practice, SQL uses `=` not `==`. Let me just match the C behavior.
+
+Let me simplify and just implement the operator lexing to match C:
+
+```haskell
+lexOp :: String -> (String, String)
+lexOp (c:rest)
+  | c == '=' = if take 1 rest == "=" then ("==", drop 1 rest) else ("=", rest)
+  | c == '<' = 
+      let r1 = if take 1 rest == "=" then drop 1 rest else rest  -- consume '=' if present
+          r2 = if c == '<' && take 1 r1 == ">" then drop 1 r1 else r1  -- consume '>' if present
+      in ("<" ++ drop (length rest - length r2) rest, r2)  -- hmm this is getting messy
+```
+
+Actually, let me just track what gets consumed:
+
+```haskell
+lexOp :: String -> (String, String)
+lexOp (c:rest) | c `elem` "=<>!" =
+  let -- step 1: check if next is '='
+      s1 = if not (null rest) && head rest == '=' then rest else rest  -- consume
+      ...
+```
+
+OK let me think about this differently. The C code does:
+1. Start at position of c
+2. If next char is '=', advance pos by 1
+3. If c=='<' and (new) next char is '>', advance pos by 1
+4. If c=='!' and (new) next char is '=', advance pos by 1
+5. Advance pos by 1 (past the last consumed char)
+6. Text = from start to pos
+
+So the consumed characters are: c, plus optionally '=' (step 1), plus optionally '>' (step 2, only if c=='<'), plus optionally '=' (step 3, only if c=='!').
+
+But steps 2 and 3 are mutually exclusive (c can't be both '<' and '!').
+
+And step 1 applies to all. So:
+
+For c='=': consume c, maybe '=' -> "=" or "=="
+For c='<': consume c, maybe '=' (step1), then maybe '>' (step2, but only if step1 didn't consume, because step2 checks new next)
+  - If rest starts with '=': step1 consumes '=', step2 checks char after '='. If that's '>', consume it too. So "<=>" -> "<=>" ? No wait:
+    - c='<', rest="=>..."
+    - step1: head rest == '=' -> yes, consume. Now looking at ">..."
+    - step2: c=='<' && head == '>' -> yes, consume. Now looking at "..."
+    - step3: c!='!' -> skip
+    - pos++ -> past last consumed
+    - text = "<=>" 
+    
+    Hmm, that's weird but let's match it.
+    
+  - If rest starts with '>': step1 fails (head is '>' not '='), step2: c=='<' && head=='>' -> yes, consume. text = "<>"
+  - If rest starts with something else: text = "<"
+
+For c='>': consume c, maybe '=' (step1). text = ">" or ">="
+For c='!': consume c, maybe '=' (step1), then maybe '=' (step3, but only if step1 didn't consume? No, step3 checks new next after step1)
+  - If rest starts with '=': step1 consumes '='. step3: c=='!' && head (after step1) == '='. If there's another '=', consume. So "!=" -> text="!=", "!!=" -> step1 fails, step3: head=='!' != '=' -> fail, text="!"
+  
+  Wait, let me re-trace "!=":
+  - c='!', rest="=..."
+  - step1: head rest == '=' -> yes, consume. Now at "..."
+  - step3: c=='!' && head == '=' -> head is whatever is after '=', not '=' (unless "!=="). So no.
+  - pos++ -> past '='
+  - text = "!="
+  
+  And "!" alone:
+  - c='!', rest="..."
+  - step1: head != '=' -> no
+  - step3: c=='!' && head != '=' -> no
+  - pos++
+  - text = "!"
+
+OK so my simpler version was actually correct:
+
+```haskell
+lexOp :: String -> (String, String)
+lexOp (c:rest)
+  | c == '=' = if take 1 rest == "=" then ("==", drop 1 rest) else ("=", rest)
+  | c == '<' = 
+      let (s1, r1) = if take 1 rest == "=" then ("=", drop 1 rest) else ("", rest)
+          (s2, r2) = if null s1 && take 1 r1 == ">" then (">", drop 1 r1) 
+                     else if not (null s1) && take 1 r1 == ">" then (">", drop 1 r1)  -- <=> case
+                     else ("", r1)
+      in ("<" ++ s1 ++ s2, r2)
+```
+
+Hmm wait, I need to re-check. For `<`, step 2 checks after step 1. So:
+- If step1 consumed '=' (rest was "=..."), then r1 is after '='. Step2 checks if r1 starts with '>'.
+- If step1 didn't consume (rest was not "=..."), then r1 = rest. Step2 checks if r1 starts with '>'.
+
+So:
+
+```haskell
+lexOp (c:rest)
+  | c == '<' = 
+      let (s1, r1) = if take 1 rest == "=" then ("=", drop 1 rest) else ("", rest)
+          (s2, r2) = if take 1 r1 == ">" then (">", drop 1 r1) else ("", r1)
+      in ("<" ++ s1 ++ s2, r2)
+```
+
+This handles `<`, `<=`, `<>`, `<=>`.
+
+Similarly for `!`:
+```haskell
+  | c == '!' = 
+      let (s1, r1) = if take 1 rest == "=" then ("=", drop 1 rest) else ("", rest)
+          (s3, r3) = if take 1 r1 == "=" then ("=", drop 1 r1) else ("", r1)
+      in ("!" ++ s1 ++ s3, r3)
+```
+
+This handles `!`, `!=`, `!==`.
+
+And for `=`:
+```haskell
+  | c == '=' = 
+      let (s1, r1) = if take 1 rest == "=" then ("=", drop 1 rest) else ("", rest)
+      in ("=" ++ s1, r1)
+```
+
+This handles `=`, `==`.
+
+And for `>`:
+```haskell
+  | c == '>' = 
+      let (s1, r1) = if take 1 rest == "=" then ("=", drop 1 rest) else ("", rest)
+      in (">" ++ s1, r1)
+```
+
+OK, let me now write the full Haskell code. I'll be as concise as possible.
+
+For the parser, I'll use a simple state-passing approach with `[Token]` as the state.
+
+Actually, let me use a different approach. I'll use a Parser monad-like structure with explicit state passing. Or even simpler, I'll just use a list and pattern match.
+
+Let me define:
+
+```haskell
+type P = [Token]
+```
+
+And parser functions return `(Maybe a, [Token])`.
+
+Actually, let me use a slightly different approach for cleaner code. I'll use the `Maybe` monad with state:
+
+Hmm, let me just do explicit state passing. It's simpler for this.
+
+```haskell
+-- peek at current token
+peek :: [Token] -> Token
+peek [] = Token TKEOF ""
+peek (t:_) = t
+
+-- accept a token of a specific kind
+accept :: TokKind -> [Token] -> Maybe (Token, [Token])
+accept k (t:ts) | tkKind t == k = Just (t, ts)
+accept _ _ = Nothing
+
+acceptKW :: String -> [Token] -> Maybe [Token]
+acceptKW kw (t:ts) | tkKind t == TKKW && map toLower (tkText t) == kw = Just ts
+acceptKW _ _ = Nothing
+
+peekKW :: String -> [Token] -> Bool
+peekKW kw (t:_) = tkKind t == TKKW && map toLower (tkText t) == kw
+peekKW _ _ = False
+```
+
+Wait, I need to be careful about case-insensitivity. The C code uses `strcasecmp` everywhere. So keywords and identifiers are case-insensitive.
+
+Let me add accessor functions:
+
+```haskell
+tkKind (Token k _) = k
+tkText (Token _ s) = s
+```
+
+Actually, with record syntax:
+
+```haskell
+data Token = Token { tkKind :: TokKind, tkText :: String }
+```
+
+OK let me write the full thing now. I'll try to be concise.
+
+For the database state, I'll use IORef:
+
+```haskell
+data DBState = DBState
+  { dbTables :: [(String, [String], [Row])]  -- (name, cols, rows)
+  , dbErrmsg :: String
+  , dbInTxn :: Bool
+  }
+
+type Sqlite3 = IORef DBState
+```
+
+For prepared statements:
+
+```haskell
+data StmtState = StmtState
+  { ssStmt :: Stmt
+  , ssSorted :: [[Value]]  -- materialized rows
+  , ssCur :: Int
+  , ssOutRow :: [Value]
+  , ssStarted :: Bool
+  }
+
+data Sqlite3Stmt = Sqlite3Stmt Sqlite3 (IORef StmtState)
+```
+
+Let me now write the complete code. I need to be careful to implement everything.
+
+For the exec callback, in Haskell I'll use:
+
+```haskell
+exec :: Sqlite3 -> String -> Maybe (Int -> [String] -> IO ()) -> IO (Either String ())
+```
+
+Actually, let me match the C API more closely. The C `sqlite3_exec` returns 0 on success, non-zero on error, and takes a callback. Let me make it:
+
+```haskell
+exec :: Sqlite3 -> String -> Maybe (Int -> [String] -> IO ()) -> IO (Int, Maybe String)
+```
+
+Where return is (errorCode, maybe errmsg).
+
+For prepare:
+
+```haskell
+prepare :: Sqlite3 -> String -> IO (Either String Sqlite3Stmt)
+```
+
+For step:
+
+```haskell
+step :: Sqlite3Stmt -> IO Int  -- 100 = ROW, 101 = DONE
+```
+
+For column_count, column_text, column_int64:
+
+```haskell
+columnCount :: Sqlite3Stmt -> IO Int
+columnText :: Sqlite3Stmt -> Int -> IO (Maybe String)
+columnInt64 :: Sqlite3Stmt -> Int -> IO Integer
+```
+
+For finalize:
+
+```haskell
+finalize :: Sqlite3Stmt -> IO ()
+```
+
+For close:
+
+```haskell
+close :: Sqlite3 -> IO ()
+```
+
+For errmsg:
+
+```haskell
+errmsg :: Sqlite3 -> IO String
+```
+
+OK let me write the full code now.
+
+For the nested loop join, I need to generate all combinations of rows from multiple tables. I can use `sequence` or a recursive function.
+
+```haskell
+-- Generate all combinations of rows from multiple tables
+-- Each table contributes a list of rows
+-- Result is a list of combined rows (concatenation)
+nestedLoop :: [[[Value]]] -> [[Value]]
+nestedLoop [] = [[]]
+nestedLoop (xs:xss) = [r ++ rest | r <- xs, rest <- nestedLoop xss]
+```
+
+Wait, but I also need the table references and schema info for column resolution. Let me think about this.
+
+In the C code, `collect_matching` does:
+1. For each table in sel_tables, get the schema index and row store
+2. Nested loop over all rows
+3. For each combination, check WHERE and JOIN ON conditions
+4. If match, concatenate all row values into a single row and add to sorted
+
+Then for ORDER BY, it sorts the materialized rows.
+
+Then `stmt_step_select` projects the output columns.
+
+Let me implement this.
+
+For column resolution in a combined row, I need to know the offsets of each table's columns in the combined row.
+
+```haskell
+-- Given table refs and schema, compute offsets
+-- offsets[i] = sum of ncols of tables 0..i-1
+```
+
+Let me write the eval function:
+
+```haskell
+-- RowCtx: list of (tableRef, tableCols) and the combined row
+-- To resolve a column name, find which table has it and compute the index
+
+evalExpr :: Expr -> [(TableRef, [String])] -> [Value] -> Value
+evalExpr (EInt i) _ _ = VInt i
+evalExpr (EStr s) _ _ = VText s
+evalExpr (ECol col) ctx row = 
+  case resolveCol col ctx of
+    Just idx -> row !! idx  -- need bounds check
+    Nothing -> VNull
+evalExpr (EBinOp op l r) ctx row = 
+  let a = evalExpr l ctx row
+      b = evalExpr r ctx row
+  in case op of
+    "AND" -> VInt (if vTruthy a && vTruthy b then 1 else 0)
+    "OR" -> VInt (if vTruthy a || vTruthy b then 1 else 0)
+    _ -> let cmp = vCmp a b
+         in VInt $ case op of
+           "=" -> if cmp == EQ then 1 else 0
+           "<>" -> if cmp /= EQ then 1 else 0
+           "<" -> if cmp == LT then 1 else 0
+           ">" -> if cmp == GT then 1 else 0
+           "<=" -> if cmp /= GT then 1 else 0
+           ">=" -> if cmp /= LT then 1 else 0
+           _ -> 0
+```
+
+For `resolveCol`:
+
+```haskell
+resolveCol :: String -> [(TableRef, [String])] -> Maybe Int
+resolveCol col ctx =
+  let parts = break (== '.') col  -- hmm, need to handle "table.col" format
+  in case break (=='.') col of
+    (tn, '.':cn) -> -- qualified
+      findIndex (\(tr, _) -> 
+        let name = fromMaybe (tRefName tr) (tRefAlias tr)
+        in map toLower name == map toLower tn) ctx
+      >>= \i -> 
+        let (_, cols) = ctx !! i
+        in case findIndex ((== map toLower cn) . map toLower) cols of
+          Just ci -> Just (offsetOf i ctx + ci)
+          Nothing -> Nothing
+    _ -> -- unqualified
+      findFirst col ctx
+```
+
+Hmm, this is getting complex. Let me simplify.
+
+Actually, let me compute offsets:
+
+```haskell
+offsets :: [(TableRef, [String])] -> [Int]
+offsets ctx = scanl (+) 0 (map (length . snd) ctx)
+-- offsets[i] = offset of table i's first column
+```
+
+Wait, `scanl (+) 0 [n0, n1, ...]` gives `[0, n0, n0+n1, ...]`. So `offsets !! i` is the offset of table i. Good.
+
+```haskell
+resolveCol :: String -> [(TableRef, [String])] -> Maybe (Int, Int)  -- (tableIdx, colIdx)
+resolveCol col ctx =
+  case break (== '.') col of
+    (tn, '.':cn) -> 
+      findIndex (\(tr, _) -> 
+        let name = maybe (tRefName tr) id (tRefAlias tr)
+        in ci name tn) ctx
+      >>= \i -> 
+        let (_, cols) = ctx !! i
+        in (\ci -> (i, ci)) <$> findIndex (ci cn) cols
+    _ -> 
+      findFirst $ zip [0..] ctx
+  where
+    ci a b = map toLower a == map toLower b
+    findFirst [] = Nothing
+    findFirst ((i,(tr,cols)):rest) = 
+      case findIndex (ci col) cols of
+        Just ci -> Just (i, ci)
+        Nothing -> findFirst rest
+```
+
+Then to get the actual index in the combined row: `offsets ctx !! i + ci`
+
+Let me simplify by returning the absolute index directly:
+
+```haskell
+resolveColAbs :: String -> [(TableRef, [String])] -> Maybe Int
+resolveColAbs col ctx = do
+  (ti, ci) <- resolveCol col ctx
+  return (offsets ctx !! ti + ci)
+```
+
+OK, let me now write the complete code. I'll try to be as concise as possible while being correct.
+
+Let me also handle the `break (== '.')` issue - `break` returns `(prefix, rest)` where rest starts with the separator. So for "users.id", `break (=='.') "users.id"` = `("users", ".id")`. So the column name is `drop 1 ".id"` = `"id"`. Good.
+
+But what if there's no dot? `break (=='.') "id"` = `("id", "")`. So the second part is empty, meaning unqualified. I need to check if the second part starts with '.'.
+
+```haskell
+case break (=='.') col of
+  (tn, '.':cn) -> qualified
+  (cn, "") -> unqualified
+```
+
+OK let me write the full code now. I'll be comprehensive.
+
+Actually, let me reconsider the architecture. The C code has:
+1. Lexer: string -> tokens
+2. Parser: tokens -> Stmt
+3. Executor: Stmt + DB -> results
+
+In Haskell, I can make the lexer and parser pure functions, and the executor works on IORef DB.
+
+Let me write it all:
+
+```haskell
+module Sqlite3 where
+
+import Data.IORef
+import Data.Char
+import Data.List
+import Data.Maybe
+
+-- ===== Value =====
+data Value = VNull | VInt Integer | VText String
+
+vCmp :: Value -> Value -> Ordering
+vCmp VNull VNull = EQ
+vCmp VNull _ = LT
+vCmp _ VNull = GT
+vCmp (VInt a) (VInt b) = compare a b
+vCmp (VText a) (VText b) = compare a b
+vCmp (VInt _) (VText _) = LT
+vCmp (VText _) (VInt _) = GT
+
+vTruthy :: Value -> Bool
+vTruthy v = vCmp v (VInt 0) /= EQ
+
+vToText :: Value -> String
+vToText (VInt i) = show i
+vToText (VText s) = s
+vToText VNull = "NULL"
+
+-- ===== Lexer =====
+data TokKind = TKEOF | TKId | TKInt | TKString | TKKW | TKPunct | TKStar | TKComma | TKLP | TKRP | TKSemi | TKOp | TKDot
+data Token = Token { tkKind :: TokKind, tkText :: String }
+
+keywords :: [String]
+keywords = ["create","table","insert","into","values","select","from","where",
+            "order","by","asc","desc","and","or","not","null","begin","commit",
+            "inner","join","on","int","integer","text","primary","key","transaction"]
+
+isKW :: String -> Bool
+isKW s = toLower s `elem` keywords  -- hmm, need case-insensitive
+-- Actually, let me compare case-insensitively
+isKW s = any (\kw -> map toLower s == kw) keywords
+
+lexSql :: String -> [Token]
+lexSql = go
+  where
+    go [] = [Token TKEOF ""]
+    go (c:cs)
+      | isSpace c = go cs
+      | c == '-' && take 1 cs == "-" = go (dropWhile (/= '\n') cs)
+      | isAlpha c || c == '_' = 
+          let (ident, rest) = span (\x -> isAlphaNum x || x == '_') (c:cs)
+          in Token (if isKW ident then TKKW else TKId) ident : go rest
+      | isDigit c =
+          let (num, rest) = span isDigit (c:cs)
+          in Token TKInt num : go rest
+      | c == '\'' =
+          let (str, rest) = break (== '\'') cs
+          in Token TKString str : go (drop 1 rest)
+      | c == '"' =
+          let (str, rest) = break (== '"') cs
+          in Token TKId str : go (drop 1 rest)
+      | c == '*' = Token TKStar "*" : go cs
+      | c == ',' = Token TKComma "," : go cs
+      | c == '(' = Token TKLP "(" : go cs
+      | c == ')' = Token TKRP ")" : go cs
+      | c == ';' = Token TKSemi ";" : go cs
+      | c == '.' = Token TKDot "." : go cs
+      | c `elem` "=<>!" = 
+          let (op, rest) = lexOp (c:cs)
+          in Token TKOp op : go rest
+      | otherwise = Token TKPunct [c] : go cs
+
+lexOp :: String -> (String, String)
+lexOp (c:rest)
+  | c == '=' = let (s1,r1) = if take 1 rest == "=" then ("=",drop 1 rest) else ("",rest) in ("="++s1, r1)
+  | c == '<' = let (s1,r1) = if take 1 rest == "=" then ("=",drop 1 rest) else ("",rest)
+                   (s2,r2) = if take 1 r1 == ">" then (">",drop 1 r1) else ("",r1)
+               in ("<"++s1++s2, r2)
+  | c == '>' = let (s1,r1) = if take 1 rest == "=" then ("=",drop 1 rest) else ("",rest) in (">"++s1, r1)
+  | c == '!' = let (s1,r1) = if take 1 rest == "=" then ("=",drop 1 rest) else ("",rest)
+                   (s3,r3) = if take 1 r1 == "=" then ("=",drop 1 r1) else ("",r1)
+               in ("!"++s1++s3, r3)
+```
+
+Wait, I have a problem with the comment case. `c == '-' && take 1 cs == "-"` - but `take 1 cs` returns a list, and comparing with "-" (a list) should work. Actually `take 1 cs` returns either "-" or "" or the first char. Let me use `head cs == '-'` but that's unsafe. Let me use `take 1 cs == "-"`.
+
+Actually, `take 1 "rest"` = `"r"`, `take 1 "-"` = `"-"`, `take 1 ""` = `""`. So `take 1 cs == "-"` works.
+
+But there's another issue: in the comment case, I do `dropWhile (/= '\n') cs` but I should drop from `c:cs`, not `cs`. Actually, the C code does `while (src[pos] && src[pos]!='\n') pos++` starting from the `-` position. So it skips until newline. Then the loop continues, and the newline is consumed by the `isspace` check. So I should do `dropWhile (/= '\n') (c:cs)` which drops the `--` and everything until newline, leaving the newline (which will be consumed by isSpace).
+
+Wait, `dropWhile (/= '\n') "--comment\nrest"` = `"\nrest"`. Then `go` will process `'\n'` as whitespace. Good.
+
+But actually, I wrote `dropWhile (/= '\n') cs` which starts from after the first `-`. So `cs = "-comment\nrest"`, `dropWhile (/= '\n') cs` = `"\nrest"`. That's the same result. Good.
+
+Now the parser:
+
+```haskell
+-- ===== AST =====
+data Expr = ECol String | EInt Integer | EStr String | EBinOp String Expr Expr
+
+data ResultCol = ResultCol { rcCol :: Maybe String, rcStar :: Bool }
+data TableRef = TableRef { tRefName :: String, tRefAlias :: Maybe String }
+
+data Stmt = Stmt
+  { stCreate :: Bool, stInsert :: Bool, stSelect :: Bool, stBegin :: Bool, stCommit :: Bool
+  , ctName :: Maybe String, ctCols :: [String]
+  , insTable :: Maybe String, insVals :: [Value]
+  , selCols :: [ResultCol], selStar :: Bool
+  , selTables :: [TableRef]
+  , selWhere :: Maybe Expr
+  , selOrderCol :: Maybe String, selOrderDesc :: Bool
+  , selJoinOn :: Maybe Expr
+  }
+
+emptyStmt :: Stmt
+emptyStmt = Stmt False False False False False Nothing [] Nothing [] [] False [] Nothing Nothing False Nothing
+```
+
+Parser functions:
+
+```haskell
+-- Helper: case-insensitive string compare
+ciEq :: String -> String -> Bool
+ciEq a b = map toLower a == map toLower b
+
+peekKW :: [Token] -> String -> Bool
+peekKW (t:_) kw = tkKind t == TKKW && ciEq (tkText t) kw
+peekKW [] _ = False
+
+acceptK :: TokKind -> [Token] -> Maybe (Token, [Token])
+acceptK k (t:ts) | tkKind t == k = Just (t, ts)
+acceptK _ _ = Nothing
+
+acceptKW :: String -> [Token] -> Maybe [Token]
+acceptKW kw (t:ts) | tkKind t == TKKW && ciEq (tkText t) kw = Just ts
+acceptKW _ _ = Nothing
+
+acceptKW_ :: String -> [Token] -> [Token]
+acceptKW_ kw ts = fromMaybe ts (acceptKW kw ts)
+```
+
+Now the expression parser:
+
+```haskell
+parseExpr :: [Token] -> Maybe (Expr, [Token])
+parseExpr ts = do
+  (l, ts1) <- parseCmp ts
+  if peekKW ts1 "and" || peekKW ts1 "or"
+    then do
+      let op = if peekKW ts1 "and" then "AND" else "OR"
+      let ts2 = drop 1 ts1  -- consume the keyword
+      (r, ts3) <- parseExpr ts2
+      return (EBinOp op l r, ts3)
+    else return (l, ts1)
+
+parseCmp :: [Token] -> Maybe (Expr, [Token])
+parseCmp ts = do
+  (l, ts1) <- parsePrimary ts
+  case ts1 of
+    (t:ts2) | tkKind t == TKOp -> do
+      (r, ts3) <- parsePrimary ts2
+      return (EBinOp (tkText t) l r, ts3)
+    _ -> return (l, ts1)
+
+parsePrimary :: [Token] -> Maybe (Expr, [Token])
+parsePrimary (t:ts)
+  | tkKind t == TKInt = Just (EInt (read (tkText t)), ts)
+  | tkKind t == TKString = Just (EStr (tkText t), ts)
+  | tkKind t == TKId || tkKind t == TKKW = 
+      let col = tkText t
+      in case ts of
+           (t2:ts2) | tkKind t2 == TKDot ->
+             case ts2 of
+               (t3:ts3) -> Just (ECol (col ++ "." ++ tkText t3), ts3)
+               _ -> Nothing
+           _ -> Just (ECol col, ts)
+  | tkKind t == TKLP = do
+      (e, ts1) <- parseExpr ts
+      let ts2 = maybe ts1 snd (acceptK TKRP ts1)
+      return (e, ts2)
+parsePrimary _ = Nothing
+```
+
+Wait, for `parsePrimary` with `TKLP`, I need to accept `)` after the expression. Let me fix:
+
+```haskell
+  | tkKind t == TKLP = do
+      (e, ts1) <- parseExpr ts
+      case acceptK TKRP ts1 of
+        Just (_, ts2) -> return (e, ts2)
+        Nothing -> return (e, ts1)  -- C code also just tries to accept, doesn't fail
+```
+
+Actually the C code does `p_accept(P,TK_RP,NULL)` which just tries to accept and continues regardless. So:
+
+```haskell
+      let ts2 = maybe ts1 snd (acceptK TKRP ts1)
+      return (e, ts2)
+```
+
+Hmm, `acceptK TKRP ts1` returns `Maybe (Token, [Token])`. `snd` of that is `[Token]`. So `maybe ts1 snd (acceptK TKRP ts1)` gives `ts2` if `)` was found, or `ts1` if not. Good.
+
+Now the statement parsers:
+
+```haskell
+parseCreate :: [Token] -> Maybe (Stmt, [Token])
+parseCreate ts = do
+  -- expect table name (ID or KW)
+  (nameT, ts1) <- acceptK TKId ts <|> acceptK TKKW ts
+  (_, ts2) <- acceptK TKLP ts1
+  let (cols, ts3) = parseCols [] ts2
+  let ts4 = maybe ts3 snd (acceptK TKRP ts3)
+  return (emptyStmt { stCreate = True, ctName = Just (tkText nameT), ctCols = cols }, ts4)
+  where
+    parseCols acc (t:ts)
+      | tkKind t == TKRP || tkKind t == TKEOF = (reverse acc, t:ts)
+      | tkKind t == TKId || tkKind t == TKKW = 
+          let (cols2, ts') = skipToCommaOrRP (t:ts)
+          in parseCols (tkText t : acc) (dropComma cols2)
+      | otherwise = (reverse acc, t:ts)
+    parseCols acc [] = (reverse acc, [])
+    skipToCommaOrRP (t:ts)
+      | tkKind t == TKComma || tkKind t == TKRP || tkKind t == TKEOF = (t:ts, [])
+      | otherwise = skipToCommaOrRP ts
+    skipToCommaOrRP [] = ([], [])
+    dropComma (t:ts) | tkKind t == TKComma = ts
+    dropComma ts = ts
+```
+
+Hmm, this is getting complicated. Let me re-read the C parse_create:
+
+```c
+static int parse_create(Parser *P, Stmt *st){
+    st->is_create=1;
+    if (P->t[P->i].kind!=TK_ID && P->t[P->i].kind!=TK_KW) return -1;
+    st->ct_name=strdup(P->t[P->i].text); P->i++;
+    if (!p_accept(P,TK_LP,NULL)) return -1;
+    while (P->t[P->i].kind!=TK_RP && P->t[P->i].kind!=TK_EOF){
+        if (P->t[P->i].kind!=TK_ID && P->t[P->i].kind!=TK_KW) return -1;
+        st->ct_cols[st->ct_ncols++]=strdup(P->t[P->i].text);
+        P->i++;
+        while (P->t[P->i].kind!=TK_COMMA && P->t[P->i].kind!=TK_RP && P->t[P->i].kind!=TK_EOF) P->i++;
+        p_accept(P,TK_COMMA,NULL);
+    }
+    p_accept(P,TK_RP,NULL);
+    return 0;
+}
+```
+
+So it:
+1. Reads table name (ID or KW)
+2. Expects `(`
+3. Loop: reads column name (ID or KW), skips tokens until comma/RP/EOF, accepts comma
+4. Accepts `)`
+
+The "skip tokens until comma/RP/EOF" part is for skipping column type declarations like "INTEGER", "TEXT", "PRIMARY KEY", etc.
+
+Let me simplify:
+
+```haskell
+parseCreate :: [Token] -> Maybe (Stmt, [Token])
+parseCreate (t:ts)
+  | tkKind t == TKId || tkKind t == TKKW =
+      let name = tkText t
+      in case acceptK TKLP ts of
+           Just (_, ts1) -> 
+             let (cols, ts2) = go [] ts1
+                 ts3 = maybe ts2 snd (acceptK TKRP ts2)
+             in Just (emptyStmt { stCreate=True, ctName=Just name, ctCols=cols }, ts3)
+           Nothing -> Nothing
+  | otherwise = Nothing
+  where
+    go acc (t:ts)
+      | tkKind t == TKRP || tkKind t == TKEOF = (reverse acc, t:ts)
+      | tkKind t == TKId || tkKind t == TKKW = 
+          let skip (x:xs) | tkKind x == TKComma || tkKind x == TKRP || tkKind x == TKEOF = x:xs
+              skip (x:xs) = skip xs
+              skip [] = []
+              afterSkip = skip ts
+              ts' = maybe afterSkip snd (acceptK TKComma afterSkip)
+          in go (tkText t : acc) ts'
+      | otherwise = (reverse acc, t:ts)  -- error case, but C returns -1
+    go acc [] = (reverse acc, [])
+parseCreate _ = Nothing
+```
+
+Wait, the C code returns -1 if the column name is not ID or KW. But in my version, I'm returning the accumulated cols. Let me match the C behavior more closely - return Nothing on error:
+
+Actually, let me reconsider. The C `parse_create` returns -1 on error, but the `parse` function checks the return and returns -1 too. Then `sqlite3_exec` checks and reports "parse error". So I should return `Nothing` on parse errors.
+
+But the column loop: if a non-ID/KW token is found before RP, C returns -1. Let me handle that:
+
+```haskell
+    go acc (t:ts)
+      | tkKind t == TKRP || tkKind t == TKEOF = (reverse acc, t:ts)
+      | tkKind t == TKId || tkKind t == TKKW = 
+          let skip = dropWhile (\x -> tkKind x /= TKComma && tkKind x /= TKRP && tkKind x /= TKEOF) ts
+              ts' = maybe skip snd (acceptK TKComma skip)
+          in go (tkText t : acc) ts'
+      | otherwise = (reverse acc, t:ts)  -- will cause error downstream
+```
+
+Hmm, but I need to signal an error. Let me change the return type to use `Maybe`:
+
+Actually, let me restructure. The `go` function returns `(cols, remainingTokens)`, and if there's an error (non-ID/KW before RP), I should return `Nothing`. But the type is `(cols, tokens)` not `Maybe (cols, tokens)`. Let me change it:
+
+Actually, let me just make `parseCreate` return `Maybe (Stmt, [Token])` and handle errors internally:
+
+```haskell
+parseCreate :: [Token] -> Maybe (Stmt, [Token])
+parseCreate (t:ts)
+  | tkKind t == TKId || tkKind t == TKKW =
+      let name = tkText t
+      in case acceptK TKLP ts of
+           Just (_, ts1) -> case go [] ts1 of
+             Just (cols, ts2) -> 
+               let ts3 = maybe ts2 snd (acceptK TKRP ts2)
+               in Just (emptyStmt { stCreate=True, ctName=Just name, ctCols=cols }, ts3)
+             Nothing -> Nothing
+           Nothing -> Nothing
+  | otherwise = Nothing
+  where
+    go acc (t:ts)
+      | tkKind t == TKRP || tkKind t == TKEOF = Just (reverse acc, t:ts)
+      | tkKind t == TKId || tkKind t == TKKW = 
+          let skip = dropWhile (\x -> tkKind x /= TKComma && tkKind x /= TKRP && tkKind x /= TKEOF) ts
+              ts' = maybe skip snd (acceptK TKComma skip)
+          in go (tkText t : acc) ts'
+      | otherwise = Nothing
+    go acc [] = Just (reverse acc, [])
+parseCreate _ = Nothing
+```
+
+OK, now parse_insert:
+
+```haskell
+parseInsert :: [Token] -> Maybe (Stmt, [Token])
+parseInsert ts = do
+  ts1 <- acceptKW "into" ts
+  (nameT, ts2) <- acceptK TKId ts1
+  ts3 <- acceptKW "values" ts2
+  (_, ts4) <- acceptK TKLP ts3
+  (vals, ts5) <- parseVals [] ts4
+  (_, ts6) <- acceptK TKRP ts5
+  return (emptyStmt { stInsert=True, insTable=Just (tkText nameT), insVals=vals }, ts6)
+  where
+    parseVals acc (t:ts)
+      | tkKind t == TKRP = Just (reverse acc, t:ts)
+      | tkKind t == TKInt = 
+          let v = VInt (read (tkText t))
+              ts' = maybe ts snd (acceptK TKComma ts)
+          in parseVals (v:acc) ts'
+      | tkKind t == TKString = 
+          let v = VText (tkText t)
+              ts' = maybe ts snd (acceptK TKComma ts)
+          in parseVals (v:acc) ts'
+      | tkKind t == TKKW && ciEq (tkText t) "null" =
+          let ts' = maybe (drop 1 ts) snd (acceptK TKComma (drop 1 ts))
+          in parseVals (VNull:acc) ts'
+      | otherwise = Just (reverse acc, t:ts)  -- error, but C breaks
+    parseVals acc [] = Just (reverse acc, [])
+```
+
+Wait, the C code for insert values:
+
+```c
+while (P->t[P->i].kind!=TK_RP && P->t[P->i].kind!=TK_EOF){
+    Value v;
+    if (P->t[P->i].kind==TK_INT) v=v_int(atol(P->t[P->i].text));
+    else if (P->t[P->i].kind==TK_STRING) v=v_text(P->t[P->i].text);
+    else if (p_accept_kw(P,"null")) v=v_null();
+    else return -1;
+    P->i++;
+    st->ins_vals[...]=v;
+    if (!p_accept(P,TK_COMMA,NULL)) break;
+}
+if (!p_accept(P,TK_RP,NULL)) return -1;
+```
+
+So it:
+1. Loop while not RP/EOF
+2. Read value (INT, STRING, or NULL keyword)
+3. Advance position
+4. Try to accept comma; if not, break
+5. After loop, expect RP
+
+The `P->i++` happens after reading the value. For INT and STRING, the position is advanced. For NULL, `p_accept_kw` already advances the position, but then `P->i++` advances again! Wait, no:
+
+```c
+else if (p_accept_kw(P,"null")) v=v_null();
+else return -1;
+P->i++;  // This advances past the value token
+```
+
+For INT: `P->i` was at the INT token. `P->i++` advances past it. Good.
+For STRING: same.
+For NULL: `p_accept_kw` already advanced `P->i` past "null". Then `P->i++` advances one more! That seems like a bug, but let me check...
+
+Actually wait, `p_accept_kw` calls `p_accept` which does `P->i++; return 1;`. So after `p_accept_kw(P,"null")`, `P->i` is past "null". Then `P->i++` advances one more. So it skips the token after "null" too!
+
+Hmm, that's a potential bug in the C code. But if the SQL is `INSERT INTO t VALUES (1, null, 2)`, after reading "null", P->i points to ",". Then P->i++ makes it point to "2". Then `p_accept(P,TK_COMMA,NULL)` tries to accept comma at "2", which fails, so it breaks. Then `p_accept(P,TK_RP,NULL)` tries to accept ")" at "2", which fails, and returns -1.
+
+Wait, that can't be right. Let me re-read more carefully.
+
+```c
+else if (p_accept_kw(P,"null")) v=v_null();
+else return -1;
+P->i++;
+```
+
+Hmm, but `p_accept_kw` returns 1 and advances P->i. Then the `else if` branch is taken. Then `P->i++` advances again. So yes, it skips one extra token after "null".
+
+But wait, maybe I'm wrong. Let me look at the control flow again:
+
+```c
+if (P->t[P->i].kind==TK_INT) v=v_int(atol(P->t[P->i].text));
+else if (P->t[P->i].kind==TK_STRING) v=v_text(P->t[P->i].text);
+else if (p_accept_kw(P,"null")) v=v_null();
+else return -1;
+P->i++;
+```
+
+For INT: the `if` branch is taken. `v` is set. `P->i++` advances past the INT token. ✓
+For STRING: the `else if` branch is taken. `v` is set. `P->i++` advances past the STRING token. ✓
+For NULL: `p_accept_kw(P,"null")` is called. If the current token is "null" keyword, it advances P->i past it and returns 1. Then `v=v_null()`. Then `P->i++` advances one more. ✗ (skips extra token)
+
+So there IS a bug in the C code for NULL values in INSERT. But the demo doesn't use NULL in INSERT, so it doesn't matter for the demo. However, I should match the behavior faithfully.
+
+Actually, wait. Let me re-read `p_accept`:
+
+```c
+static int p_accept(Parser *P, TokKind k, const char *text){
+    if (P->t[P->i].kind!=k) return 0;
+    if (text && strcasecmp(P->t[P->i].text,text)) return 0;
+    P->i++; return 1;
+}
+```
+
+And `p_accept_kw`:
+```c
+static int p_accept_kw(Parser *P, const char *kw){ return p_accept(P, TK_KW, kw); }
+```
+
+So `p_accept_kw(P, "null")` checks if current token is TK_KW with text "null". If so, P->i++ and return 1.
+
+Then in the insert parser, after `p_accept_kw` returns 1, P->i is already past "null". Then `P->i++` advances one more.
+
+So for `VALUES (null, 1)`:
+- P->i at "null" (TK_KW)
+- p_accept_kw succeeds, P->i now at ","
+- P->i++ -> P->i now at "1"
+- v = v_null()
+- p_accept(TK_COMMA) at "1" -> fails
+- break
+- p_accept(TK_RP) at "1" -> fails
+- return -1
+
+So `INSERT INTO t VALUES (null, 1)` would fail! That's a bug in the C code. But `INSERT INTO t VALUES (1, null)` would:
+- P->i at "1" (TK_INT)
+- v = v_int(1)
+- P->i++ -> P->i at ","
+- p_accept(TK_COMMA) succeeds, P->i at "null"
+- loop continues
+- P->i at "null" (TK_KW)
+- p_accept_kw("null") succeeds, P->i at ")"
+- P->i++ -> P->i past ")" (at EOF or next token)
+- v = v_null()
+- p_accept(TK_COMMA) -> fails (we're past ")")
+- break
+- p_accept(TK_RP) -> fails (we're past ")")
+- return -1
+
+So `INSERT INTO t VALUES (1, null)` also fails! NULL in INSERT is completely broken in the C code.
+
+Hmm, but the requirements say "Values are NULL / integer / text." and "every behavior... must appear in the port." So I should match this buggy behavior? Or should I fix it?
+
+The requirements say "port faithfully and completely: every public function, every behavior." I think I should match the behavior, including bugs. But this seems like a clear bug that would make NULL in INSERT not work at all.
+
+Actually, let me re-read more carefully. Maybe I'm wrong about the control flow.
+
+```c
+while (P->t[P->i].kind!=TK_RP && P->t[P->i].kind!=TK_EOF){
+    Value v;
+    if (P->t[P->i].kind==TK_INT) v=v_int(atol(P->t[P->i].text));
+    else if (P->t[P->i].kind==TK_STRING) v=v_text(P->t[P->i].text);
+    else if (p_accept_kw(P,"null")) v=v_null();
+    else return -1;
+    P->i++;
+    st->ins_vals=realloc(st->ins_vals,(st->ins_nvals+1)*sizeof(Value));
+    st->ins_vals[st->ins_nvals++]=v;
+    if (!p_accept(P,TK_COMMA,NULL)) break;
+}
+```
+
+For `VALUES (null)`:
+- P->i at "null" (TK_KW), not RP/EOF, enter loop
+- p_accept_kw("null") -> yes, P->i now at ")"
+- P->i++ -> P->i past ")" (at EOF)
+- v = v_null(), stored
+- p_accept(TK_COMMA) at EOF -> no, break
+- p_accept(TK_RP) at EOF -> no
+- return -1
+
+So even `VALUES (null)` fails. NULL in INSERT is completely broken.
+
+OK, I'll match this behavior. In my Haskell port, I'll do the same: after accepting "null", advance one more token.
+
+Actually, wait. Let me reconsider. Maybe I should just fix it since it's clearly a bug and the requirements say "Values are NULL / integer / text." which implies NULL should work in INSERT. But the requirements also say "every behavior" must appear.
+
+I think the safest approach is to match the C behavior exactly, including the bug. If someone uses NULL in INSERT, it will fail, just like in the C code.
+
+Actually, you know what, let me just match the C code exactly. The P->i++ after p_accept_kw is the behavior. Let me implement it.
+
+In my Haskell parser, for the NULL case:
+- Accept "null" keyword (consume it)
+- Then advance one more token (skip it)
+
+```haskell
+      | tkKind t == TKKW && ciEq (tkText t) "null" =
+          -- p_accept_kw advances past "null", then P->i++ advances one more
+          let afterNull = drop 1 ts  -- past "null"
+              afterExtra = drop 1 afterNull  -- P->i++ skips one more
+              ts' = maybe afterExtra snd (acceptK TKComma afterExtra)
+          in parseVals (VNull:acc) ts'
+```
+
+Wait, but `drop 1` on an empty list gives empty list. And `drop 1` on `[Token TKEOF ""]` gives `[]`. Let me be careful.
+
+Actually, `ts` is the list after the current token `t`. So if `t` is "null", `ts` is the remaining tokens. `p_accept_kw` consumes "null", so we're at `ts`. Then `P->i++` advances one more, so we're at `drop 1 ts`.
+
+```haskell
+      | tkKind t == TKKW && ciEq (tkText t) "null" =
+          let afterExtra = drop 1 ts  -- p_accept_kw consumed "null" (t), then P->i++ skips one more
+              ts' = maybe afterExtra snd (acceptK TKComma afterExtra)
+          in parseVals (VNull:acc) ts'
+```
+
+Hmm wait, `t` is the current token, `ts` is the rest. `p_accept_kw` consumes `t`, so we're at `ts`. Then `P->i++` skips one more, so we're at `drop 1 ts`. Then try to accept comma.
+
+But what if `ts` is empty or just `[Token TKEOF ""]`? `drop 1 []` = `[]`, `drop 1 [Token TKEOF ""]` = `[]`. That's fine.
+
+OK, let me continue with the other parsers.
+
+parse_select:
+
+```haskell
+parseSelect :: [Token] -> Maybe (Stmt, [Token])
+parseSelect ts = do
+  -- parse projections
+  (star, cols, ts1) <- parseProjs ts
+  -- FROM
+  ts2 <- acceptKW "from" ts1
+  -- first table
+  (tables, joinOn, ts3) <- parseTables [] Nothing ts2
+  -- WHERE
+  let (whereE, ts4) = case acceptKW "where" ts3 of
+        Just ts' -> case parseExpr ts' of
+          Just (e, ts'') -> (Just e, ts'')
+          Nothing -> (Nothing, ts')
+        Nothing -> (Nothing, ts3)
+  -- ORDER BY
+  let (orderCol, orderDesc, ts5) = parseOrderBy ts4
+  return (emptyStmt { stSelect=True, selCols=cols, selStar=star, selTables=tables, selWhere=whereE, selOrderCol=orderCol, selOrderDesc=orderDesc, selJoinOn=joinOn }, ts5)
+```
+
+This is getting complex. Let me write it more carefully.
+
+Actually, let me step back and write the whole thing more carefully, being faithful to the C code structure.
+
+Let me write the complete Haskell file now:
+
+```haskell
+module Main where
+
+import Data.IORef
+import Data.Char
+import Data.List
+import Data.Maybe
+
+-- ===== Value =====
+data Value = VNull | VInt Integer | VText String
+
+vCmp :: Value -> Value -> Ordering
+vCmp VNull VNull = EQ
+vCmp VNull _ = LT
+vCmp _ VNull = GT
+vCmp (VInt a) (VInt b) = compare a b
+vCmp (VText a) (VText b) = compare a b
+vCmp (VInt _) (VText _) = LT
+vCmp (VText _) (VInt _) = GT
+
+vTruthy :: Value -> Bool
+vTruthy v = vCmp v (VInt 0) /= EQ
+
+vToText :: Value -> String
+vToText (VInt i) = show i
+vToText (VText s) = s
+vToText VNull = "NULL"
+
+-- ===== Lexer =====
+...
+```
+
+Let me just write the whole thing out now. I'll be careful and complete.
+
+For the `exec` function, the C code processes multiple statements separated by semicolons. I need to handle that too.
+
+Let me think about the overall structure:
+
+1. `lexSql :: String -> [Token]` - pure
+2. `parseStmt :: [Token] -> Maybe (Stmt, [Token])` - pure, parses one statement
+3. `exec :: Sqlite3 -> String -> Maybe (Int -> [String] -> IO ()) -> IO (Int, Maybe String)` - IO
+4. `prepare :: Sqlite3 -> String -> IO (Either String Sqlite3Stmt)` - IO
+5. `step :: Sqlite3Stmt -> IO Int` - IO
+6. etc.
+
+For `exec`, I need to loop over statements:
+- Lex the SQL
+- While not EOF:
+  - Parse one statement
+  - Execute it (CREATE, INSERT, or SELECT)
+  - For SELECT, run the prepared statement and call callback for each row
+
+For `prepare`, I parse one statement and create a prepared statement object.
+
+Let me now write the complete code. I'll use IORef for mutable state.
+
+For the database:
+
+```haskell
+data DBState = DBState
+  { dbTables :: [(String, [String], [[Value]])]  -- (name, cols, rows)
+  , dbErr :: String
+  , dbInTxn :: Bool
+  }
+
+type Sqlite3 = IORef DBState
+```
+
+For prepared statements:
+
+```haskell
+data StmtState = StmtState
+  { ssStmt :: Stmt
+  , ssSorted :: [[Value]]  -- materialized matching rows (combined)
+  , ssCurIdx :: Int
+  , ssOutRow :: [Value]
+  , ssNOut :: Int
+  , ssStarted :: Bool
+  }
+
+type Sqlite3Stmt = IORef StmtState
+```
+
+Wait, but I also need a reference to the DB. Let me include it:
+
+```haskell
+data StmtState = StmtState
+  { ssDB :: Sqlite3
+  , ssStmt :: Stmt
+  , ssSorted :: [[Value]]
+  , ssCurIdx :: Int
+  , ssOutRow :: [Value]
+  , ssStarted :: Bool
+  }
+```
+
+OK let me write the complete code now. I'll try to be concise but complete.
+
+Actually, for the `exec` function, I need to handle the case where a SELECT is executed. In the C code, it creates a temporary prepared statement, steps through it, calls the callback for each row, then frees it. I'll do the same.
+
+Let me also think about how to handle the `prepare` + `step` + `column_text` flow. The prepared statement needs to:
+1. On first `step`, collect matching rows (with WHERE, JOIN ON, ORDER BY)
+2. On each `step`, advance to next row and compute projections
+3. `column_count` returns the number of output columns
+4. `column_text` returns the text representation of a column
+5. `column_int64` returns the integer value of a column
+
+Let me now write the complete code:
+
+```haskell
+module Main (main) where
+
+import Data.IORef
+import Data.Char
+import Data.List
+import Data.Maybe
+
+-- ===== Value =====
+data Value = VNull | VInt Integer | VText String
+
+vCmp :: Value -> Value -> Ordering
+vCmp VNull VNull = EQ
+vCmp VNull _ = LT
+vC _ VNull = GT
+vCmp (VInt a) (VInt b) = compare a b
+vCmp (VText a) (VText b) = compare a b
+vCmp (VInt _) (VText _) = LT
+vCmp (VText _) (VInt _) = GT
+
+vTruthy :: Value -> Bool
+vTruthy v = vCmp v (VInt 0) /= EQ
+
+vToText :: Value -> String
+vToText (VInt i) = show i
+vToText (VText s) = s
+vToText VNull = "NULL"
+
+-- ===== Lexer =====
+data TK = TKEOF | TKId | TKInt | TKString | TKKW | TKPunct | TKStar | TKComma | TKLP | TKRP | TKSemi | TKOp | TKDot
+  deriving (Eq, Show)
+data Token = Token { tkK :: TK, tkT :: String }
+
+kws :: [String]
+kws = ["create","table","insert","into","values","select","from","where",
+       "order","by","asc","desc","and","or","not","null","begin","commit",
+       "inner","join","on","int","integer","text","primary","key","transaction"]
+
+isKW :: String -> Bool
+isKW s = map toLower s `elem` kws
+
+ciEq :: String -> String -> Bool
+ciEq a b = map toLower a == map toLower b
+
+lexSql :: String -> [Token]
+lexSql = go
+  where
+    go [] = [Token TKEOF ""]
+    go (c:cs)
+      | isSpace c = go cs
+      | c == '-' && take 1 cs == "-" = go (dropWhile (/= '\n') cs)
+      | isAlpha c || c == '_' =
+          let (ident, rest) = span (\x -> isAlphaNum x || x == '_') (c:cs)
+          in Token (if isKW ident then TKKW else TKId) ident : go rest
+      | isDigit c =
+          let (num, rest) = span isDigit (c:cs)
+          in Token TKInt num : go rest
+      | c == '\'' =
+          let (str, rest) = break (== '\'') cs
+          in Token TKString str : go (drop 1 rest)
+      | c == '"' =

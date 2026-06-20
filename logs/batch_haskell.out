@@ -1,3 +1,5 @@
 [2026-06-20T17:43:02Z] loop start: 1 languages, orig_tokens=8805
 [2026-06-20T17:43:02Z]   >>> porting haskell (Haskell)
 [2026-06-20T17:47:10Z]       porter length-capped (16000 tok); retry high effort
+[2026-06-20T17:51:07Z]       porter done: 162 bytes, 57 tokens, 484.9s
+[2026-06-20T17:51:09Z]       judge: completeness=8 notes=The port defines only a single data structure (StmtState) with no implementation

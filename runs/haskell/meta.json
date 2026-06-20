@@ -1,0 +1,40 @@
+{
+  "language": "Haskell",
+  "slug": "haskell",
+  "timestamp_utc": "2026-06-20T17:51:09Z",
+  "elapsed_seconds": 484.9,
+  "porter_finish_reason": "length",
+  "original_tokens": 8805,
+  "ported_tokens": 57,
+  "token_ratio": 0.0065,
+  "reduction_factor": 154.47,
+  "porter_model": "accounts/fireworks/models/glm-5p2",
+  "judge_model": "claude-haiku-4-5",
+  "porter_usage": {
+    "prompt_tokens": 14260,
+    "total_tokens": 30260,
+    "completion_tokens": 16000,
+    "prompt_tokens_details": {
+      "cached_tokens": 14259
+    }
+  },
+  "judge_usage": {
+    "input_tokens": 11821,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "cache_creation": {
+      "ephemeral_5m_input_tokens": 0,
+      "ephemeral_1h_input_tokens": 0
+    },
+    "output_tokens": 112,
+    "service_tier": "standard",
+    "inference_geo": "not_available"
+  },
+  "judge_score": {
+    "completeness": 8,
+    "api_surface": 5,
+    "sql_features": 2,
+    "architecture": 10,
+    "notes": "The port defines only a single data structure (StmtState) with no implementations of any functions, lexer, parser, executor, or public API. While the architecture mirrors the C design conceptually, the port is essentially a stub containing 0% of the actual working code."
+  }
+}

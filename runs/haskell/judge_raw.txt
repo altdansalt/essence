@@ -1,0 +1,9 @@
+```json
+{
+  "completeness": 8,
+  "api_surface": 5,
+  "sql_features": 2,
+  "architecture": 10,
+  "notes": "The port defines only a single data structure (StmtState) with no implementations of any functions, lexer, parser, executor, or public API. While the architecture mirrors the C design conceptually, the port is essentially a stub containing 0% of the actual working code."
+}
+```
