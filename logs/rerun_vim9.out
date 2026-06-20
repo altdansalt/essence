@@ -12,3 +12,10 @@
                             ^^^^^^
 NameError: name 'finish' is not defined
 
+[main b230d5d] port: vim9script failed: name 'finish' is not defined
+ 7 files changed, 76 insertions(+), 2 deletions(-)
+ create mode 100644 runs/vim9script/ERROR.txt
+ create mode 100644 runs/vim9script/sqlite_core.txt
+To https://github.com/altdansalt/essence.git
+   4a94bf3..b230d5d  main -> main
+[2026-06-20T17:33:03Z] loop done: 0 runs
