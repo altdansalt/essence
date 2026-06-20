@@ -3,3 +3,12 @@
 [2026-06-20T17:37:33Z]       porter length-capped (16000 tok); retry high effort
 [2026-06-20T17:38:31Z]       porter done: 25385 bytes, 6506 tokens, 224.7s
 [2026-06-20T17:38:35Z]       judge: completeness=42 notes=The port captures core architectural elements (lexer, parser, AST, schema, execu
+[main ae97e8a] port: nostos (Nostos) completeness=42
+ 9 files changed, 1707 insertions(+)
+ create mode 100644 runs/nostos/judge_raw.txt
+ create mode 100644 runs/nostos/meta.json
+ create mode 100644 runs/nostos/porter_raw.txt
+ create mode 100644 runs/nostos/sqlite_core.txt
+To https://github.com/altdansalt/essence.git
+   202cd90..ae97e8a  main -> main
+[2026-06-20T17:38:36Z] loop done: 1 runs

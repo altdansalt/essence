@@ -111,3 +111,4 @@ NameError: name 'finish' is not defined
 [2026-06-20T17:37:35Z]       porter length-capped (16000 tok); retry high effort
 [2026-06-20T17:38:31Z]       porter done: 25385 bytes, 6506 tokens, 224.7s
 [2026-06-20T17:38:35Z]       judge: completeness=42 notes=The port captures core architectural elements (lexer, parser, AST, schema, execu
+[2026-06-20T17:38:36Z] loop done: 1 runs
