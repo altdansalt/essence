@@ -1,0 +1,9 @@
+```json
+{
+  "completeness": 15,
+  "api_surface": 5,
+  "sql_features": 10,
+  "architecture": 20,
+  "notes": "Port is severely incomplete: only lexer stub is present with no parser, AST, executor, or database engine. Missing ~95% of functionality including all public API functions, statement execution, table/row storage, expression evaluation, and JOIN/WHERE/ORDER BY logic."
+}
+```

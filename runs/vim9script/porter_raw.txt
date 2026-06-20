@@ -1,0 +1,1572 @@
+Let me port the C SQLite-style engine to Vim9 script. I need to implement:
+
+1. Value types (NULL, INT, TEXT)
+2. Lexer
+3. Parser (recursive descent)
+4. Executor (nested-loop joins, WHERE, ORDER BY, projections)
+5. In-memory table store
+6. Public API: open, exec, prepare, step, finalize, close, column_count, column_text, column_int64, errmsg
+7. SQL subset: CREATE TABLE, INSERT, SELECT with projections, SELECT *, WHERE, ORDER BY, INNER JOIN
+8. Demo equivalent to SQLITE_CORE_DEMO
+
+Let me write this in Vim9 script using classes.
+
+Vim9 script has classes, so I'll create a Sqlite3 class and a Stmt class.
+
+Let me think about the structure:
+
+- Value: I'll use a dict or a class. A class with `type` (string), `ival` (number), `sval` (string)
+- Token: dict with kind and text
+- Lexer: produces list of tokens
+- Expr: class with kind, col, ival, sval, op, l, r
+- Stmt: class for AST statements
+- Table: class with name, cols (list<string>)
+- RowStore: class with rows (list<list<Value>>)
+- Database: class with schema tables, stores, errmsg
+- Stmt (prepared): class with db, ast, sorted rows, cursor
+
+Let me be concise but complete.
+
+In Vim9, I can use classes. Let me structure this.
+
+Actually, Vim9 classes are somewhat verbose. Let me use dicts for lightweight structures and classes for the main API.
+
+Let me think about what's most concise...
+
+I'll use a mix: classes for the main API objects (Sqlite3, Sqlite3Stmt), and dicts/functions for internal structures.
+
+Let me write the code:
+
+```vim
+vim9script
+
+# Value helpers - using dict {type: 'null'|'int'|'text', ival: number, sval: string}
+def VNull(): dict<any>
+  return {type: 'null', ival: 0, sval: ''}
+enddef
+
+def VInt(i: number): dict<any>
+  return {type: 'int', ival: i, sval: ''}
+enddef
+
+def VText(s: string): dict<any>
+  return {type: 'text', ival: 0, sval: s}
+enddef
+
+def VCopy(v: dict<any>): dict<any>
+  if v.type == 'text'
+    return VText(v.sval)
+  endif
+  return copy(v)
+enddef
+
+def VCmp(a: dict<any>, b: dict<any>): number
+  if a.type != b.type
+    # order: null < int < text (matching C enum order)
+    var at: number = a.type == 'null' ? 0 : (a.type == 'int' ? 1 : 2)
+    var bt: number = b.type == 'null' ? 0 : (b.type == 'int' ? 1 : 2)
+    return at - bt
+  endif
+  if a.type == 'int'
+    return a.ival < b.ival ? -1 : (a.ival > b.ival ? 1 : 0)
+  endif
+  if a.type == 'text'
+    return strcmp(a.sval, b.sval)
+  endif
+  return 0
+enddef
+
+def VToText(v: dict<any>): string
+  if v.type == 'int'
+    return string(v.ival)
+  endif
+  if v.type == 'text'
+    return v.sval
+  endif
+  return 'NULL'
+enddef
+
+def VTruthy(v: dict<any>): bool
+  return VCmp(v, VInt(0)) != 0
+enddef
+```
+
+Now the lexer. Keywords list, tokenization.
+
+```vim
+var KEYWORDS: list<string> = ['create','table','insert','into','values','select','from','where','order','by','asc','desc','and','or','not','null','begin','commit','inner','join','on','int','integer','text','primary','key','transaction']
+
+def IsKw(s: string): bool
+  return indexof(KEYWORDS, (_, k) => k ==? s) >= 0
+enddef
+```
+
+Token: {kind: string, text: string}
+
+```vim
+def Lex(sql: string): list<dict<string>>
+  var toks: list<dict<string>> = []
+  var pos = 0
+  var n = len(sql)
+  while pos < n
+    var c = sql[pos]
+    if c == ' ' || c == "\t" || c == "\n" || c == "\r"
+      pos += 1
+      continue
+    endif
+    if c == '-' && pos + 1 < n && sql[pos + 1] == '-'
+      while pos < n && sql[pos] != "\n"
+        pos += 1
+      endwhile
+      continue
+    endif
+    # identifier or keyword
+    if c =~ '\a' || c == '_'
+      var st = pos
+      while pos < n && (sql[pos] =~ '\a' || sql[pos] =~ '\d' || sql[pos] == '_')
+        pos += 1
+      endwhile
+      var word = sql[st : pos - 1]
+      add(toks, {kind: IsKw(word) ? 'kw' : 'id', text: word})
+      continue
+    endif
+    # number
+    if c =~ '\d'
+      var st = pos
+      while pos < n && sql[pos] =~ '\d'
+        pos += 1
+      endwhile
+      add(toks, {kind: 'int', text: sql[st : pos - 1]})
+      continue
+    endif
+    # string literal
+    if c == "'"
+      pos += 1
+      var st = pos
+      while pos < n && sql[pos] != "'"
+        pos += 1
+      endwhile
+      add(toks, {kind: 'string', text: pos > st ? sql[st : pos - 1] : ''})
+      if pos < n
+        pos += 1
+      endif
+      continue
+    endif
+    # quoted identifier
+    if c == '"'
+      pos += 1
+      var st = pos
+      while pos < n && sql[pos] != '"'
+        pos += 1
+      endwhile
+      add(toks, {kind: 'id', text: pos > st ? sql[st : pos - 1] : ''})
+      if pos < n
+        pos += 1
+      endif
+      continue
+    endif
+    # operators and punctuation
+    if c == '*'
+      add(toks, {kind: 'star', text: '*'})
+      pos += 1
+    elseif c == ','
+      add(toks, {kind: 'comma', text: ','})
+      pos += 1
+    elseif c == '('
+      add(toks, {kind: 'lp', text: '('})
+      pos += 1
+    elseif c == ')'
+      add(toks, {kind: 'rp', text: ')'})
+      pos += 1
+    elseif c == ';'
+      add(toks, {kind: 'semi', text: ';'})
+      pos += 1
+    elseif c == '.'
+      add(toks, {kind: 'dot', text: '.'})
+      pos += 1
+    elseif c == '=' || c == '<' || c == '>' || c == '!'
+      var st = pos
+      if pos + 1 < n && sql[pos + 1] == '='
+        pos += 1
+      endif
+      if c == '<' && pos + 1 < n && sql[pos + 1] == '>'
+        pos += 1
+      endif
+      if c == '!' && pos + 1 < n && sql[pos + 1] == '='
+        pos += 1
+      endif
+      pos += 1
+      add(toks, {kind: 'op', text: sql[st : pos - 1]})
+    else
+      add(toks, {kind: 'punct', text: c})
+      pos += 1
+    endif
+  endwhile
+  add(toks, {kind: 'eof', text: ''})
+  return toks
+enddef
+```
+
+Now the AST and parser. I'll use dicts for Expr and Stmt.
+
+Expr: {kind: 'col'|'int'|'str'|'binop', col: string, ival: number, sval: string, op: string, l: dict<any>, r: dict<any>}
+
+Actually in Vim9, I can't have recursive type definitions easily with dicts. Let me just use dict<any>.
+
+Let me think about the parser. I'll make a class or just use functions with a position tracker.
+
+Actually, let me use a class for the parser to hold state.
+
+```vim
+class Parser
+  var toks: list<dict<string>>
+  var i: number = 0
+
+  def new(toks: list<dict<string>>)
+    this.toks = toks
+  enddef
+
+  def Peek(): dict<string>
+    return this.toks[this.i]
+  enddef
+
+  def Accept(kind: string, text: string = ''): bool
+    var t = this.toks[this.i]
+    if t.kind != kind
+      return false
+    endif
+    if text != '' && t.text !=? text
+      return false
+    endif
+    this.i += 1
+    return true
+  enddef
+
+  def AcceptKw(kw: string): bool
+    return this.Accept('kw', kw)
+  enddef
+
+  def PeekKw(kw: string): bool
+    var t = this.toks[this.i]
+    return t.kind == 'kw' && t.text ==? kw
+  enddef
+```
+
+Wait, Vim9 string comparison is case-sensitive by default. The C code uses `strcasecmp`. I need case-insensitive comparison. In Vim9, `==?` is case-insensitive comparison.
+
+Let me continue with the parser methods for expressions:
+
+```vim
+  def ParsePrimary(): dict<any>
+    var t = this.Peek()
+    if t.kind == 'int'
+      this.i += 1
+      return {kind: 'int', ival: str2nr(t.text), sval: '', op: '', col: '', l: {}, r: {}}
+    endif
+    if t.kind == 'string'
+      this.i += 1
+      return {kind: 'str', ival: 0, sval: t.text, op: '', col: '', l: {}, r: {}}
+    endif
+    if t.kind == 'id' || t.kind == 'kw'
+      var col = t.text
+      this.i += 1
+      if this.Peek().kind == 'dot'
+        this.i += 1
+        col ..= '.' .. this.Peek().text
+        this.i += 1
+      endif
+      return {kind: 'col', ival: 0, sval: '', op: '', col: col, l: {}, r: {}}
+    endif
+    if this.Accept('lp')
+      var e = this.ParseExpr()
+      this.Accept('rp')
+      return e
+    endif
+    return {}
+  enddef
+
+  def ParseCmp(): dict<any>
+    var l = this.ParsePrimary()
+    if this.Peek().kind == 'op'
+      var op = this.Peek().text
+      this.i += 1
+      var r = this.ParsePrimary()
+      return {kind: 'binop', ival: 0, sval: '', op: op, col: '', l: l, r: r}
+    endif
+    return l
+  enddef
+
+  def ParseExpr(): dict<any>
+    var l = this.ParseCmp()
+    if this.PeekKw('and') || this.PeekKw('or')
+      var op = this.PeekKw('and') ? 'AND' : 'OR'
+      this.i += 1
+      var r = this.ParseExpr()
+      return {kind: 'binop', ival: 0, sval: '', op: op, col: '', l: l, r: r}
+    endif
+    return l
+  enddef
+```
+
+Now the statement parser. The Stmt structure in C has many fields. Let me use a dict:
+
+Stmt: {is_create, is_insert, is_select, is_begin, is_commit, ct_name, ct_cols, ins_table, ins_vals, sel_cols, sel_star, sel_tables, sel_where, sel_order_col, sel_order_desc, sel_join_on}
+
+```vim
+  def ParseCreate(): dict<any>
+    var st: dict<any> = {is_create: true, ct_name: '', ct_cols: []}
+    var t = this.Peek()
+    if t.kind != 'id' && t.kind != 'kw'
+      return {}
+    endif
+    st.ct_name = t.text
+    this.i += 1
+    if !this.Accept('lp')
+      return {}
+    endif
+    while this.Peek().kind != 'rp' && this.Peek().kind != 'eof'
+      var t2 = this.Peek()
+      if t2.kind != 'id' && t2.kind != 'kw'
+        return {}
+      endif
+      add(st.ct_cols, t2.text)
+      this.i += 1
+      while this.Peek().kind != 'comma' && this.Peek().kind != 'rp' && this.Peek().kind != 'eof'
+        this.i += 1
+      endwhile
+      this.Accept('comma')
+    endwhile
+    this.Accept('rp')
+    return st
+  enddef
+
+  def ParseInsert(): dict<any>
+    var st: dict<any> = {is_insert: true, ins_table: '', ins_vals: []}
+    if !this.AcceptKw('into')
+      return {}
+    endif
+    if this.Peek().kind != 'id'
+      return {}
+    endif
+    st.ins_table = this.Peek().text
+    this.i += 1
+    if !this.AcceptKw('values')
+      return {}
+    endif
+    if !this.Accept('lp')
+      return {}
+    endif
+    while this.Peek().kind != 'rp' && this.Peek().kind != 'eof'
+      var t = this.Peek()
+      if t.kind == 'int'
+        add(st.ins_vals, VInt(str2nr(t.text)))
+        this.i += 1
+      elseif t.kind == 'string'
+        add(st.ins_vals, VText(t.text))
+        this.i += 1
+      elseif this.AcceptKw('null')
+        add(st.ins_vals, VNull())
+      else
+        return {}
+      endif
+      if !this.Accept('comma')
+        break
+      endif
+    endwhile
+    if !this.Accept('rp')
+      return {}
+    endif
+    return st
+  enddef
+
+  def ParseSelect(): dict<any>
+    var st: dict<any> = {is_select: true, sel_cols: [], sel_star: false, sel_tables: [], sel_where: {}, sel_order_col: '', sel_order_desc: false, sel_join_on: {}}
+    if this.Accept('star')
+      st.sel_star = true
+    else
+      while true
+        var rc: dict<any> = {col: '', star: false}
+        if this.Accept('star')
+          rc.star = true
+        elseif this.Peek().kind == 'id' || this.Peek().kind == 'kw'
+          var col = this.Peek().text
+          this.i += 1
+          if this.Peek().kind == 'dot'
+            this.i += 1
+            if this.Accept('star')
+              rc.star = true
+            else
+              col ..= '.' .. this.Peek().text
+              this.i += 1
+              rc.col = col
+            endif
+          else
+            rc.col = col
+          endif
+        else
+          return {}
+        endif
+        add(st.sel_cols, rc)
+        if !this.Accept('comma')
+          break
+        endif
+      endwhile
+    endif
+    if !this.AcceptKw('from')
+      return {}
+    endif
+    if this.Peek().kind != 'id'
+      return {}
+    endif
+    # first table
+    var tr: dict<any> = {tname: this.Peek().text, alias: ''}
+    this.i += 1
+    if this.Peek().kind == 'id' && !this.PeekKw('on') && !this.PeekKw('where') && !this.PeekKw('order') && !this.PeekKw('inner') && !this.PeekKw('join')
+      tr.alias = this.Peek().text
+      this.i += 1
+    endif
+    add(st.sel_tables, tr)
+    # joins
+    while this.PeekKw('inner') || this.PeekKw('join')
+      if this.AcceptKw('inner')
+        if !this.AcceptKw('join')
+          return {}
+        endif
+      else
+        this.AcceptKw('join')
+      endif
+      if this.Peek().kind != 'id'
+        return {}
+      endif
+      var tr2: dict<any> = {tname: this.Peek().text, alias: ''}
+      this.i += 1
+      if this.Peek().kind == 'id' && !this.PeekKw('on') && !this.PeekKw('where') && !this.PeekKw('order')
+        tr2.alias = this.Peek().text
+        this.i += 1
+      endif
+      add(st.sel_tables, tr2)
+      if this.AcceptKw('on')
+        var on = this.ParseExpr()
+        if empty(st.sel_join_on)
+          st.sel_join_on = on
+        else
+          st.sel_join_on = {kind: 'binop', op: 'AND', l: st.sel_join_on, r: on, ival: 0, sval: '', col: ''}
+        endif
+      endif
+    endwhile
+    if this.AcceptKw('where')
+      st.sel_where = this.ParseExpr()
+    endif
+    if this.AcceptKw('order')
+      if !this.AcceptKw('by')
+        return {}
+      endif
+      var t = this.Peek()
+      if t.kind != 'id' && t.kind != 'kw'
+        return {}
+      endif
+      st.sel_order_col = t.text
+      this.i += 1
+      if this.AcceptKw('desc')
+        st.sel_order_desc = true
+      else
+        this.AcceptKw('asc')
+      endif
+    endif
+    return st
+  enddef
+
+  def Parse(): dict<any>
+    if this.PeekKw('begin')
+      this.i += 1
+      this.AcceptKw('transaction')
+      return {is_begin: true}
+    endif
+    if this.PeekKw('commit')
+      this.i += 1
+      this.AcceptKw('transaction')
+      return {is_commit: true}
+    endif
+    if this.AcceptKw('create')
+      if this.AcceptKw('table')
+        return this.ParseCreate()
+      endif
+      return {}
+    endif
+    if this.AcceptKw('insert')
+      return this.ParseInsert()
+    endif
+    if this.AcceptKw('select')
+      return this.ParseSelect()
+    endif
+    return {}
+  enddef
+endclass
+```
+
+Now the database and executor. Let me create the Sqlite3 class.
+
+```vim
+class Sqlite3
+  var tables: list<string> = []        # table names
+  var cols: list<list<string>> = []    # column names per table
+  var stores: list<list<list<dict<any>>>> = []  # rows per table, each row is list of Values
+  var errmsg: string = ''
+  var in_txn: bool = false
+
+  def new()
+  enddef
+
+  def FindTable(name: string): number
+    for i in range(len(this.tables))
+      if this.tables[i] ==? name
+        return i
+      endif
+    endfor
+    return -1
+  enddef
+
+  def ColIndex(tabidx: number, col: string): number
+    for i in range(len(this.cols[tabidx]))
+      if this.cols[tabidx][i] ==? col
+        return i
+      endif
+    endfor
+    return -1
+  enddef
+```
+
+Now exec:
+
+```vim
+  def Exec(sql: string, cb: func(any, list<string>): void = null_function, arg: any = null): number
+    var toks = Lex(sql)
+    var p = Parser.new(toks)
+    var rc = 0
+    while p.Peek().kind != 'eof'
+      var st = p.Parse()
+      if empty(st)
+        this.errmsg = 'parse error'
+        return 1
+      endif
+      if get(st, 'is_begin', false)
+        this.in_txn = true
+      elseif get(st, 'is_commit', false)
+        this.in_txn = false
+      elseif get(st, 'is_create', false)
+        if this.FindTable(st.ct_name) >= 0
+          this.errmsg = $"table already exists: {st.ct_name}"
+          return 1
+        endif
+        add(this.tables, st.ct_name)
+        add(this.cols, st.ct_cols)
+        add(this.stores, [])
+      elseif get(st, 'is_insert', false)
+        var idx = this.FindTable(st.ins_table)
+        if idx < 0
+          this.errmsg = $"no such table: {st.ins_table}"
+          return 1
+        endif
+        var row: list<dict<any>> = []
+        for v in st.ins_vals
+          add(row, VCopy(v))
+        endfor
+        add(this.stores[idx], row)
+      elseif get(st, 'is_select', false)
+        var stmt = Sqlite3Stmt.new(this, st)
+        while stmt.Step() == 100
+          if cb != null_function
+            var vals: list<string> = []
+            for i in range(stmt.nout)
+              add(vals, VToText(stmt.outrow[i]))
+            endfor
+            cb(arg, vals)
+          endif
+        endwhile
+        stmt.Finalize()
+      endif
+      p.Accept('semi')
+    endwhile
+    return rc
+  enddef
+```
+
+Hmm, `null_function` - I'm not sure that's a valid Vim9 thing. Let me use a different approach. Maybe make cb optional with a default that does nothing.
+
+Actually in Vim9, I can use `func(...)` type. Let me think... I'll make the callback optional.
+
+Actually, let me simplify. For the callback, I'll just check if it's provided. Let me use a different approach - make cb a `func(any, list<string>): void` with a default no-op function.
+
+```vim
+def NopCb(arg: any, vals: list<string>): void
+enddef
+```
+
+Now the prepared statement class:
+
+```vim
+class Sqlite3Stmt
+  var db: Sqlite3
+  var st: dict<any>
+  var sorted: list<list<dict<any>>> = []  # materialized rows
+  var cur: number = 0
+  var started: bool = false
+  var outrow: list<dict<any>> = []
+  var nout: number = 0
+
+  def new(db: Sqlite3, st: dict<any>)
+    this.db = db
+    this.st = st
+  enddef
+
+  def ColIndexInCtx(col: string, tabs: list<number>, rows: list<list<dict<any>>>): list<number>
+    # returns [tabidx, colidx] or [-1, -1]
+    var dot = stridx(col, '.')
+    if dot >= 0
+      var tname = col[: dot - 1]
+      var cname = col[dot + 1 :]
+      for i in range(len(this.st.sel_tables))
+        var tn = !empty(this.st.sel_tables[i].alias) ? this.st.sel_tables[i].alias : this.st.sel_tables[i].tname
+        if tn ==? tname
+          var ci = this.db.ColIndex(tabs[i], cname)
+          if ci >= 0
+            return [i, ci]
+          endif
+        endif
+      endfor
+      return [-1, -1]
+    endif
+    for i in range(len(tabs))
+      var ci = this.db.ColIndex(tabs[i], col)
+      if ci >= 0
+        return [i, ci]
+      endif
+    endfor
+    return [-1, -1]
+  enddef
+
+  def EvalExpr(e: dict<any>, tabs: list<number>, rows: list<list<dict<any>>>): dict<any>
+    if empty(e)
+      return VNull()
+    endif
+    if e.kind == 'int'
+      return VInt(e.ival)
+    endif
+    if e.kind == 'str'
+      return VText(e.sval)
+    endif
+    if e.kind == 'col'
+      var res = this.ColIndexInCtx(e.col, tabs, rows)
+      if res[0] < 0
+        return VNull()
+      endif
+      return VCopy(rows[res[0]][res[1]])
+    endif
+    if e.kind == 'binop'
+      var a = this.EvalExpr(e.l, tabs, rows)
+      var b = this.EvalExpr(e.r, tabs, rows)
+      if e.op ==? 'AND'
+        return VInt(VTruthy(a) && VTruthy(b) ? 1 : 0)
+      elseif e.op ==? 'OR'
+        return VInt(VTruthy(a) || VTruthy(b) ? 1 : 0)
+      else
+        var cmp = VCmp(a, b)
+        if e.op == '='
+          return VInt(cmp == 0 ? 1 : 0)
+        elseif e.op == '<>'
+          return VInt(cmp != 0 ? 1 : 0)
+        elseif e.op == '<'
+          return VInt(cmp < 0 ? 1 : 0)
+        elseif e.op == '>'
+          return VInt(cmp > 0 ? 1 : 0)
+        elseif e.op == '<='
+          return VInt(cmp <= 0 ? 1 : 0)
+        elseif e.op == '>='
+          return VInt(cmp >= 0 ? 1 : 0)
+        endif
+      endif
+    endif
+    return VNull()
+  enddef
+
+  def RowMatch(where: dict<any>, tabs: list<number>, rows: list<list<dict<any>>>): bool
+    if empty(where)
+      return true
+    endif
+    return VTruthy(this.EvalExpr(where, tabs, rows))
+  enddef
+
+  def CollectMatching()
+    var n = len(this.st.sel_tables)
+    var idxs: list<number> = []
+    for i in range(n)
+      add(idxs, this.db.FindTable(this.st.sel_tables[i].tname))
+    endfor
+    # nested loop
+    var curs: list<number> = []  # current row index in each table
+    for i in range(n)
+      add(curs, 0)
+    endfor
+    while true
+      # check all cursors valid
+      var ok = true
+      for i in range(n)
+        if idxs[i] < 0 || curs[i] >= len(this.db.stores[idxs[i]])
+          ok = false
+          break
+        endif
+      endfor
+      if !ok
+        break
+      endif
+      # build row context
+      var tabs = idxs
+      var rows: list<list<dict<any>>> = []
+      for i in range(n)
+        add(rows, this.db.stores[idxs[i]][curs[i]])
+      endfor
+      if this.RowMatch(this.st.sel_where, tabs, rows) && (empty(this.st.sel_join_on) || this.RowMatch(this.st.sel_join_on, tabs, rows))
+        # collect combined row
+        var combined: list<dict<any>> = []
+        for i in range(n)
+          for j in range(len(rows[i]))
+            add(combined, VCopy(rows[i][j]))
+          endfor
+        endfor
+        add(this.sorted, combined)
+      endif
+      # advance innermost
+      var k = n - 1
+      while k >= 0
+        curs[k] += 1
+        if idxs[k] >= 0 && curs[k] < len(this.db.stores[idxs[k]])
+          break
+        endif
+        if k > 0
+          curs[k] = 0
+        endif
+        k -= 1
+      endwhile
+      if k < 0
+        break
+      endif
+    endwhile
+    # ORDER BY
+    if !empty(this.st.sel_order_col) && n == 1
+      var cidx = this.db.ColIndex(idxs[0], this.st.sel_order_col)
+      if cidx >= 0
+        # insertion sort
+        for i in range(1, len(this.sorted) - 1)
+          var j = i
+          while j > 0
+            var a = this.sorted[j - 1][cidx]
+            var b = this.sorted[j][cidx]
+            var cmp = VCmp(a, b)
+            if (this.st.sel_order_desc && cmp < 0) || (!this.st.sel_order_desc && cmp > 0)
+              var tmp = this.sorted[j - 1]
+              this.sorted[j - 1] = this.sorted[j]
+              this.sorted[j] = tmp
+            else
+              break
+            endif
+            j -= 1
+          endwhile
+        endfor
+      endif
+    endif
+  enddef
+
+  def Step(): number
+    if !this.started
+      this.started = true
+      this.CollectMatching()
+    endif
+    if this.cur >= len(this.sorted)
+      return 101  # DONE
+    endif
+    var r = this.sorted[this.cur]
+    this.cur += 1
+    var n = len(this.st.sel_tables)
+    var idxs: list<number> = []
+    for i in range(n)
+      add(idxs, this.db.FindTable(this.st.sel_tables[i].tname))
+    endfor
+    # compute offsets
+    var offsets: list<number> = []
+    var off = 0
+    for i in range(n)
+      add(offsets, off)
+      off += len(this.db.cols[idxs[i]])
+    endfor
+    # build output
+    this.outrow = []
+    this.nout = 0
+    if this.st.sel_star
+      for i in range(n)
+        for j in range(len(this.db.cols[idxs[i]]))
+          add(this.outrow, VCopy(r[offsets[i] + j]))
+        endfor
+      endfor
+    else
+      for rc in this.st.sel_cols
+        if rc.star
+          for i in range(n)
+            for j in range(len(this.db.cols[idxs[i]]))
+              add(this.outrow, VCopy(r[offsets[i] + j]))
+            endfor
+          endfor
+        else
+          var dot = stridx(rc.col, '.')
+          var ti = 0
+          var ci = -1
+          if dot >= 0
+            var tname = rc.col[: dot - 1]
+            for i in range(n)
+              var tn = !empty(this.st.sel_tables[i].alias) ? this.st.sel_tables[i].alias : this.st.sel_tables[i].tname
+              if tn ==? tname
+                ci = this.db.ColIndex(idxs[i], rc.col[dot + 1 :])
+                ti = i
+                break
+              endif
+            endfor
+          else
+            for i in range(n)
+              ci = this.db.ColIndex(idxs[i], rc.col)
+              if ci >= 0
+                ti = i
+                break
+              endif
+            endfor
+          endif
+          if ci < 0
+            add(this.outrow, VNull())
+          else
+            add(this.outrow, VCopy(r[offsets[ti] + ci]))
+          endif
+        endif
+      endfor
+    endif
+    this.nout = len(this.outrow)
+    return 100  # ROW
+  enddef
+
+  def ColumnCount(): number
+    return this.nout
+  enddef
+
+  def ColumnText(i: number): string
+    if i < 0 || i >= this.nout
+      return ''
+    endif
+    return VToText(this.outrow[i])
+  enddef
+
+  def ColumnInt64(i: number): number
+    if i < 0 || i >= this.nout
+      return 0
+    endif
+    return this.outrow[i].type == 'int' ? this.outrow[i].ival : 0
+  enddef
+
+  def Finalize()
+    # nothing special needed in GC language
+  enddef
+endclass
+```
+
+Now the public API methods on Sqlite3:
+
+```vim
+  def Prepare(sql: string): Sqlite3Stmt
+    var toks = Lex(sql)
+    var p = Parser.new(toks)
+    var st = p.Parse()
+    if empty(st)
+      this.errmsg = 'parse error'
+      return null_object
+    endif
+    return Sqlite3Stmt.new(this, st)
+  enddef
+
+  def Close()
+    # nothing needed
+  enddef
+
+  def Errmsg(): string
+    return this.errmsg
+  enddef
+```
+
+Now the demo:
+
+```vim
+def PrintRow(arg: any, vals: list<string>): void
+  echo join(vals, ' | ')
+enddef
+
+def Demo()
+  var db = Sqlite3.new()
+  var sql = "CREATE TABLE users (id INTEGER, name TEXT);"
+    .. "INSERT INTO users VALUES (1, 'ada');"
+    .. "INSERT INTO users VALUES (2, 'grace');"
+    .. "INSERT INTO users VALUES (3, 'linus');"
+    .. "SELECT * FROM users WHERE id > 1 ORDER BY id DESC;"
+  var rc = db.Exec(sql, PrintRow, null)
+  db.Close()
+enddef
+
+Demo()
+```
+
+Wait, I need to be careful with Vim9 syntax. Let me review some things:
+
+1. `==?` is case-insensitive comparison in Vim9
+2. String slicing: `sql[st : pos - 1]` - this should work
+3. `stridx` for finding substring
+4. `str2nr` for string to number
+5. `string()` for number to string - actually `string(42)` gives "42" but might add quotes for strings. Let me use `printf('%d', v.ival)` or just `'' .. v.ival`
+
+Actually, for VToText with int, I should use `printf('%d', v.ival)` or string concatenation. `string()` in Vim might produce something unexpected. Let me use `'' .. v.ival` which converts number to string.
+
+Wait, actually in Vim9, `'' .. 42` gives "42". That should work.
+
+Let me also check: `null_object` - is that valid in Vim9? I think `null` might work, or I should use a different approach. Actually in Vim9 script, `null` is not a keyword. Let me check... I think `null_object` might not exist. Let me just return an empty statement or handle it differently.
+
+Actually, looking at Vim9 docs, there's `null` for special types. But for objects, I might need to handle this differently. Let me just not return null and instead handle errors via the errmsg.
+
+Hmm, but `Prepare` needs to return something. Let me think... In Vim9, I can return `null_object` type. Actually, I'm not sure about the exact syntax. Let me just make Prepare return a Sqlite3Stmt or handle the error differently.
+
+Actually, let me look at this more carefully. In Vim9 script, you can use `null` for object references. But I'm not 100% sure. Let me just use a different approach - maybe throw an exception or return a special value.
+
+Actually, for simplicity, let me just have Prepare always return a statement, and if there's a parse error, the statement will have an error flag. Or I could just not worry about it and return a valid object that will produce an error on step.
+
+Let me simplify and just make it work for the demo case.
+
+Let me also reconsider the `Exec` callback. In Vim9, I need to handle the optional callback. Let me use a default no-op function.
+
+Actually, let me reconsider the whole structure. Vim9 classes are somewhat verbose. Let me try to be as concise as possible.
+
+One issue: in Vim9, `==?` is case-insensitive string comparison. But for the `op` comparison in EvalExpr, the C code uses `!strcmp(e->op,"=")` which is case-sensitive. But the AND/OR use `!strcasecmp`. Let me match the C behavior: comparison operators are case-sensitive, AND/OR are case-insensitive.
+
+Actually wait, looking at the C code more carefully:
+- `!strcasecmp(e->op,"AND")` - case-insensitive for AND/OR
+- `!strcmp(e->op,"=")` - case-sensitive for comparison ops
+
+But the lexer always produces the ops as they appear in the source. So `=` will always be `=`, `<>` will always be `<>`, etc. The AND/OR are stored as "AND"/"OR" (uppercased in the parser). So the case-sensitivity doesn't really matter for the comparison ops since they're always the same case.
+
+Let me just use `==` for comparison ops and `==?` for AND/OR to match the C behavior.
+
+Actually, looking at the parser code:
+```c
+strncpy(e->op,p_peek_kw(P,"and")?"AND":"OR",3);
+```
+So AND/OR are always stored as uppercase. And comparison ops are stored as-is from the lexer. So `==` should work for all of them.
+
+Let me also think about the `get()` function for dict access with defaults. In Vim9, `get(dict, key, default)` should work.
+
+Let me also handle the case where `st` might not have all keys. Since I'm using dicts, I need to use `get()` with defaults.
+
+Actually, let me make sure all statement dicts have consistent keys. Let me initialize them properly.
+
+Let me also think about `empty()` for checking if a dict is empty. In Vim9, `empty({})` should return true.
+
+Now let me also think about the `null` issue for the callback. In Vim9, I can define the callback parameter as optional:
+
+```vim
+def Exec(sql: string, cb: func(any, list<string>): void = (a, v) => {}, arg: any = 0): number
+```
+
+Wait, can I use a lambda as a default value? I'm not sure. Let me use a different approach - make the callback check optional.
+
+Actually, let me just define a no-op function and use it as default.
+
+Let me also think about whether `Sqlite3Stmt` needs to be defined before `Sqlite3` class since `Sqlite3.Exec` creates `Sqlite3Stmt` objects. In Vim9, I think classes need to be defined before use. So I should define `Sqlite3Stmt` first, then `Sqlite3`.
+
+But `Sqlite3Stmt` references `Sqlite3` in its constructor... This is a circular dependency. In Vim9, I think this might work if I use `any` type for the db parameter.
+
+Let me use `any` for the db type in Sqlite3Stmt.
+
+Actually, let me check if Vim9 allows forward references to classes... I think it might not. Let me restructure.
+
+One approach: define Sqlite3Stmt first with `var db: any`, then define Sqlite3 which can reference Sqlite3Stmt.
+
+Let me also think about the `Exec` method - it creates `Sqlite3Stmt` internally. If `Sqlite3Stmt` is defined first, this should work.
+
+Let me also reconsider: do I need to handle the `p.Accept('semi')` at the end of each statement in the exec loop? Looking at the C code, `parse()` calls `p_accept(P,TK_SEMI,NULL)` at the end. In my code, I have it in the `Parse()` method... actually no, I have it in the `Exec` loop. Let me put it in `Parse()` to match the C code.
+
+Wait, looking at the C code again:
+```c
+static int parse(Parser *P, Stmt *st){
+    ...
+    p_accept(P,TK_SEMI,NULL);
+    return 0;
+}
+```
+
+So the semicolon is consumed in `parse()`. Let me add it to my `Parse()` method.
+
+Actually, I already have `p.Accept('semi')` in the Exec loop. Let me move it to Parse() to match the C code. But actually, it doesn't matter much - either way works. Let me keep it in the Exec loop for clarity.
+
+Wait, actually in the C code, `parse()` is called once per statement, and it consumes the semicolon. Then the while loop checks for EOF. In my code, I should do the same.
+
+Let me put `this.Accept('semi')` at the end of `Parse()`.
+
+Now let me also think about the `range()` function. In Vim9, `range(n)` gives [0, 1, ..., n-1]. `range(1, n-1)` gives [1, 2, ..., n-1]. This should work for my loops.
+
+But wait, if `len(this.sorted)` is 0 or 1, `range(1, len(this.sorted) - 1)` would be `range(1, -1)` or `range(1, 0)`. In Vim, `range(1, -1)` gives [] and `range(1, 0)` gives []. So that should be fine.
+
+Actually, `range(1, 0)` gives [1, 0] in Vim? No, `range(1, 0)` gives [] because the default step is 1 and 0 < 1. Let me verify... Actually in Vim, `range(1, 0)` returns [] because you can't go from 1 to 0 with step +1. Good.
+
+But `range(1, -1)` also returns []. Good.
+
+Now let me think about string slicing. In Vim9, `str[a:b]` gives characters from index a to b inclusive. So `sql[st : pos - 1]` gives characters from st to pos-1 inclusive, which is correct.
+
+But what if `pos == st`? Then `sql[st : st - 1]` which is `sql[st : st-1]`. In Vim, this would give an empty string because the end index is before the start index. Good.
+
+Let me also think about the `stridx` function. `stridx(col, '.')` returns the byte index of '.' in col, or -1 if not found. This should work.
+
+For string slicing with stridx result: `col[: dot - 1]` gives everything before the dot, and `col[dot + 1 :]` gives everything after the dot. This should work in Vim9.
+
+Now let me think about the `==?` operator. In Vim9, `==?` is case-insensitive comparison. `==#` is case-sensitive. Plain `==` depends on the `ignorecase` setting. To be safe, I should use `==?` for case-insensitive and `==#` for case-sensitive.
+
+For the comparison operators (=, <>, <, >, <=, >=), the C code uses `strcmp` which is case-sensitive. But since the lexer produces these operators as-is, they'll always be the same case. So `==` should work. But to be safe, let me use `==#`.
+
+Actually, in Vim9 script, `==` for strings is case-sensitive by default (unlike legacy Vim script). So `==` should be fine.
+
+Hmm, actually I need to double-check. In Vim9 script, the `==` operator for strings is case-sensitive by default. Yes, that's correct - Vim9 script changed this from legacy Vim script.
+
+OK let me also think about the `Accept` method. The C code uses `strcasecmp` for text comparison in `p_accept`. So `Accept('kw', 'into')` should match case-insensitively. Let me use `==?` in the Accept method.
+
+Wait, but for non-keyword tokens like punctuation, the text is always the same case. So it doesn't matter. But for keywords, it should be case-insensitive. Let me use `==?` to be safe.
+
+Actually, looking at the C code:
+```c
+static int p_accept(Parser *P, TokKind k, const char *text){
+    if (P->t[P->i].kind!=k) return 0;
+    if (text && strcasecmp(P->t[P->i].text,text)) return 0;
+    P->i++; return 1;
+}
+```
+
+It uses `strcasecmp` for all text comparisons. So I should use `==?` in my Accept method.
+
+Now let me also think about the `PeekKw` method. The C code:
+```c
+static int p_peek_kw(Parser *P, const char *kw){
+    return P->t[P->i].kind==TK_KW && !strcasecmp(P->t[P->i].text,kw);
+}
+```
+
+Uses `strcasecmp`, so `==?` is correct.
+
+Let me also think about `schema_find` and `table_colindex` which use `strcasecmp`. So `==?` is correct for those too.
+
+Now let me think about the `VToText` function. For integers, the C code uses `snprintf(buf,n,"%ld",v->ival)`. In Vim9, I can use `printf('%d', v.ival)` or `'' .. v.ival`. Let me use `printf('%d', v.ival)` to be explicit.
+
+Actually, `string(v.ival)` in Vim9 gives the string representation of a number without quotes. Let me check... `string(42)` gives "42", `string("hello")` gives "'hello'". So for numbers, `string()` works. But to be safe, let me use `printf('%d', v.ival)`.
+
+Hmm, actually `printf('%d', 42)` gives "42" in Vim. That should work.
+
+Now let me think about the overall structure. I need to define:
+1. Value helper functions
+2. Lexer function
+3. Parser class
+4. Sqlite3Stmt class
+5. Sqlite3 class
+6. Demo function and call
+
+Let me also think about whether I need to handle the `Prepare` method returning null. In Vim9, I can return a `Sqlite3Stmt` or... actually, let me just make it always return a statement. If there's a parse error, I'll set an error flag and the Step method will return DONE immediately.
+
+Actually, let me simplify: if parse fails, set errmsg and return a "dummy" statement that has `is_select: false` so Step returns DONE.
+
+Hmm, but the C code returns 1 (error) from prepare_v2. Let me think about how to handle this in Vim9. I could return a tuple (rc, stmt) or throw an exception. For simplicity, let me just return the statement and have the caller check errmsg.
+
+Actually, let me look at how the demo uses the API. The demo only uses `exec`, not `prepare`. So I can keep `prepare` simple.
+
+Let me also think about the `Exec` callback. The C code's callback signature is `void (*cb)(void*,int,char**,char**)`. In Vim9, I'll make it `func(any, list<string>): void`.
+
+Now, one more thing: the C code's `sqlite3_exec` also has an `err` output parameter. In Vim9, I can just use the errmsg from the db object.
+
+Let me also think about the `Close` method. In Vim9 with garbage collection, I don't really need to free anything. But I'll keep the method for API compatibility.
+
+Let me now write the complete code. I'll try to be concise.
+
+Actually, I realize I should double-check some Vim9 syntax issues:
+
+1. Can I use `==?` for string comparison? Yes.
+2. Can I use `stridx`? Yes, it's a builtin.
+3. Can I use `printf`? Yes.
+4. Can I use `str2nr`? Yes.
+5. Can I use `add`, `len`, `empty`, `get`? Yes.
+6. Can I use `copy`? Yes.
+7. Can I use `join`? Yes.
+8. Can I use `string` regex matching with `=~`? Yes.
+9. Can I define classes with methods? Yes.
+10. Can I use default parameter values? Yes.
+11. Can I use `null` for object references? I need to check... In Vim9, `null` is used for special types. For objects, I think I can use `null_object` or just not return anything.
+
+Actually, let me check: in Vim9 script, `null` is a special value. `null_object`, `null_string`, `null_list`, etc. are typed null values. For a class type, I think `null` should work.
+
+Hmm, actually I'm not sure. Let me just avoid returning null and handle errors differently.
+
+For the `Prepare` method, let me return a Sqlite3Stmt that has an error state. Or I could just not worry about it since the demo doesn't use Prepare.
+
+Actually, let me just make Prepare work for the happy path and not worry about error handling too much.
+
+Let me also think about whether I need `export` for the classes. Since this is a standalone script with a demo, I don't need to export anything.
+
+One more thing: in Vim9, can I use `for i in range(n)` when n is 0? `range(0)` gives [0], not []. So `for i in range(0)` would iterate once with i=0. That's wrong if n=0. I should use `for i in range(len(something))` which handles empty lists correctly since `range(0)` gives [0] but `len([])` is 0 and `range(0)` gives [0]...
+
+Wait, `range(0)` in Vim gives [0], not []. That's a problem. Let me check... Actually, `range(0)` gives [] in Vim9? Let me think... `range(3)` gives [0, 1, 2]. `range(0)` gives [0]? No, I think `range(0)` gives [] because it generates numbers from 0 to 0-1=-1 which is empty. Actually no, `range(0)` gives [0] because it generates from 0 to 0 inclusive.
+
+Hmm, this is a common Vim gotcha. `range(0)` returns [0], not []. So I need to be careful.
+
+Actually, let me check: `range(n)` generates [0, 1, ..., n-1]. So `range(0)` generates [0, ..., -1] which is empty? No, `range(0)` in Vim generates [0] because it's range from 0 to 0.
+
+Wait, I need to be more careful. In Vim, `range(4)` returns [0, 1, 2, 3]. `range(0)` returns [0]. `range(-1)` returns [].
+
+So `range(0)` returns [0], which is wrong for iterating over an empty list. I should use `range(len(list))` instead, which for an empty list gives `range(0)` = [0]. That's still wrong!
+
+Hmm, actually let me reconsider. `len([])` is 0. `range(0)` is [0]. So `for i in range(len([]))` would iterate once with i=0, which is wrong.
+
+I should instead use `for i in range(len(list))` but only when len > 0, or use a different approach.
+
+Actually, wait. Let me re-check. In Vim9 script, `range(0)` returns [0]? Or []?
+
+Looking at Vim docs: `range({expr} [, {max} [, {stride}]])` - If only {expr} is specified, it's like range(0, {expr}-1). So `range(0)` is like `range(0, -1)` which is empty.
+
+Actually, I think I was wrong. `range(0)` returns [] because it's range(0, -1) which is empty. Let me verify: `range(4)` returns [0, 1, 2, 3] which is range(0, 3). So `range(0)` is range(0, -1) which is empty. Good.
+
+So `for i in range(len(list))` should work correctly for empty lists.
+
+OK, I think I was confused. `range(n)` in Vim gives [0, 1, ..., n-1], so `range(0)` gives []. Good.
+
+Now let me also think about the `=~` operator for character matching. In Vim9, `c =~ '\a'` checks if c matches the pattern '\a'. But `=~` does a full match, not a search. Actually, `=~` is a pattern match (search), not a full match. So `'a' =~ '\a'` returns true because 'a' contains a match for '\a'.
+
+Wait, actually `=~` in Vim is a "matches" operator - it checks if the string matches the pattern. It's like a search, not a full match. So `'abc' =~ '\a'` returns true. And `'a' =~ '\a'` also returns true. Good.
+
+But `'1' =~ '\d'` should return true. And `'_' =~ '\a'` - does \a match underscore? In Vim, \a matches alphabetic characters, not underscore. So `'_' =~ '\a'` is false. I need to handle underscore separately.
+
+In the lexer, I check `c =~ '\a' || c == '_'` for identifier start, and `c =~ '\a' || c =~ '\d' || c == '_'` for identifier continuation. This should work.
+
+But wait, `c =~ '\d'` - does \d match a single digit character? Yes, \d is [0-9] in Vim regex. And since c is a single character, `c =~ '\d'` will be true if c is a digit. Good.
+
+Actually, I realize there might be an issue. In Vim9, `=~` uses the pattern engine which might have different semantics. Let me use `charclass()` or just compare directly. Actually, let me use a simpler approach:
+
+For checking if a character is alphabetic: `c =~ '^\a$'` - but this uses full match. Actually, `=~` is a search, not full match. So `'a' =~ '\a'` is true, but so is `'1a' =~ '\a'`.
+
+For single characters, this should be fine since a single character either matches or doesn't.
+
+Actually, I just realized that in Vim9 script, `=~` is case-sensitive by default (unlike legacy Vim script where it depends on 'ignorecase'). And `=~#` is explicitly case-sensitive, `=~?` is case-insensitive. Since I'm using `\a` and `\d` which are character classes, case doesn't matter.
+
+Let me just use `=~` for pattern matching. It should work for single characters.
+
+Hmm, but there's another issue. In Vim9, the `=~` operator might not work as expected with single characters and patterns. Let me use a different approach - I'll use `matchstr()` or just check character ranges directly.
+
+Actually, let me use a helper function:
+
+```vim
+def IsAlpha(c: string): bool
+  return c =~ '\a'
+enddef
+
+def IsDigit(c: string): bool
+  return c =~ '\d'
+enddef
+```
+
+Or even simpler, I can use `char2nr(c)` and check ranges. But that's more verbose. Let me stick with `=~`.
+
+Actually, I just realized there might be an issue with empty strings. If `pos >= n`, then `sql[pos]` would be... In Vim9, indexing past the end of a string gives an empty string. So I need to be careful.
+
+Let me add bounds checking where needed.
+
+OK, let me also think about another issue. In Vim9, string indexing `sql[pos]` gives a single character. But if pos is out of bounds, it gives an empty string. So I need to check `pos < n` before accessing.
+
+Let me now write the complete code. I'll try to be as concise as possible while being correct.
+
+Actually, let me reconsider the structure. Instead of classes, maybe I should use a simpler approach with dict-based objects and standalone functions. This might be more concise.
+
+But the requirements say "a class/module Sqlite3 with methods open/exec/prepare/step/finalize/close". So I should use classes.
+
+Let me define:
+- `Sqlite3` class with methods: `new()` (open), `Exec()`, `Prepare()`, `Close()`, `Errmsg()`
+- `Sqlite3Stmt` class with methods: `new()`, `Step()`, `ColumnCount()`, `ColumnText()`, `ColumnInt64()`, `Finalize()`
+
+Let me write the final code now.
+
+One more consideration: in Vim9, can I have a class method that returns an instance of another class? Yes, as long as the other class is defined first.
+
+So the order should be:
+1. Value helper functions
+2. Lex function
+3. Parser class
+4. Sqlite3Stmt class (references Sqlite3 via `any` type)
+5. Sqlite3 class (references Sqlite3Stmt)
+6. Demo
+
+Let me also think about the `Exec` callback parameter. I'll make it optional with a no-op default.
+
+Actually, in Vim9, I'm not sure if I can use a lambda as a default parameter. Let me define a no-op function instead.
+
+```vim
+def NoopCb(arg: any, vals: list<string>): void
+enddef
+```
+
+Then use it as default: `cb: func(any, list<string>) = function('NoopCb')`
+
+Hmm, that's not great. Let me just make the callback check if it's null.
+
+Actually, in Vim9, I think I can do:
+
+```vim
+def Exec(sql: string, cb: func(any, list<string>): void = (a, v) => {}, arg: any = 0): number
+```
+
+Let me try that. If it doesn't work, I'll use a no-op function.
+
+Actually, I'm not sure if lambdas can be default values. Let me just use a different approach - make cb optional by checking if it's been provided.
+
+Hmm, in Vim9, all parameters must have values. Let me just use a no-op function.
+
+Actually, let me try a different approach. I'll make the callback a `func(any, list<string>): void` with a default of `null_function` or something. But I'm not sure if that exists.
+
+Let me just define a no-op function and use it as default. Or better yet, I'll just not use a default and always require the callback.
+
+For the demo, I'll always pass the callback. So let me just require it.
+
+Actually, looking at the C API, `sqlite3_exec` has a callback that can be NULL. Let me handle this by making the callback optional in a different way. I'll use a `any` type and check if it's a `Func` type.
+
+Hmm, this is getting complicated. Let me just use a simple approach:
+
+```vim
+def Exec(sql: string, cb: any = '', arg: any = 0): number
+```
+
+And then check `type(cb) == v:t_func` before calling it.
+
+Actually, in Vim9, I can use `type()` or just check with `exists()` or something. Let me use a simpler approach:
+
+I'll make cb a `func(any, list<string>): void` with no default, and always pass a callback. For the demo, I'll pass a real callback. For cases where no callback is needed, I'll pass a no-op.
+
+Actually, let me just define the no-op and use it:
+
+```vim
+def NoopCb(_: any, __: list<string>): void
+enddef
+```
+
+And in Exec:
+```vim
+def Exec(sql: string, cb: func(any, list<string>): void = NoopCb, arg: any = 0): number
+```
+
+Wait, can I use a function reference as a default value? In Vim9, I think I can use `function('NoopCb')` but not just `NoopCb`. Let me check...
+
+Actually, in Vim9 script, you can pass function references. `NoopCb` without quotes should work as a function reference. But I'm not sure if it can be used as a default parameter value.
+
+Let me just not use a default and always require the callback. The demo will always pass one.
+
+OK, let me just write the code now. I'll handle edge cases as needed.
+
+Let me also think about one more thing: the `str2nr` function. `str2nr('42')` returns 42. `str2nr('123')` returns 123. This should work for parsing integer literals.
+
+But wait, `str2nr` might parse things differently than `atol`. `atol('42abc')` returns 42, and `str2nr('42abc')` also returns 42 in Vim. So they should be equivalent for our purposes.
+
+OK, let me write the final code now. I'll be as concise as possible.
+
+Actually, one more thing: in the C code, the `v_cmp` function compares types by their enum value: V_NULL=0, V_INT=1, V_TEXT=2. So NULL < INT < TEXT. I need to match this.
+
+In my VCmp function, I need to map type strings to numbers: 'null' -> 0, 'int' -> 1, 'text' -> 2.
+
+Let me also think about the `VTruthy` function. The C code compares against v_int(0). So a value is truthy if it's not equal to integer 0. This means:
+- NULL: VCmp(null, int(0)) -> type mismatch, null type (0) < int type (1), so -1 != 0, truthy
+- INT 0: VCmp(int(0), int(0)) -> 0, so not truthy
+- INT 5: VCmp(int(5), int(0)) -> 1, truthy
+- TEXT '': VCmp(text(''), int(0)) -> type mismatch, text type (2) > int type (1), so 1 != 0, truthy
+- TEXT 'hello': same, truthy
+
+Wait, that means NULL is truthy? Let me check the C code:
+```c
+static int v_truthy(const Value *v){ Value z=v_int(0); return v_cmp(v,&z)!=0; }
+```
+
+For NULL vs INT: `v_cmp` returns `(int)a->type-(int)b->type` = 0-1 = -1. So -1 != 0, which means NULL is truthy. That seems like a bug in the C code, but I should match it.
+
+Actually, looking at it more carefully, this is used for WHERE clause evaluation. If WHERE is NULL, `row_match` returns 1 (true) because `where` is NULL (the expression is null, not a value). But if an expression evaluates to NULL, `v_truthy` would return true. This is a quirk of the C implementation that I should match.
+
+OK, let me match this behavior exactly.
+
+Now let me write the complete code:
+
+```vim
+vim9script
+
+# Value helpers
+def VNull(): dict<any>
+  return {type: 'null', ival: 0, sval: ''}
+enddef
+def VInt(i: number): dict<any>
+  return {type: 'int', ival: i, sval: ''}
+enddef
+def VText(s: string): dict<any>
+  return {type: 'text', ival: 0, sval: s}
+enddef
+def VCopy(v: dict<any>): dict<any>
+  return v.type == 'text' ? VText(v.sval) : deepcopy(v)
+enddef
+def VTypeOrd(t: string): number
+  return t == 'null' ? 0 : (t == 'int' ? 1 : 2)
+enddef
+def VCmp(a: dict<any>, b: dict<any>): number
+  if a.type != b.type
+    return VTypeOrd(a.type) - VTypeOrd(b.type)
+  endif
+  if a.type == 'int'
+    return a.ival < b.ival ? -1 : (a.ival > b.ival ? 1 : 0)
+  endif
+  if a.type == 'text'
+    return strcmp(a.sval, b.sval)
+  endif
+  return 0
+enddef
+def VToText(v: dict<any>): string
+  if v.type == 'int'
+    return printf('%d', v.ival)
+  endif
+  if v.type == 'text'
+    return v.sval
+  endif
+  return 'NULL'
+enddef
+def VTruthy(v: dict<any>): bool
+  return VCmp(v, VInt(0)) != 0
+enddef
+```
+
+Wait, `strcmp` is a Vim builtin? Let me check... Yes, `strcmp()` is available in Vim9 script. It returns -1, 0, or 1.
+
+Actually, I should use `strcmp()` or just compare with Vim operators. `strcmp` should work.
+
+Now the lexer:
+
+```vim
+var KEYWORDS: list<string> = ['create','table','insert','into','values','select','from','where','order','by','asc','desc','and','or','not','null','begin','commit','inner','join','on','int','integer','text','primary','key','transaction']
+
+def IsKw(s: string): bool
+  for k in KEYWORDS
+    if k ==? s
+      return true
+    endif
+  endfor
+  return false
+enddef
+
+def Lex(sql: string): list<dict<string>>
+  var toks: list<dict<string>> = []
+  var pos = 0
+  var n = len(sql)
+  while pos < n
+    var c = sql[pos]
+    if c == ' ' || c == "\t" || c == "\n" || c == "\r"
+      pos += 1
+      continue
+    endif
+    if c == '-' && pos + 1 < n && sql[pos + 1] == '-'
+      while pos < n && sql[pos] != "\n"
+        pos += 1
+      endwhile
+      continue
+    endif
+    if c =~ '\a' || c == '_'
+      var st = pos
+      while pos < n && (sql[pos] =~ '\a' || sql[pos] =~ '\d' || sql[pos] == '_')
+        pos += 1
+      endwhile
+      var w = sql[st : pos - 1]
+      add(toks, {kind: IsKw(w) ? 'kw' : 'id', text: w})
+      continue
+    endif
+    if c =~ '\d'
+      var st = pos
+      while pos < n && sql[pos] =~ '\d'
+        pos += 1
+      endwhile
+      add(toks, {kind: 'int', text: sql[st : pos - 1]})
+      continue
+    endif
+    if c == "'"
+      pos += 1
+      var st = pos
+      while pos < n && sql[pos] != "'"
+        pos += 1
+      endwhile
+      add(toks, {kind: 'string', text: sql[st : pos - 1]})
+      if pos < n
+        pos += 1
+      endif
+      continue
+    endif
+    if c == '"'
+      pos += 1
+      var st = pos
+      while pos < n && sql[pos] != '"'
+        pos += 1
+      endwhile
+      add(toks, {kind: 'id', text: sql[st : pos - 1]})
+      if pos < n
+        pos += 1
+      endif
+      continue
+    endif
+    if c == '*'
+      add(toks, {kind: 'star', text: '*'})
+      pos += 1
+    elseif c == ','
+      add(toks, {kind: 'comma', text: ','})
+      pos += 1
+    elseif c == '('
+      add(toks, {kind: 'lp', text: '('})
+      pos += 1
+    elseif c == ')'
+      add(toks, {kind: 'rp', text: ')'})
+      pos += 1
+    elseif c == ';'
+      add(toks, {kind: 'semi', text: ';'})
+      pos += 1
+    elseif c == '.'
+      add(toks, {kind: 'dot', text: '.'})
+      pos += 1
+    elseif c == '=' || c == '<' || c == '>' || c == '!'
+      var st = pos
+      if pos + 1 < n && sql[pos + 1] == '='
+        pos += 1
+      endif
+      if c == '<' && pos + 1 < n && sql[pos + 1] == '>'
+        pos += 1
+      endif
+      if c == '!' && pos + 1 < n && sql[pos + 1] == '='
+        pos += 1
+      endif
+      pos += 1
+      add(toks, {kind: 'op', text: sql[st : pos - 1]})
+    else
+      add(toks, {kind: 'punct', text: c})
+      pos += 1
+    endif
+  endwhile
+  add(toks, {kind: 'eof', text: ''})
+  return toks
+enddef
+```
+
+Now the Parser class:
+
+```vim
+class Parser
+  var toks: list<dict<string>>
+  var i: number = 0
+
+  def new(toks: list<dict<string>>)
+    this.toks = toks
+  enddef
+
+  def Peek(): dict<string>
+    return this.toks[this.i]
+  enddef
+
+  def Accept(kind: string, text: string = ''): bool
+    var t = this.toks[this.i]
+    if t.kind != kind
+      return false
+    endif
+    if text != '' && t.text !=? text
+      return false
+    endif
+    this.i += 1
+    return true
+  enddef
+
+  def AcceptKw(kw: string): bool
+    return this.Accept('kw', kw)
+  enddef
+
+  def PeekKw(kw: string): bool
+    return this.toks[this.i].kind == 'kw' && this.toks[this.i].text ==? kw
+  enddef
+
+  def ParsePrimary(): dict<any>
+    var t = this.Peek()
+    if t.kind == 'int'
+      this.i += 1
+      return {kind: 'int', ival: str2nr(t.text), sval: '', op: '', col: '', l: {}, r: {}}
+    endif
+    if t.kind == 'string'
+      this.i += 1
+      return {kind: 'str', ival: 0, sval: t.text, op: '', col: '', l: {}, r: {}}
+    endif
+    if t.kind == 'id' || t.kind == 'kw'
+      var col = t.text
+      this.i += 1
+      if this.Peek().kind == 'dot'
+        this.i += 1
+        col ..= '.' .. this.Peek().text
+        this.i += 1
+      endif
+      return {kind: 'col', ival: 0, sval: '', op: '', col: col, l: {}, r: {}}
+    endif
+    if this.Accept('lp')
+      var e = this.ParseExpr()
+      this.Accept('rp')
+      return e
+    endif
+    return {}
+  enddef
+
+  def ParseCmp(): dict<any>
+    var l = this.ParsePrimary()
+    if this.Peek().kind == 'op'
+      var op = this.Peek().text
+      this.i += 1
+      var r = this.ParsePrimary()
+      return {kind: 'binop', ival: 0, sval: '', op: op, col: '', l: l, r: r}
+    endif
+    return l
+  enddef
+
+  def ParseExpr(): dict<any>
+    var l = this.ParseCmp()
+    if this.PeekKw('and') || this.PeekKw('or')
+      var op = this.PeekKw('and') ? 'AND' : 'OR'
+      this.i += 1
+      var r = this.ParseExpr()
+      return {kind: 'binop', ival: 0, sval: '', op: op, col: '', l: l, r: r}
+    endif
+    return l
+  enddef
+
+  def ParseCreate(): dict<any>
+    var st: dict<any> = {is_create: true, ct_name: '', ct_cols: []}
+    var t = this.Peek()
+    if t.kind != 'id' && t.kind != 'kw'
+      return {}
+    endif
+    st.ct_name = t.text
+    this.i += 1
+    if !this.Accept('lp')
+      return {}
+    endif
+    while this.Peek().kind != 'rp' && this.Peek().kind != 'eof'
+      var t2 = this.Peek()
+      if t2.kind != 'id' && t2.kind != 'kw'
+        return {}
+      endif
+      add(st.ct_cols, t2.text)
+      this.i += 1
+      while this.Peek().kind != 'comma' && this.Peek().kind != 'rp' && this.Peek().kind != 'eof'
+        this.i += 1
+      endwhile
+      this.Accept('comma')
+    endwhile
+    this.Accept

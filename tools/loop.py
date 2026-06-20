@@ -89,14 +89,30 @@ Requirements:
 Now output the full port to {lang['name']} in a single fenced code block. Nothing else."""
     return [{"role": "system", "content": PORTER_SYS}, {"role": "user", "content": user}]
 
-def run_porter(lang: dict, *, max_tokens: int = 8000) -> tuple[str, dict, str]:
-    """Returns (ported_code, usage, raw_response)."""
+def run_porter(lang: dict, *, max_tokens: int = 32000) -> tuple[str, dict, str, float, str]:
+    """Returns (ported_code, usage, raw_response, elapsed, finish_reason).
+
+    If GLM-5.2 hits the length cap (finish_reason=='length'), retry once with
+    reasoning_effort='high' and a larger budget; that usually means the model
+    needs more thinking room to produce complete code in one pass.
+    """
     msgs = porter_prompt(lang)
     t0 = time.time()
-    raw, usage = llm.porter_text(msgs, max_tokens=max_tokens, temperature=0.2)
+    resp = llm.porter(msgs, max_tokens=max_tokens, temperature=0.3)
+    finish = resp.get("choices", [{}])[0].get("finish_reason", "")
+    usage = resp.get("usage", {})
+    raw = resp["choices"][0]["message"]["content"]
+    if finish == "length":
+        log(f"      porter length-capped ({usage.get('completion_tokens')} tok); retry high effort")
+        resp2 = llm.porter(msgs, max_tokens=max_tokens, temperature=0.3, reasoning_effort="high")
+        finish2 = resp2.get("choices", [{}])[0].get("finish_reason", "")
+        raw2 = resp2["choices"][0]["message"]["content"]
+        # prefer the retry if it produced a longer fenced code block
+        if len(llm.extract_code(raw2)) > len(llm.extract_code(raw)):
+            raw, usage, finish = raw2, resp2.get("usage", {}), finish2
     elapsed = time.time() - t0
     code = llm.extract_code(raw)
-    return code, usage, raw, elapsed
+    return code, usage, raw, elapsed, finish
 
 def judge(lang: dict, ported_code: str, *, max_tokens: int = 2000) -> tuple[dict, str, dict]:
     """Run the judge agent. Returns (score_dict, judge_text, usage)."""
@@ -147,6 +163,7 @@ def record_run(lang: dict, ported_code: str, port_tokens: int, orig_tokens: int,
         "slug": slug,
         "timestamp_utc": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "elapsed_seconds": round(elapsed, 1),
+        "porter_finish_reason": finish,
         "original_tokens": orig_tokens,
         "ported_tokens": port_tokens,
         "token_ratio": round(port_tokens / orig_tokens, 4) if orig_tokens else None,
@@ -231,7 +248,7 @@ def main(argv: list[str]) -> int:
             continue
         log(f"  >>> porting {slug} ({lang['name']})")
         try:
-            code, porter_usage, raw_porter, elapsed = run_porter(lang, max_tokens=args.max_tokens)
+            code, porter_usage, raw_porter, elapsed, finish = run_porter(lang, max_tokens=args.max_tokens)
             port_tokens, _, _ = tc.count_text(code), 0, 0
             port_tokens = tc.count_text(code)
             log(f"      porter done: {len(code)} bytes, {port_tokens} tokens, {elapsed:.1f}s")

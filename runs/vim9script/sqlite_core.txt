@@ -1,0 +1,107 @@
+var KEYWORDS: list<string> = ['create','table','insert','into','values','select','from','where','order','by','asc','desc','and','or','not','null','begin','commit','inner','join','on','int','integer','text','primary','key','transaction']
+
+def IsKw(s: string): bool
+  for k in KEYWORDS
+    if k ==? s
+      return true
+    endif
+  endfor
+  return false
+enddef
+
+def Lex(sql: string): list<dict<string>>
+  var toks: list<dict<string>> = []
+  var pos = 0
+  var n = len(sql)
+  while pos < n
+    var c = sql[pos]
+    if c == ' ' || c == "\t" || c == "\n" || c == "\r"
+      pos += 1
+      continue
+    endif
+    if c == '-' && pos + 1 < n && sql[pos + 1] == '-'
+      while pos < n && sql[pos] != "\n"
+        pos += 1
+      endwhile
+      continue
+    endif
+    if c =~ '\a' || c == '_'
+      var st = pos
+      while pos < n && (sql[pos] =~ '\a' || sql[pos] =~ '\d' || sql[pos] == '_')
+        pos += 1
+      endwhile
+      var w = sql[st : pos - 1]
+      add(toks, {kind: IsKw(w) ? 'kw' : 'id', text: w})
+      continue
+    endif
+    if c =~ '\d'
+      var st = pos
+      while pos < n && sql[pos] =~ '\d'
+        pos += 1
+      endwhile
+      add(toks, {kind: 'int', text: sql[st : pos - 1]})
+      continue
+    endif
+    if c == "'"
+      pos += 1
+      var st = pos
+      while pos < n && sql[pos] != "'"
+        pos += 1
+      endwhile
+      add(toks, {kind: 'string', text: sql[st : pos - 1]})
+      if pos < n
+        pos += 1
+      endif
+      continue
+    endif
+    if c == '"'
+      pos += 1
+      var st = pos
+      while pos < n && sql[pos] != '"'
+        pos += 1
+      endwhile
+      add(toks, {kind: 'id', text: sql[st : pos - 1]})
+      if pos < n
+        pos += 1
+      endif
+      continue
+    endif
+    if c == '*'
+      add(toks, {kind: 'star', text: '*'})
+      pos += 1
+    elseif c == ','
+      add(toks, {kind: 'comma', text: ','})
+      pos += 1
+    elseif c == '('
+      add(toks, {kind: 'lp', text: '('})
+      pos += 1
+    elseif c == ')'
+      add(toks, {kind: 'rp', text: ')'})
+      pos += 1
+    elseif c == ';'
+      add(toks, {kind: 'semi', text: ';'})
+      pos += 1
+    elseif c == '.'
+      add(toks, {kind: 'dot', text: '.'})
+      pos += 1
+    elseif c == '=' || c == '<' || c == '>' || c == '!'
+      var st = pos
+      if pos + 1 < n && sql[pos + 1] == '='
+        pos += 1
+      endif
+      if c == '<' && pos + 1 < n && sql[pos + 1] == '>'
+        pos += 1
+      endif
+      if c == '!' && pos + 1 < n && sql[pos + 1] == '='
+        pos += 1
+      endif
+      pos += 1
+      add(toks, {kind: 'op', text: sql[st : pos - 1]})
+    else
+      add(toks, {kind: 'punct', text: c})
+      pos += 1
+    endif
+  endwhile
+  add(toks, {kind: 'eof', text: ''})
+  return toks
+enddef

@@ -36,3 +36,14 @@ To https://github.com/altdansalt/essence.git
 [2026-06-20T17:10:45Z]   >>> porting csharp (C#)
 [2026-06-20T17:11:54Z]       porter done: 29026 bytes, 6931 tokens, 69.0s
 [2026-06-20T17:11:57Z]       judge: completeness=72 notes=Port captures most API surface (sqlite3_open/close/exec/prepare_v2/step/finalize
+[main 3d80f25] port: csharp (C#) completeness=72
+ 7 files changed, 1470 insertions(+), 2 deletions(-)
+ create mode 100644 runs/csharp/judge_raw.txt
+ create mode 100644 runs/csharp/meta.json
+ create mode 100644 runs/csharp/porter_raw.txt
+ create mode 100644 runs/csharp/sqlite_core.cs
+To https://github.com/altdansalt/essence.git
+   4563bcd..3d80f25  main -> main
+[2026-06-20T17:11:58Z]   >>> porting vim9script (Vim9 script)
+[2026-06-20T17:14:46Z]       porter done: 2706 bytes, 928 tokens, 168.1s
+[2026-06-20T17:14:48Z]       judge: completeness=15 notes=Port is severely incomplete: only lexer stub is present with no parser, AST, exe
