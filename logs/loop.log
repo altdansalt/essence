@@ -59,3 +59,15 @@
 NameError: name 'finish' is not defined
 
 [2026-06-20T17:25:46Z] loop done: 0 runs
+[2026-06-20T17:25:54Z]       porter done: 21050 bytes, 7421 tokens, 81.9s
+[2026-06-20T17:25:54Z]       porter done: 26171 bytes, 6961 tokens, 82.1s
+[2026-06-20T17:25:56Z]       judge: completeness=75 notes=Port covers all major API functions and SQL features with functional equivalence
+[2026-06-20T17:25:56Z]       ERROR on nostos: name 'finish' is not defined
+[2026-06-20T17:25:56Z] Traceback (most recent call last):
+  File "/home/exedev/essence/tools/loop.py", line 258, in main
+    record_run(lang, code, port_tokens, orig_tokens,
+  File "/home/exedev/essence/tools/loop.py", line 166, in record_run
+    "porter_finish_reason": finish,
+                            ^^^^^^
+NameError: name 'finish' is not defined
+

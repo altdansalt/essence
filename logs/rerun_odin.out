@@ -1,2 +1,3 @@
 [2026-06-20T17:24:32Z] loop start: 1 languages, orig_tokens=8805
 [2026-06-20T17:24:32Z]   >>> porting odin (Odin)
+[2026-06-20T17:25:54Z]       porter done: 21050 bytes, 7421 tokens, 81.9s
