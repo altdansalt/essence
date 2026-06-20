@@ -1,0 +1,9 @@
+```json
+{
+  "completeness": 15,
+  "api_surface": 5,
+  "sql_features": 25,
+  "architecture": 20,
+  "notes": "The port is severely incomplete, containing only expression evaluation and row context logic. Missing: entire lexer, parser, statement structures, database/store management, all public API functions (sqlite3_open/close/exec/prepare_v2/step/finalize/column_*), and main demo. No compilation possible."
+}
+```

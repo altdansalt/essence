@@ -1,0 +1,40 @@
+{
+  "language": "OCaml",
+  "slug": "ocaml",
+  "timestamp_utc": "2026-06-20T17:49:25Z",
+  "elapsed_seconds": 381.2,
+  "porter_finish_reason": "length",
+  "original_tokens": 8805,
+  "ported_tokens": 623,
+  "token_ratio": 0.0708,
+  "reduction_factor": 14.13,
+  "porter_model": "accounts/fireworks/models/glm-5p2",
+  "judge_model": "claude-haiku-4-5",
+  "porter_usage": {
+    "prompt_tokens": 13620,
+    "total_tokens": 29620,
+    "completion_tokens": 16000,
+    "prompt_tokens_details": {
+      "cached_tokens": 177
+    }
+  },
+  "judge_usage": {
+    "input_tokens": 12467,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "cache_creation": {
+      "ephemeral_5m_input_tokens": 0,
+      "ephemeral_1h_input_tokens": 0
+    },
+    "output_tokens": 121,
+    "service_tier": "standard",
+    "inference_geo": "not_available"
+  },
+  "judge_score": {
+    "completeness": 15,
+    "api_surface": 5,
+    "sql_features": 25,
+    "architecture": 20,
+    "notes": "The port is severely incomplete, containing only expression evaluation and row context logic. Missing: entire lexer, parser, statement structures, database/store management, all public API functions (sqlite3_open/close/exec/prepare_v2/step/finalize/column_*), and main demo. No compilation possible."
+  }
+}
