@@ -15,8 +15,9 @@ Reduction >1 means the port is smaller than the C reference by token count.
 | 8 | Nostos | 42 | 1.35x | 6506/8805 | The port captures core architectural elements (lexer, parser, AST, sch |
 | 9 | Scala | 42 | 1.3x | 6752/8805 | The Scala port captures core SQL parsing and execution logic but has s |
 | 10 | F# | 32 | 1.4x | 6298/8805 | The F# port has significant structural issues: Parser class lacks prop |
-| 11 | Odin | 15 | n/a | 136/8805 | Port is severely incomplete: only two small cleanup procedures shown ( ⚠️ capped/incomplete |
-| 12 | OCaml | 15 | n/a | 623/8805 | The port is severely incomplete, containing only expression evaluation ⚠️ capped/incomplete |
-| 13 | Gleam | 12 | n/a | 180/8805 | The port shows only a single utility function (v_cmp) with no database ⚠️ capped/incomplete |
-| 14 | Vim9 script | 8 | n/a | 132/8805 | Port is essentially a stub demo that calls nonexistent Sqlite3 class m ⚠️ capped/incomplete |
-| 15 | Erlang | 8 | n/a | 167/8805 | The Erlang port provides only a single `project/6` function for column ⚠️ capped/incomplete |
+| 11 | Elixir | 24 | n/a | 221/8805 | Port is severely incomplete. Only partial lexer/parser stubs present;  ⚠️ capped/incomplete |
+| 12 | Odin | 15 | n/a | 136/8805 | Port is severely incomplete: only two small cleanup procedures shown ( ⚠️ capped/incomplete |
+| 13 | OCaml | 15 | n/a | 623/8805 | The port is severely incomplete, containing only expression evaluation ⚠️ capped/incomplete |
+| 14 | Gleam | 12 | n/a | 180/8805 | The port shows only a single utility function (v_cmp) with no database ⚠️ capped/incomplete |
+| 15 | Vim9 script | 8 | n/a | 132/8805 | Port is essentially a stub demo that calls nonexistent Sqlite3 class m ⚠️ capped/incomplete |
+| 16 | Erlang | 8 | n/a | 167/8805 | The Erlang port provides only a single `project/6` function for column ⚠️ capped/incomplete |
