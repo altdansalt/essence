@@ -297,9 +297,18 @@ def rebuild_leaderboard() -> None:
            "|---|----------|-------------|-----------|------------------|-------|"]
     for i, r in enumerate(rows, 1):
         js = r.get("judge_score", {})
-        out.append(f"| {i} | {r['language']} | {js.get('completeness','-')} | "
-                   f"{r.get('reduction_factor','-')}x | {r.get('ported_tokens','-')}/{r.get('original_tokens','-')} | "
-                   f"{(js.get('notes','') or '').replace('|','\\|')[:80]} |")
+        finish = r.get('porter_finish_reason', '')
+        comp = js.get('completeness', 0) or 0
+        red = r.get('reduction_factor')
+        flag = ""
+        if finish == "length" or comp < 30:
+            flag = " ⚠️ capped/incomplete"
+            red_disp = "n/a"
+        else:
+            red_disp = f"{red}x" if red else "-"
+        out.append(f"| {i} | {r['language']} | {comp} | "
+                   f"{red_disp} | {r.get('ported_tokens','-')}/{r.get('original_tokens','-')} | "
+                   f"{(js.get('notes','') or '').replace('|','\\|')[:70]}{flag} |")
     out.append("")
     open(os.path.join(ROOT, "LANGUAGES.md"), "w").write("\n".join(out))
 
