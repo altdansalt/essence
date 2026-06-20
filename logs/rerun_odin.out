@@ -11,3 +11,7 @@
                             ^^^^^^
 NameError: name 'finish' is not defined
 
+[main 7515dd6] port: odin failed: name 'finish' is not defined
+ 5 files changed, 954 insertions(+)
+ create mode 100644 runs/odin/ERROR.txt
+ create mode 100644 runs/odin/sqlite_core.odin
