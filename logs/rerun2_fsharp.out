@@ -2,3 +2,16 @@
 [2026-06-20T17:34:47Z]   >>> porting fsharp (F#)
 [2026-06-20T17:35:57Z]       porter done: 24139 bytes, 6298 tokens, 69.7s
 [2026-06-20T17:35:59Z]       judge: completeness=32 notes=The F# port has significant structural issues: Parser class lacks proper positio
+[main 346a09f] port: fsharp (F#) completeness=32
+ 10 files changed, 1267 insertions(+)
+ create mode 100644 logs/rerun2_fsharp.out
+ create mode 100644 logs/rerun2_nostos.out
+ create mode 100644 logs/rerun2_odin.out
+ create mode 100644 logs/rerun2_vim9script.out
+ create mode 100644 runs/fsharp/judge_raw.txt
+ create mode 100644 runs/fsharp/meta.json
+ create mode 100644 runs/fsharp/porter_raw.txt
+ create mode 100644 runs/fsharp/sqlite_core.fs
+To https://github.com/altdansalt/essence.git
+   fdee532..346a09f  main -> main
+[2026-06-20T17:36:01Z] loop done: 1 runs

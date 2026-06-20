@@ -10,3 +10,4 @@ Reduction >1 means the port is smaller than the C reference by token count.
 | 3 | Rust | 72 | 1.29x | 6805/8805 | The Rust port successfully translates the core architecture (lexer, parser, exec |
 | 4 | C# | 72 | 1.27x | 6931/8805 | Port captures most API surface (sqlite3_open/close/exec/prepare_v2/step/finalize |
 | 5 | Haxe | 72 | 1.23x | 7182/8805 | Port captures core lexer, parser, and executor structure with correct SQL featur |
+| 6 | F# | 32 | 1.4x | 6298/8805 | The F# port has significant structural issues: Parser class lacks proper positio |

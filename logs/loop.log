@@ -105,3 +105,4 @@ NameError: name 'finish' is not defined
 [2026-06-20T17:34:47Z]   >>> porting vim9script (Vim9 script)
 [2026-06-20T17:35:57Z]       porter done: 24139 bytes, 6298 tokens, 69.7s
 [2026-06-20T17:35:59Z]       judge: completeness=32 notes=The F# port has significant structural issues: Parser class lacks proper positio
+[2026-06-20T17:36:01Z] loop done: 1 runs
