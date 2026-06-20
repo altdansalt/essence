@@ -1,0 +1,39 @@
+{
+  "language": "Java",
+  "slug": "java",
+  "timestamp_utc": "2026-06-20T17:15:41Z",
+  "elapsed_seconds": 49.1,
+  "original_tokens": 8805,
+  "ported_tokens": 6175,
+  "token_ratio": 0.7013,
+  "reduction_factor": 1.43,
+  "porter_model": "accounts/fireworks/models/glm-5p2",
+  "judge_model": "claude-haiku-4-5",
+  "porter_usage": {
+    "prompt_tokens": 13946,
+    "total_tokens": 20218,
+    "completion_tokens": 6272,
+    "prompt_tokens_details": {
+      "cached_tokens": 177
+    }
+  },
+  "judge_usage": {
+    "input_tokens": 20175,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "cache_creation": {
+      "ephemeral_5m_input_tokens": 0,
+      "ephemeral_1h_input_tokens": 0
+    },
+    "output_tokens": 98,
+    "service_tier": "standard",
+    "inference_geo": "not_available"
+  },
+  "judge_score": {
+    "completeness": 78,
+    "api_surface": 82,
+    "sql_features": 75,
+    "architecture": 75,
+    "notes": "Java port captures most C API surface and core SQL features but has structural gaps: ORDER BY with joins incomplete, missing column aliasing, some edge case handling differs. Architecture ported cleanly with good OOP adaptation."
+  }
+}

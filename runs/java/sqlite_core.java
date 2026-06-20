@@ -1,0 +1,569 @@
+import java.util.*;
+import java.util.function.*;
+
+public class Sqlite3 {
+
+    // ---------- Value ----------
+    enum VType { V_NULL, V_INT, V_TEXT }
+    static final class Value {
+        VType type;
+        long ival;
+        String sval;
+        Value(VType t, long i, String s){ type=t; ival=i; sval=s; }
+        static Value vNull(){ return new Value(VType.V_NULL,0,null); }
+        static Value vInt(long i){ return new Value(VType.V_INT,i,null); }
+        static Value vText(String s){ return new Value(VType.V_TEXT,0,s!=null?s:""); }
+        Value copy(){ return type==VType.V_TEXT ? vText(sval) : new Value(type,ival,sval); }
+        static int cmp(Value a, Value b){
+            if(a.type!=b.type) return a.type.ordinal()-b.type.ordinal();
+            if(a.type==VType.V_INT) return Long.compare(a.ival,b.ival);
+            if(a.type==VType.V_TEXT) return (a.sval!=null?a.sval:"").compareTo(b.sval!=null?b.sval:"");
+            return 0;
+        }
+        String toText(){
+            if(type==VType.V_INT) return String.valueOf(ival);
+            if(type==VType.V_TEXT) return sval!=null?sval:"";
+            return "NULL";
+        }
+        boolean truthy(){ return cmp(this, vInt(0))!=0; }
+    }
+
+    // ---------- Schema ----------
+    static final class Table {
+        String name;
+        String[] cols;
+        int ncols;
+        Table(String n, String[] c){ name=n; cols=c; ncols=c.length; }
+        int colIndex(String col){
+            for(int i=0;i<ncols;i++) if(cols[i].equalsIgnoreCase(col)) return i;
+            return -1;
+        }
+    }
+
+    // ---------- Row / Store ----------
+    static final class Row { Value[] vals; int n; Row(Value[] v){ vals=v; n=v.length; } Row(){ vals=null; n=0; } }
+    static final class RowNode { Row row; RowNode next; RowNode(Row r){ row=r; } }
+    static final class RowStore { RowNode head, tail; int nrows; }
+
+    // ---------- Lexer ----------
+    enum TokKind { TK_EOF, TK_ID, TK_INT, TK_STRING, TK_KW, TK_PUNCT, TK_STAR, TK_COMMA, TK_LP, TK_RP, TK_SEMI, TK_OP, TK_DOT }
+    static final class Token { TokKind kind; String text; Token(TokKind k,String t){ kind=k; text=t; } }
+
+    static final Set<String> KEYWORDS = new HashSet<>(Arrays.asList(
+        "create","table","insert","into","values","select","from","where",
+        "order","by","asc","desc","and","or","not","null","begin","commit",
+        "inner","join","on","int","integer","text","primary","key","transaction"
+    ));
+
+    static List<Token> lex(String sql){
+        List<Token> toks = new ArrayList<>();
+        int pos=0, n=sql.length();
+        while(pos<n){
+            char c=sql.charAt(pos);
+            if(Character.isWhitespace(c)){ pos++; continue; }
+            if(c=='-' && pos+1<n && sql.charAt(pos+1)=='-'){
+                while(pos<n && sql.charAt(pos)!='\n') pos++;
+                continue;
+            }
+            if(Character.isLetter(c) || c=='_'){
+                int st=pos;
+                while(pos<n && (Character.isLetterOrDigit(sql.charAt(pos)) || sql.charAt(pos)=='_')) pos++;
+                String s=sql.substring(st,pos);
+                toks.add(new Token(KEYWORDS.contains(s.toLowerCase())?TokKind.TK_KW:TokKind.TK_ID, s));
+                continue;
+            }
+            if(Character.isDigit(c)){
+                int st=pos;
+                while(pos<n && Character.isDigit(sql.charAt(pos))) pos++;
+                toks.add(new Token(TokKind.TK_INT, sql.substring(st,pos)));
+                continue;
+            }
+            if(c=='\''){
+                int st=++pos;
+                while(pos<n && sql.charAt(pos)!='\'') pos++;
+                toks.add(new Token(TokKind.TK_STRING, sql.substring(st,pos)));
+                if(pos<n) pos++;
+                continue;
+            }
+            if(c=='"'){
+                int st=++pos;
+                while(pos<n && sql.charAt(pos)!='"') pos++;
+                toks.add(new Token(TokKind.TK_ID, sql.substring(st,pos)));
+                if(pos<n) pos++;
+                continue;
+            }
+            switch(c){
+                case '*': toks.add(new Token(TokKind.TK_STAR,"*")); pos++; break;
+                case ',': toks.add(new Token(TokKind.TK_COMMA,",")); pos++; break;
+                case '(': toks.add(new Token(TokKind.TK_LP,"(")); pos++; break;
+                case ')': toks.add(new Token(TokKind.TK_RP,")")); pos++; break;
+                case ';': toks.add(new Token(TokKind.TK_SEMI,";")); pos++; break;
+                case '.': toks.add(new Token(TokKind.TK_DOT,".")); pos++; break;
+                default:
+                    if("=<>!".indexOf(c)>=0){
+                        int st=pos;
+                        if(pos+1<n && sql.charAt(pos+1)=='=') pos++;
+                        if(c=='<' && pos+1<n && sql.charAt(pos+1)=='>') pos++;
+                        if(c=='!' && pos+1<n && sql.charAt(pos+1)=='=') pos++;
+                        pos++;
+                        toks.add(new Token(TokKind.TK_OP, sql.substring(st,pos)));
+                    } else { toks.add(new Token(TokKind.TK_PUNCT, String.valueOf(c))); pos++; }
+            }
+        }
+        toks.add(new Token(TokKind.TK_EOF,""));
+        return toks;
+    }
+
+    // ---------- AST ----------
+    static final class Expr {
+        enum Kind { E_COL, E_INT, E_STR, E_BINOP }
+        Kind kind; String col; long ival; String sval; String op; Expr l, r;
+        static Expr col(String c){ Expr e=new Expr(); e.kind=Kind.E_COL; e.col=c; return e; }
+        static Expr intl(long i){ Expr e=new Expr(); e.kind=Kind.E_INT; e.ival=i; return e; }
+        static Expr str(String s){ Expr e=new Expr(); e.kind=Kind.E_STR; e.sval=s; return e; }
+        static Expr binop(String o, Expr ll, Expr rr){ Expr e=new Expr(); e.kind=Kind.E_BINOP; e.op=o; e.l=ll; e.r=rr; return e; }
+    }
+
+    static final class ResultCol { String col; boolean star; }
+    static final class TableRef { String tname, alias; }
+
+    static final class Stmt {
+        boolean isCreate, isInsert, isSelect, isBegin, isCommit;
+        String ctName; String[] ctCols; int ctNcols;
+        String insTable; Value[] insVals; int insNvals;
+        ResultCol[] selCols; int selNcols; boolean selStar;
+        TableRef[] selTables; int selNtables;
+        Expr selWhere; String selOrderCol; boolean selOrderDesc; Expr selJoinOn;
+    }
+
+    // ---------- Parser ----------
+    static final class Parser {
+        List<Token> t; int i;
+        Parser(List<Token> toks){ t=toks; i=0; }
+        Token cur(){ return t.get(i); }
+        boolean accept(TokKind k){ return accept(k,null); }
+        boolean accept(TokKind k, String text){
+            if(cur().kind!=k) return false;
+            if(text!=null && !cur().text.equalsIgnoreCase(text)) return false;
+            i++; return true;
+        }
+        boolean acceptKw(String kw){ return accept(TokKind.TK_KW, kw); }
+        boolean peekKw(String kw){ return cur().kind==TokKind.TK_KW && cur().text.equalsIgnoreCase(kw); }
+
+        Expr parsePrimary(){
+            Token tk=cur();
+            if(tk.kind==TokKind.TK_INT){ i++; return Expr.intl(Long.parseLong(tk.text)); }
+            if(tk.kind==TokKind.TK_STRING){ i++; return Expr.str(tk.text); }
+            if(tk.kind==TokKind.TK_ID || tk.kind==TokKind.TK_KW){
+                StringBuilder sb=new StringBuilder(tk.text); i++;
+                if(cur().kind==TokKind.TK_DOT){ i++; sb.append('.').append(cur().text); i++; }
+                return Expr.col(sb.toString());
+            }
+            if(accept(TokKind.TK_LP)){ Expr e=parseExpr(); accept(TokKind.TK_RP); return e; }
+            return null;
+        }
+        Expr parseCmp(){
+            Expr l=parsePrimary();
+            if(cur().kind==TokKind.TK_OP){ String o=cur().text; i++; Expr r=parsePrimary(); return Expr.binop(o,l,r); }
+            return l;
+        }
+        Expr parseExpr(){
+            Expr l=parseCmp();
+            if(peekKw("and")||peekKw("or")){
+                String o = peekKw("and")?"AND":"OR"; i++;
+                Expr r=parseExpr();
+                return Expr.binop(o,l,r);
+            }
+            return l;
+        }
+
+        int parseCreate(Stmt st){
+            st.isCreate=true;
+            if(cur().kind!=TokKind.TK_ID && cur().kind!=TokKind.TK_KW) return -1;
+            st.ctName=cur().text; i++;
+            if(!accept(TokKind.TK_LP)) return -1;
+            List<String> cols=new ArrayList<>();
+            while(cur().kind!=TokKind.TK_RP && cur().kind!=TokKind.TK_EOF){
+                if(cur().kind!=TokKind.TK_ID && cur().kind!=TokKind.TK_KW) return -1;
+                cols.add(cur().text); i++;
+                while(cur().kind!=TokKind.TK_COMMA && cur().kind!=TokKind.TK_RP && cur().kind!=TokKind.TK_EOF) i++;
+                accept(TokKind.TK_COMMA);
+            }
+            accept(TokKind.TK_RP);
+            st.ctCols=cols.toArray(new String[0]); st.ctNcols=cols.size();
+            return 0;
+        }
+        int parseInsert(Stmt st){
+            st.isInsert=true;
+            if(!acceptKw("into")) return -1;
+            if(cur().kind!=TokKind.TK_ID) return -1;
+            st.insTable=cur().text; i++;
+            if(!acceptKw("values")) return -1;
+            if(!accept(TokKind.TK_LP)) return -1;
+            List<Value> vals=new ArrayList<>();
+            while(cur().kind!=TokKind.TK_RP && cur().kind!=TokKind.TK_EOF){
+                if(cur().kind==TokKind.TK_INT) vals.add(Value.vInt(Long.parseLong(cur().text)));
+                else if(cur().kind==TokKind.TK_STRING) vals.add(Value.vText(cur().text));
+                else if(acceptKw("null")) vals.add(Value.vNull());
+                else return -1;
+                if(cur().kind!=TokKind.TK_RP) i++;
+                if(!accept(TokKind.TK_COMMA)) break;
+            }
+            if(!accept(TokKind.TK_RP)) return -1;
+            st.insVals=vals.toArray(new Value[0]); st.insNvals=vals.size();
+            return 0;
+        }
+        int parseSelect(Stmt st){
+            st.isSelect=true;
+            if(accept(TokKind.TK_STAR)){ st.selStar=true; }
+            else {
+                List<ResultCol> cols=new ArrayList<>();
+                do {
+                    ResultCol rc=new ResultCol(); rc.star=false;
+                    if(accept(TokKind.TK_STAR)){ rc.star=true; }
+                    else if(cur().kind==TokKind.TK_ID || cur().kind==TokKind.TK_KW){
+                        StringBuilder sb=new StringBuilder(cur().text); i++;
+                        if(cur().kind==TokKind.TK_DOT){
+                            i++;
+                            if(accept(TokKind.TK_STAR)){ rc.star=true; }
+                            else { sb.append('.').append(cur().text); i++; rc.col=sb.toString(); }
+                        } else rc.col=sb.toString();
+                    } else return -1;
+                    cols.add(rc);
+                } while(accept(TokKind.TK_COMMA));
+                st.selCols=cols.toArray(new ResultCol[0]); st.selNcols=cols.size();
+            }
+            if(!acceptKw("from")) return -1;
+            if(cur().kind!=TokKind.TK_ID) return -1;
+            List<TableRef> tables=new ArrayList<>();
+            {
+                TableRef tr=new TableRef(); tr.tname=cur().text; i++;
+                if(cur().kind==TokKind.TK_ID && !peekKw("on") && !peekKw("where") && !peekKw("order") && !peekKw("inner") && !peekKw("join")){
+                    tr.alias=cur().text; i++;
+                }
+                tables.add(tr);
+            }
+            while(peekKw("inner")||peekKw("join")){
+                if(acceptKw("inner")){ if(!acceptKw("join")) return -1; }
+                else acceptKw("join");
+                if(cur().kind!=TokKind.TK_ID) return -1;
+                TableRef tr=new TableRef(); tr.tname=cur().text; i++;
+                if(cur().kind==TokKind.TK_ID && !peekKw("on") && !peekKw("where") && !peekKw("order")){
+                    tr.alias=cur().text; i++;
+                }
+                tables.add(tr);
+                if(acceptKw("on")){
+                    Expr on=parseExpr();
+                    if(st.selJoinOn==null) st.selJoinOn=on;
+                    else st.selJoinOn=Expr.binop("AND", st.selJoinOn, on);
+                }
+            }
+            st.selTables=tables.toArray(new TableRef[0]); st.selNtables=tables.size();
+            if(acceptKw("where")) st.selWhere=parseExpr();
+            if(acceptKw("order")){
+                if(!acceptKw("by")) return -1;
+                if(cur().kind!=TokKind.TK_ID && cur().kind!=TokKind.TK_KW) return -1;
+                st.selOrderCol=cur().text; i++;
+                if(acceptKw("desc")) st.selOrderDesc=true;
+                else acceptKw("asc");
+            }
+            return 0;
+        }
+        int parse(Stmt st){
+            if(peekKw("begin")){ st.isBegin=true; i++; acceptKw("transaction"); }
+            else if(peekKw("commit")){ st.isCommit=true; i++; acceptKw("transaction"); }
+            else if(acceptKw("create")){ if(acceptKw("table")) return parseCreate(st); return -1; }
+            else if(acceptKw("insert")) return parseInsert(st);
+            else if(acceptKw("select")) return parseSelect(st);
+            else return -1;
+            accept(TokKind.TK_SEMI);
+            return 0;
+        }
+    }
+
+    // ---------- Database ----------
+    List<Table> schema = new ArrayList<>();
+    List<RowStore> stores = new ArrayList<>();
+    String errmsg = "";
+    int inTxn = 0;
+
+    Table schemaFind(String name){
+        for(Table t: schema) if(t.name.equalsIgnoreCase(name)) return t;
+        return null;
+    }
+    int schemaIndex(String name){
+        for(int i=0;i<schema.size();i++) if(schema.get(i).name.equalsIgnoreCase(name)) return i;
+        return -1;
+    }
+    int schemaAdd(String name, String[] cols){
+        if(schemaFind(name)!=null) return -1;
+        schema.add(new Table(name, cols));
+        stores.add(new RowStore());
+        return 0;
+    }
+
+    int execCreate(Stmt st){
+        if(schemaAdd(st.ctName, st.ctCols)!=0){
+            errmsg="table already exists: "+st.ctName;
+            return -1;
+        }
+        return 0;
+    }
+    int execInsert(Stmt st){
+        int idx=schemaIndex(st.insTable);
+        if(idx<0){ errmsg="no such table: "+st.insTable; return -1; }
+        RowStore rs=stores.get(idx);
+        Value[] vals=new Value[st.insNvals];
+        for(int i=0;i<st.insNvals;i++) vals[i]=st.insVals[i].copy();
+        RowNode node=new RowNode(new Row(vals));
+        if(rs.tail!=null) rs.tail.next=node; else rs.head=node;
+        rs.tail=node; rs.nrows++;
+        return 0;
+    }
+
+    // ---------- expression eval ----------
+    static final class RowCtx {
+        TableRef[] refs; int n; Table[] tabs; Row[] rows;
+        RowCtx(TableRef[] r, int nt, Table[] t, Row[] rw){ refs=r; n=nt; tabs=t; rows=rw; }
+        int[] colIndex(String col){
+            int dot=col.indexOf('.');
+            if(dot>=0){
+                String tname=col.substring(0,dot), cname=col.substring(dot+1);
+                for(int i=0;i<n;i++){
+                    String tn = refs[i].alias!=null?refs[i].alias:refs[i].tname;
+                    if(tn.equalsIgnoreCase(tname)){
+                        int ci=tabs[i].colIndex(cname);
+                        if(ci>=0) return new int[]{i,ci};
+                    }
+                }
+                return null;
+            }
+            for(int i=0;i<n;i++){
+                int ci=tabs[i].colIndex(col);
+                if(ci>=0) return new int[]{i,ci};
+            }
+            return null;
+        }
+    }
+
+    static Value evalExpr(Expr e, RowCtx c){
+        if(e==null) return Value.vNull();
+        switch(e.kind){
+            case E_INT: return Value.vInt(e.ival);
+            case E_STR: return Value.vText(e.sval);
+            case E_COL: {
+                int[] idx=c.colIndex(e.col);
+                if(idx==null) return Value.vNull();
+                return c.rows[idx[0]].vals[idx[1]].copy();
+            }
+            case E_BINOP: {
+                Value a=evalExpr(e.l,c), b=evalExpr(e.r,c);
+                Value res;
+                if(e.op.equalsIgnoreCase("AND")) res=Value.vInt(a.truthy()&&b.truthy()?1:0);
+                else if(e.op.equalsIgnoreCase("OR")) res=Value.vInt(a.truthy()||b.truthy()?1:0);
+                else {
+                    int cmp=Value.cmp(a,b);
+                    if(e.op.equals("=")) res=Value.vInt(cmp==0?1:0);
+                    else if(e.op.equals("<>")) res=Value.vInt(cmp!=0?1:0);
+                    else if(e.op.equals("<")) res=Value.vInt(cmp<0?1:0);
+                    else if(e.op.equals(">")) res=Value.vInt(cmp>0?1:0);
+                    else if(e.op.equals("<=")) res=Value.vInt(cmp<=0?1:0);
+                    else if(e.op.equals(">=")) res=Value.vInt(cmp>=0?1:0);
+                    else res=Value.vNull();
+                }
+                return res;
+            }
+        }
+        return Value.vNull();
+    }
+
+    static boolean rowMatch(Expr where, RowCtx c){
+        if(where==null) return true;
+        return evalExpr(where,c).truthy();
+    }
+
+    // ---------- prepared statement ----------
+    public static final class sqlite3_stmt {
+        Sqlite3 db;
+        Stmt st;
+        boolean started=false;
+        int curSorted=0;
+        Row[] sorted=new Row[0];
+        int nsorted=0;
+        Value[] outrow=new Value[0];
+        int nout=0;
+
+        void collectMatching(){
+            int n=st.selNtables;
+            int[] idx=new int[n];
+            Table[] tabs=new Table[n];
+            for(int i=0;i<n;i++){ idx[i]=db.schemaIndex(st.selTables[i].tname); tabs[i]=idx[i]>=0?db.schema.get(idx[i]):null; }
+            RowNode[] cur=new RowNode[n];
+            for(int i=0;i<n;i++) cur[i]=idx[i]>=0?db.stores.get(idx[i]).head:null;
+            List<Row> results=new ArrayList<>();
+            while(true){
+                boolean ok=true;
+                for(int i=0;i<n;i++) if(cur[i]==null){ ok=false; break; }
+                if(!ok) break;
+                Row[] rows=new Row[n];
+                for(int i=0;i<n;i++) rows[i]=cur[i].row;
+                RowCtx c=new RowCtx(st.selTables, n, tabs, rows);
+                if(rowMatch(st.selWhere, c) && (st.selJoinOn==null || rowMatch(st.selJoinOn, c))){
+                    List<Value> all=new ArrayList<>();
+                    for(int i=0;i<n;i++) for(int j=0;j<rows[i].n;j++) all.add(rows[i].vals[j].copy());
+                    results.add(new Row(all.toArray(new Value[0])));
+                }
+                int k;
+                for(k=n-1;k>=0;k--){
+                    cur[k]=cur[k].next;
+                    if(cur[k]!=null) break;
+                    if(k>0) cur[k]=idx[k]>=0?db.stores.get(idx[k]).head:null;
+                }
+                if(k<0) break;
+            }
+            sorted=results.toArray(new Row[0]); nsorted=results.size();
+            // ORDER BY
+            if(st.selOrderCol!=null && n==1){
+                Table t0=tabs[0];
+                int cidx=t0.colIndex(st.selOrderCol);
+                if(cidx>=0){
+                    for(int i=1;i<nsorted;i++){
+                        for(int j=i;j>0;j--){
+                            Value a=sorted[j-1].vals[cidx], b=sorted[j].vals[cidx];
+                            int cmp=Value.cmp(a,b);
+                            if((st.selOrderDesc && cmp<0) || (!st.selOrderDesc && cmp>0)){
+                                Row tmp=sorted[j-1]; sorted[j-1]=sorted[j]; sorted[j]=tmp;
+                            } else break;
+                        }
+                    }
+                }
+            }
+        }
+
+        int stepSelect(){
+            if(!started){ started=true; collectMatching(); }
+            if(curSorted>=nsorted) return 101;
+            Row r=sorted[curSorted++];
+            int n=st.selNtables;
+            Table[] tabs=new Table[n];
+            for(int i=0;i<n;i++) tabs[i]=db.schemaFind(st.selTables[i].tname);
+            int[] offsets=new int[n];
+            int off=0;
+            for(int i=0;i<n;i++){ offsets[i]=off; off+=tabs[i].ncols; }
+            int noutCount;
+            if(st.selStar) noutCount=off;
+            else {
+                noutCount=0;
+                for(int k=0;k<st.selNcols;k++){
+                    if(st.selCols[k].star){ for(int i=0;i<n;i++) noutCount+=tabs[i].ncols; }
+                    else noutCount++;
+                }
+            }
+            outrow=new Value[noutCount]; nout=0;
+            if(st.selStar){
+                for(int i=0;i<n;i++) for(int j=0;j<tabs[i].ncols;j++) outrow[nout++]=r.vals[offsets[i]+j].copy();
+            } else {
+                for(int k=0;k<st.selNcols;k++){
+                    ResultCol rc=st.selCols[k];
+                    if(rc.star){
+                        for(int i=0;i<n;i++) for(int j=0;j<tabs[i].ncols;j++) outrow[nout++]=r.vals[offsets[i]+j].copy();
+                    } else {
+                        int dot=rc.col.indexOf('.');
+                        int ti=0, ci=-1;
+                        if(dot>=0){
+                            String tname=rc.col.substring(0,dot), cname=rc.col.substring(dot+1);
+                            for(int i=0;i<n;i++){
+                                String tn=st.selTables[i].alias!=null?st.selTables[i].alias:st.selTables[i].tname;
+                                if(tn.equalsIgnoreCase(tname)){ ci=tabs[i].colIndex(cname); ti=i; break; }
+                            }
+                        } else {
+                            for(int i=0;i<n;i++){ ci=tabs[i].colIndex(rc.col); if(ci>=0){ ti=i; break; } }
+                        }
+                        if(ci<0) outrow[nout++]=Value.vNull();
+                        else outrow[nout++]=r.vals[offsets[ti]+ci].copy();
+                    }
+                }
+            }
+            return 100;
+        }
+    }
+
+    // ---------- public API ----------
+    public static Sqlite3 open(String name){ return new Sqlite3(); }
+    public int close(){ return 0; }
+    public String errmsg(){ return errmsg; }
+
+    public interface ExecCallback { void call(Object arg, int n, String[] vals, String[] cols); }
+
+    public int exec(String sql, ExecCallback cb, Object arg, String[] err){
+        List<Token> toks=lex(sql);
+        Parser p=new Parser(toks);
+        int rc=0;
+        while(p.cur().kind!=TokKind.TK_EOF){
+            Stmt st=new Stmt();
+            if(p.parse(st)<0){ if(err!=null) err[0]="parse error"; rc=1; break; }
+            if(st.isBegin) inTxn=1;
+            else if(st.isCommit) inTxn=0;
+            else if(st.isCreate) rc=execCreate(st);
+            else if(st.isInsert) rc=execInsert(st);
+            else if(st.isSelect){
+                sqlite3_stmt s=new sqlite3_stmt(); s.db=this; s.st=st;
+                int r;
+                while((r=s.stepSelect())==100){
+                    String[] vals=new String[s.nout];
+                    for(int i=0;i<s.nout;i++) vals[i]=s.outrow[i].toText();
+                    if(cb!=null) cb.call(arg, s.nout, vals, null);
+                }
+            }
+            if(rc!=0 && err!=null && err[0]==null) err[0]=errmsg;
+        }
+        return rc;
+    }
+
+    public sqlite3_stmt prepare_v2(String sql, int n, String[] tail){
+        String buf = n<0 ? sql : sql.substring(0, Math.min(n, sql.length()));
+        List<Token> toks=lex(buf);
+        Parser p=new Parser(toks);
+        Stmt st=new Stmt();
+        if(p.parse(st)<0) return null;
+        sqlite3_stmt s=new sqlite3_stmt(); s.db=this; s.st=st;
+        return s;
+    }
+
+    public static int step(sqlite3_stmt s){
+        if(s.st.isSelect) return s.stepSelect();
+        return 101;
+    }
+    public static int column_count(sqlite3_stmt s){ return s.nout; }
+    public static String column_text(sqlite3_stmt s, int i){
+        if(i<0||i>=s.nout) return null;
+        return s.outrow[i].toText();
+    }
+    public static long column_int64(sqlite3_stmt s, int i){
+        if(i<0||i>=s.nout) return 0;
+        return s.outrow[i].type==VType.V_INT ? s.outrow[i].ival : 0;
+    }
+    public static int finalize(sqlite3_stmt s){ return 0; }
+
+    // ---------- demo ----------
+    static void printRow(Object arg, int n, String[] vals, String[] cols){
+        StringBuilder sb=new StringBuilder();
+        for(int i=0;i<n;i++){ sb.append(vals[i]); sb.append(i+1<n?" | ":"\n"); }
+        System.out.print(sb);
+    }
+
+    public static void main(String[] args){
+        Sqlite3 db = Sqlite3.open(":memory:");
+        String[] err = new String[1];
+        String sql =
+            "CREATE TABLE users (id INTEGER, name TEXT);" +
+            "INSERT INTO users VALUES (1, 'ada');" +
+            "INSERT INTO users VALUES (2, 'grace');" +
+            "INSERT INTO users VALUES (3, 'linus');" +
+            "SELECT * FROM users WHERE id > 1 ORDER BY id DESC;";
+        if(db.exec(sql, Sqlite3::printRow, null, err)!=0){
+            System.err.println("err: "+(err[0]!=null?err[0]:"?"));
+        }
+        db.close();
+    }
+}

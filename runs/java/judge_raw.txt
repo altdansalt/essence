@@ -1,0 +1,9 @@
+```json
+{
+  "completeness": 78,
+  "api_surface": 82,
+  "sql_features": 75,
+  "architecture": 75,
+  "notes": "Java port captures most C API surface and core SQL features but has structural gaps: ORDER BY with joins incomplete, missing column aliasing, some edge case handling differs. Architecture ported cleanly with good OOP adaptation."
+}
+```
