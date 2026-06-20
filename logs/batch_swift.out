@@ -8,3 +8,19 @@
  create mode 100644 runs/swift/meta.json
  create mode 100644 runs/swift/porter_raw.txt
  create mode 100644 runs/swift/sqlite_core.swift
+To https://github.com/altdansalt/essence.git
+ ! [remote rejected] main -> main (cannot lock ref 'refs/heads/main': is at cc93892ad8af244ac88a4111d44ba259d8a8a759 but expected 5c0a3e3903e5bfd4e531c76334c25bdb30158a74)
+error: failed to push some refs to 'https://github.com/altdansalt/essence.git'
+[2026-06-20T17:44:06Z]       ERROR on swift: Command '['git', 'push']' returned non-zero exit status 1.
+[2026-06-20T17:44:06Z] Traceback (most recent call last):
+  File "/home/exedev/essence/tools/loop.py", line 263, in main
+    commit_push(f"port: {slug} ({lang['name']}) completeness={comp}", not args.no_push)
+  File "/home/exedev/essence/tools/loop.py", line 211, in commit_push
+    git("push")
+  File "/home/exedev/essence/tools/loop.py", line 201, in git
+    return subprocess.run(["git", *args], cwd=ROOT, check=check).returncode
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/subprocess.py", line 571, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['git', 'push']' returned non-zero exit status 1.
+

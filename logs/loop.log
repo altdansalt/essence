@@ -139,3 +139,16 @@ NameError: name 'finish' is not defined
 [2026-06-20T17:44:04Z]       judge: completeness=78 notes=TypeScript port captures the core API surface and SQL features well, but has inc
 [2026-06-20T17:44:05Z]       judge: completeness=72 notes=Swift port successfully translates core lexer, parser, and executor logic with g
 [2026-06-20T17:44:05Z] loop done: 1 runs
+[2026-06-20T17:44:06Z]       ERROR on swift: Command '['git', 'push']' returned non-zero exit status 1.
+[2026-06-20T17:44:06Z] Traceback (most recent call last):
+  File "/home/exedev/essence/tools/loop.py", line 263, in main
+    commit_push(f"port: {slug} ({lang['name']}) completeness={comp}", not args.no_push)
+  File "/home/exedev/essence/tools/loop.py", line 211, in commit_push
+    git("push")
+  File "/home/exedev/essence/tools/loop.py", line 201, in git
+    return subprocess.run(["git", *args], cwd=ROOT, check=check).returncode
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/subprocess.py", line 571, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['git', 'push']' returned non-zero exit status 1.
+

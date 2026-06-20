@@ -1,0 +1,12 @@
+Command '['git', 'push']' returned non-zero exit status 1.
+Traceback (most recent call last):
+  File "/home/exedev/essence/tools/loop.py", line 263, in main
+    commit_push(f"port: {slug} ({lang['name']}) completeness={comp}", not args.no_push)
+  File "/home/exedev/essence/tools/loop.py", line 211, in commit_push
+    git("push")
+  File "/home/exedev/essence/tools/loop.py", line 201, in git
+    return subprocess.run(["git", *args], cwd=ROOT, check=check).returncode
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/subprocess.py", line 571, in run
+    raise CalledProcessError(retcode, process.args,
+subprocess.CalledProcessError: Command '['git', 'push']' returned non-zero exit status 1.
