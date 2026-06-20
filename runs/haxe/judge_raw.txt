@@ -1,0 +1,9 @@
+```json
+{
+  "completeness": 72,
+  "api_surface": 75,
+  "sql_features": 80,
+  "architecture": 65,
+  "notes": "Port captures core lexer, parser, and executor structure with correct SQL feature coverage (CREATE TABLE, INSERT, SELECT with WHERE/ORDER BY/JOINs). Missing: sqlite3_finalize cleanup details, proper transaction handling, some edge cases in join/ORDER BY logic for multi-table scenarios, and materialization of sorted results for joins is incomplete."
+}
+```

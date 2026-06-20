@@ -13,3 +13,7 @@
 [2026-06-20T17:02:30Z]       porter done: 20003 bytes, 5200 tokens, 100.4s
 [2026-06-20T17:02:32Z]       judge: completeness=42 notes=Python port is incomplete: the Sqlite3Stmt._collect_matching method is truncated
 [2026-06-20T17:02:33Z] loop done: 1 runs
+[2026-06-20T17:04:04Z] loop start: 8 languages, orig_tokens=8805
+[2026-06-20T17:04:04Z]   >>> porting haxe (Haxe)
+[2026-06-20T17:05:13Z]       porter done: 25676 bytes, 7182 tokens, 69.1s
+[2026-06-20T17:05:16Z]       judge: completeness=72 notes=Port captures core lexer, parser, and executor structure with correct SQL featur

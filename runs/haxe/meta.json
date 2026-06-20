@@ -1,0 +1,39 @@
+{
+  "language": "Haxe",
+  "slug": "haxe",
+  "timestamp_utc": "2026-06-20T17:05:16Z",
+  "elapsed_seconds": 69.1,
+  "original_tokens": 8805,
+  "ported_tokens": 7182,
+  "token_ratio": 0.8157,
+  "reduction_factor": 1.23,
+  "porter_model": "accounts/fireworks/models/glm-5p2",
+  "judge_model": "claude-haiku-4-5",
+  "porter_usage": {
+    "prompt_tokens": 13788,
+    "total_tokens": 21089,
+    "completion_tokens": 7301,
+    "prompt_tokens_details": {
+      "cached_tokens": 10
+    }
+  },
+  "judge_usage": {
+    "input_tokens": 20724,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "cache_creation": {
+      "ephemeral_5m_input_tokens": 0,
+      "ephemeral_1h_input_tokens": 0
+    },
+    "output_tokens": 128,
+    "service_tier": "standard",
+    "inference_geo": "not_available"
+  },
+  "judge_score": {
+    "completeness": 72,
+    "api_surface": 75,
+    "sql_features": 80,
+    "architecture": 65,
+    "notes": "Port captures core lexer, parser, and executor structure with correct SQL feature coverage (CREATE TABLE, INSERT, SELECT with WHERE/ORDER BY/JOINs). Missing: sqlite3_finalize cleanup details, proper transaction handling, some edge cases in join/ORDER BY logic for multi-table scenarios, and materialization of sorted results for joins is incomplete."
+  }
+}

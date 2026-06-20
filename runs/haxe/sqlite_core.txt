@@ -1,0 +1,656 @@
+class Sqlite3 {
+    // ---------- Value ----------
+    static enum abstract VType(Int) {
+        var VNull = 0; var VInt = 1; var VText = 2;
+    }
+
+    static function vCmp(a:Value, b:Value):Int {
+        if (a.type != b.type) return a.type - b.type;
+        return switch (a.type) {
+            case VInt: a.ival < b.ival ? -1 : (a.ival > b.ival ? 1 : 0);
+            case VText: (a.sval == null ? "" : a.sval) < (b.sval == null ? "" : b.sval) ? -1 :
+                        (a.sval == null ? "" : a.sval) > (b.sval == null ? "" : b.sval) ? 1 : 0;
+            default: 0;
+        }
+    }
+
+    static function vTruthy(v:Value):Bool return vCmp(v, {type: VInt, ival: 0, sval: null}) != 0;
+
+    static function vToText(v:Value):String {
+        return switch (v.type) {
+            case VInt: Std.string(v.ival);
+            case VText: v.sval;
+            default: "NULL";
+        }
+    }
+
+    static function vCopy(v:Value):Value {
+        return {type: v.type, ival: v.ival, sval: v.type == VText ? (v.sval == null ? "" : v.sval) : null};
+    }
+
+    // ---------- Schema ----------
+    static function schemaFind(s:Schema, name:String):Table {
+        for (t in s.tables) if (t.name.toLowerCase() == name.toLowerCase()) return t;
+        return null;
+    }
+
+    static function schemaIndex(s:Schema, name:String):Int {
+        for (i in 0...s.tables.length) if (s.tables[i].name.toLowerCase() == name.toLowerCase()) return i;
+        return -1;
+    }
+
+    static function tableColIndex(t:Table, col:String):Int {
+        for (i in 0...t.cols.length) if (t.cols[i].toLowerCase() == col.toLowerCase()) return i;
+        return -1;
+    }
+
+    // ---------- Lexer ----------
+    static var KEYWORDS:Array<String> = [
+        "create","table","insert","into","values","select","from","where",
+        "order","by","asc","desc","and","or","not","null","begin","commit",
+        "inner","join","on","int","integer","text","primary","key","transaction"
+    ];
+
+    static function isKw(s:String):Bool {
+        var sl = s.toLowerCase();
+        for (k in KEYWORDS) if (k == sl) return true;
+        return false;
+    }
+
+    static function lex(sql:String):Array<Token> {
+        var toks:Array<Token> = [];
+        var i = 0;
+        while (i < sql.length) {
+            var c = sql.charAt(i);
+            if (c == " " || c == "\t" || c == "\n" || c == "\r") { i++; continue; }
+            if (c == "-" && sql.charAt(i + 1) == "-") {
+                while (i < sql.length && sql.charAt(i) != "\n") i++;
+                continue;
+            }
+            if ((c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || c == "_") {
+                var st = i;
+                while (i < sql.length) {
+                    var ch = sql.charAt(i);
+                    if ((ch >= "a" && ch <= "z") || (ch >= "A" && ch <= "Z") || (ch >= "0" && ch <= "9") || ch == "_") i++;
+                    else break;
+                }
+                var word = sql.substr(st, i - st);
+                toks.push({kind: isKw(word) ? TKw : TId, text: word});
+                continue;
+            }
+            if (c >= "0" && c <= "9") {
+                var st = i;
+                while (i < sql.length && sql.charAt(i) >= "0" && sql.charAt(i) <= "9") i++;
+                toks.push({kind: TInt, text: sql.substr(st, i - st)});
+                continue;
+            }
+            if (c == "'") {
+                i++;
+                var st = i;
+                while (i < sql.length && sql.charAt(i) != "'") i++;
+                toks.push({kind: TString, text: sql.substr(st, i - st)});
+                if (i < sql.length && sql.charAt(i) == "'") i++;
+                continue;
+            }
+            if (c == '"') {
+                i++;
+                var st = i;
+                while (i < sql.length && sql.charAt(i) != '"') i++;
+                toks.push({kind: TId, text: sql.substr(st, i - st)});
+                if (i < sql.length && sql.charAt(i) == '"') i++;
+                continue;
+            }
+            switch (c) {
+                case "*": toks.push({kind: TStar, text: "*"}); i++;
+                case ",": toks.push({kind: TComma, text: ","}); i++;
+                case "(": toks.push({kind: TLp, text: "("}); i++;
+                case ")": toks.push({kind: TRp, text: ")"}); i++;
+                case ";": toks.push({kind: TSemi, text: ";"}); i++;
+                case ".": toks.push({kind: TDot, text: "."}); i++;
+                default:
+                    if (c == "=" || c == "<" || c == ">" || c == "!") {
+                        var st = i;
+                        if (sql.charAt(i + 1) == "=") i++;
+                        if (c == "<" && sql.charAt(i + 1) == ">") i++;
+                        if (c == "!" && sql.charAt(i + 1) == "=") i++;
+                        i++;
+                        toks.push({kind: TOp, text: sql.substr(st, i - st)});
+                    } else {
+                        toks.push({kind: TPunct, text: c}); i++;
+                    }
+            }
+        }
+        toks.push({kind: TEof, text: ""});
+        return toks;
+    }
+
+    // ---------- Parser ----------
+    static function pAccept(p:Parser, k:TokKind, ?text:String):Bool {
+        if (p.toks[p.i].kind != k) return false;
+        if (text != null && p.toks[p.i].text.toLowerCase() != text.toLowerCase()) return false;
+        p.i++;
+        return true;
+    }
+
+    static function pAcceptKw(p:Parser, kw:String):Bool return pAccept(p, TKw, kw);
+
+    static function pPeekKw(p:Parser, kw:String):Bool {
+        return p.toks[p.i].kind == TKw && p.toks[p.i].text.toLowerCase() == kw.toLowerCase();
+    }
+
+    static function parsePrimary(p:Parser):Expr {
+        var t = p.toks[p.i];
+        if (t.kind == TInt) { p.i++; return {kind: EInt, ival: Std.parseInt(t.text), sval: null, col: null, op: null, l: null, r: null}; }
+        if (t.kind == TString) { p.i++; return {kind: EStr, ival: 0, sval: t.text, col: null, op: null, l: null, r: null}; }
+        if (t.kind == TId || t.kind == TKw) {
+            var buf = t.text; p.i++;
+            if (p.toks[p.i].kind == TDot) {
+                p.i++;
+                buf += "." + p.toks[p.i].text;
+                p.i++;
+            }
+            return {kind: ECol, ival: 0, sval: null, col: buf, op: null, l: null, r: null};
+        }
+        if (pAccept(p, TLp)) { var e = parseExpr(p); pAccept(p, TRp); return e; }
+        return null;
+    }
+
+    static function parseCmp(p:Parser):Expr {
+        var l = parsePrimary(p);
+        if (p.toks[p.i].kind == TOp) {
+            var op = p.toks[p.i].text; p.i++;
+            var r = parsePrimary(p);
+            return {kind: EBinop, ival: 0, sval: null, col: null, op: op, l: l, r: r};
+        }
+        return l;
+    }
+
+    static function parseExpr(p:Parser):Expr {
+        var l = parseCmp(p);
+        if (pPeekKw(p, "and") || pPeekKw(p, "or")) {
+            var op = pPeekKw(p, "and") ? "AND" : "OR";
+            p.i++;
+            var r = parseExpr(p);
+            return {kind: EBinop, ival: 0, sval: null, col: null, op: op, l: l, r: r};
+        }
+        return l;
+    }
+
+    static function parseCreate(p:Parser, st:Stmt):Bool {
+        st.isCreate = true;
+        if (p.toks[p.i].kind != TId && p.toks[p.i].kind != TKw) return false;
+        st.ctName = p.toks[p.i].text; p.i++;
+        if (!pAccept(p, TLp)) return false;
+        while (p.toks[p.i].kind != TRp && p.toks[p.i].kind != TEof) {
+            if (p.toks[p.i].kind != TId && p.toks[p.i].kind != TKw) return false;
+            st.ctCols.push(p.toks[p.i].text);
+            p.i++;
+            while (p.toks[p.i].kind != TComma && p.toks[p.i].kind != TRp && p.toks[p.i].kind != TEof) p.i++;
+            pAccept(p, TComma);
+        }
+        pAccept(p, TRp);
+        return true;
+    }
+
+    static function parseInsert(p:Parser, st:Stmt):Bool {
+        st.isInsert = true;
+        if (!pAcceptKw(p, "into")) return false;
+        if (p.toks[p.i].kind != TId) return false;
+        st.insTable = p.toks[p.i].text; p.i++;
+        if (!pAcceptKw(p, "values")) return false;
+        if (!pAccept(p, TLp)) return false;
+        while (p.toks[p.i].kind != TRp && p.toks[p.i].kind != TEof) {
+            var v:Value;
+            if (p.toks[p.i].kind == TInt) v = {type: VInt, ival: Std.parseInt(p.toks[p.i].text), sval: null};
+            else if (p.toks[p.i].kind == TString) v = {type: VText, ival: 0, sval: p.toks[p.i].text};
+            else if (pAcceptKw(p, "null")) v = {type: VNull, ival: 0, sval: null};
+            else return false;
+            p.i++;
+            st.insVals.push(v);
+            if (!pAccept(p, TComma)) break;
+        }
+        if (!pAccept(p, TRp)) return false;
+        return true;
+    }
+
+    static function parseSelect(p:Parser, st:Stmt):Bool {
+        st.isSelect = true;
+        if (pAccept(p, TStar)) {
+            st.selStar = true;
+        } else {
+            do {
+                var rc:ResultCol = {col: null, star: false};
+                if (pAccept(p, TStar)) {
+                    rc.star = true;
+                } else if (p.toks[p.i].kind == TId || p.toks[p.i].kind == TKw) {
+                    var buf = p.toks[p.i].text; p.i++;
+                    if (p.toks[p.i].kind == TDot) {
+                        p.i++;
+                        if (pAccept(p, TStar)) {
+                            rc.star = true;
+                        } else {
+                            buf += "." + p.toks[p.i].text; p.i++;
+                            rc.col = buf;
+                        }
+                    } else {
+                        rc.col = buf;
+                    }
+                } else return false;
+                st.selCols.push(rc);
+            } while (pAccept(p, TComma));
+        }
+        if (!pAcceptKw(p, "from")) return false;
+        if (p.toks[p.i].kind != TId) return false;
+        // first table
+        var tr:TableRef = {tname: p.toks[p.i].text, alias: null};
+        p.i++;
+        if (p.toks[p.i].kind == TId && !pPeekKw(p, "on") && !pPeekKw(p, "where")
+            && !pPeekKw(p, "order") && !pPeekKw(p, "inner") && !pPeekKw(p, "join")) {
+            tr.alias = p.toks[p.i].text; p.i++;
+        }
+        st.selTables.push(tr);
+        // joins
+        while (pPeekKw(p, "inner") || pPeekKw(p, "join")) {
+            if (pAcceptKw(p, "inner")) { if (!pAcceptKw(p, "join")) return false; }
+            else pAcceptKw(p, "join");
+            if (p.toks[p.i].kind != TId) return false;
+            var tr2:TableRef = {tname: p.toks[p.i].text, alias: null};
+            p.i++;
+            if (p.toks[p.i].kind == TId && !pPeekKw(p, "on") && !pPeekKw(p, "where") && !pPeekKw(p, "order")) {
+                tr2.alias = p.toks[p.i].text; p.i++;
+            }
+            st.selTables.push(tr2);
+            if (pAcceptKw(p, "on")) {
+                var on = parseExpr(p);
+                if (st.selJoinOn == null) st.selJoinOn = on;
+                else st.selJoinOn = {kind: EBinop, ival: 0, sval: null, col: null, op: "AND", l: st.selJoinOn, r: on};
+            }
+        }
+        if (pAcceptKw(p, "where")) st.selWhere = parseExpr(p);
+        if (pAcceptKw(p, "order")) {
+            if (!pAcceptKw(p, "by")) return false;
+            if (p.toks[p.i].kind != TId && p.toks[p.i].kind != TKw) return false;
+            st.selOrderCol = p.toks[p.i].text; p.i++;
+            if (pAcceptKw(p, "desc")) st.selOrderDesc = true;
+            else pAcceptKw(p, "asc");
+        }
+        return true;
+    }
+
+    static function parse(p:Parser, st:Stmt):Bool {
+        if (pPeekKw(p, "begin")) { st.isBegin = true; p.i++; pAcceptKw(p, "transaction"); }
+        else if (pPeekKw(p, "commit")) { st.isCommit = true; p.i++; pAcceptKw(p, "transaction"); }
+        else if (pAcceptKw(p, "create")) { if (pAcceptKw(p, "table")) { if (!parseCreate(p, st)) return false; } else return false; }
+        else if (pAcceptKw(p, "insert")) { if (!parseInsert(p, st)) return false; }
+        else if (pAcceptKw(p, "select")) { if (!parseSelect(p, st)) return false; }
+        else return false;
+        pAccept(p, TSemi);
+        return true;
+    }
+
+    // ---------- Expression eval ----------
+    static function rowctxColindex(c:RowCtx, col:String):{tabidx:Int, colidx:Int} {
+        var dot = col.indexOf(".");
+        if (dot >= 0) {
+            var tname = col.substr(0, dot);
+            var cname = col.substr(dot + 1);
+            for (i in 0...c.n) {
+                var tn = c.refs[i].alias != null ? c.refs[i].alias : c.refs[i].tname;
+                if (tn.toLowerCase() == tname.toLowerCase()) {
+                    var ci = tableColIndex(c.tabs[i], cname);
+                    if (ci >= 0) return {tabidx: i, colidx: ci};
+                }
+            }
+            return null;
+        }
+        for (i in 0...c.n) {
+            var ci = tableColIndex(c.tabs[i], col);
+            if (ci >= 0) return {tabidx: i, colidx: ci};
+        }
+        return null;
+    }
+
+    static function evalExpr(e:Expr, c:RowCtx):Value {
+        if (e == null) return {type: VNull, ival: 0, sval: null};
+        return switch (e.kind) {
+            case EInt: {type: VInt, ival: e.ival, sval: null};
+            case EStr: {type: VText, ival: 0, sval: e.sval};
+            case ECol:
+                var idx = rowctxColindex(c, e.col);
+                if (idx == null) {type: VNull, ival: 0, sval: null}
+                else vCopy(c.rows[idx.tabidx].vals[idx.colidx]);
+            case EBinop:
+                var a = evalExpr(e.l, c);
+                var b = evalExpr(e.r, c);
+                var res:Value;
+                if (e.op.toLowerCase() == "and") {
+                    res = {type: VInt, ival: vTruthy(a) && vTruthy(b) ? 1 : 0, sval: null};
+                } else if (e.op.toLowerCase() == "or") {
+                    res = {type: VInt, ival: vTruthy(a) || vTruthy(b) ? 1 : 0, sval: null};
+                } else {
+                    var cmp = vCmp(a, b);
+                    res = switch (e.op) {
+                        case "=": {type: VInt, ival: cmp == 0 ? 1 : 0, sval: null};
+                        case "<>": {type: VInt, ival: cmp != 0 ? 1 : 0, sval: null};
+                        case "<": {type: VInt, ival: cmp < 0 ? 1 : 0, sval: null};
+                        case ">": {type: VInt, ival: cmp > 0 ? 1 : 0, sval: null};
+                        case "<=": {type: VInt, ival: cmp <= 0 ? 1 : 0, sval: null};
+                        case ">=": {type: VInt, ival: cmp >= 0 ? 1 : 0, sval: null};
+                        default: {type: VNull, ival: 0, sval: null};
+                    }
+                }
+                res;
+        }
+    }
+
+    static function rowMatch(where:Expr, c:RowCtx):Bool {
+        if (where == null) return true;
+        return vTruthy(evalExpr(where, c));
+    }
+
+    // ---------- Public API ----------
+    public var schema:Schema;
+    public var stores:Array<RowStore>;
+    public var errmsg:String;
+    public var inTxn:Bool;
+
+    public function new() {
+        schema = {tables: []};
+        stores = [];
+        errmsg = "";
+        inTxn = false;
+    }
+
+    public static function open(name:String):Sqlite3 {
+        return new Sqlite3();
+    }
+
+    public function close():Int {
+        return 0;
+    }
+
+    public function getErrmsg():String return errmsg;
+
+    function execCreate(st:Stmt):Int {
+        if (schemaFind(schema, st.ctName) != null) {
+            errmsg = "table already exists: " + st.ctName;
+            return -1;
+        }
+        schema.tables.push({name: st.ctName, cols: st.ctCols});
+        stores.push({head: null, tail: null, nrows: 0});
+        return 0;
+    }
+
+    function execInsert(st:Stmt):Int {
+        var idx = schemaIndex(schema, st.insTable);
+        if (idx < 0) { errmsg = "no such table: " + st.insTable; return -1; }
+        var rs = stores[idx];
+        var vals = [for (v in st.insVals) vCopy(v)];
+        var node:RowNode = {row: {vals: vals}, next: null};
+        if (rs.tail != null) rs.tail.next = node;
+        else rs.head = node;
+        rs.tail = node;
+        rs.nrows++;
+        return 0;
+    }
+
+    public function exec(sql:String, ?cb:(n:Int, vals:Array<String>)->Void):Int {
+        var toks = lex(sql);
+        var p:Parser = {toks: toks, i: 0};
+        var rc = 0;
+        while (p.toks[p.i].kind != TEof) {
+            var st:Stmt = {
+                isCreate: false, isInsert: false, isSelect: false, isBegin: false, isCommit: false,
+                ctName: null, ctCols: [],
+                insTable: null, insVals: [],
+                selCols: [], selStar: false, selTables: [], selWhere: null,
+                selOrderCol: null, selOrderDesc: false, selJoinOn: null
+            };
+            if (!parse(p, st)) { errmsg = "parse error"; rc = 1; break; }
+            if (st.isBegin) { inTxn = true; }
+            else if (st.isCommit) { inTxn = false; }
+            else if (st.isCreate) { rc = execCreate(st); }
+            else if (st.isInsert) { rc = execInsert(st); }
+            else if (st.isSelect) {
+                var s = new StmtHandle(this, st);
+                while (s.step() == 100) {
+                    if (cb != null) {
+                        var vals = [for (i in 0...s.nout) vToText(s.outrow[i])];
+                        cb(s.nout, vals);
+                    }
+                }
+                s.finalize();
+            }
+            if (rc != 0) break;
+        }
+        return rc;
+    }
+
+    public function prepare(sql:String):StmtHandle {
+        var toks = lex(sql);
+        var p:Parser = {toks: toks, i: 0};
+        var st:Stmt = {
+            isCreate: false, isInsert: false, isSelect: false, isBegin: false, isCommit: false,
+            ctName: null, ctCols: [],
+            insTable: null, insVals: [],
+            selCols: [], selStar: false, selTables: [], selWhere: null,
+            selOrderCol: null, selOrderDesc: false, selJoinOn: null
+        };
+        if (!parse(p, st)) { errmsg = "parse error"; return null; }
+        return new StmtHandle(this, st);
+    }
+
+    // ---------- Demo ----------
+    public static function main() {
+        var db = Sqlite3.open(":memory:");
+        var sql =
+            "CREATE TABLE users (id INTEGER, name TEXT);" +
+            "INSERT INTO users VALUES (1, 'ada');" +
+            "INSERT INTO users VALUES (2, 'grace');" +
+            "INSERT INTO users VALUES (3, 'linus');" +
+            "SELECT * FROM users WHERE id > 1 ORDER BY id DESC;";
+        var rc = db.exec(sql, function(n, vals) {
+            var parts = [for (i in 0...n) vals[i]];
+            Sys.println(parts.join(" | "));
+        });
+        if (rc != 0) Sys.stderr().writeString("err: " + db.getErrmsg() + "\n");
+        db.close();
+    }
+}
+
+// ---------- Types ----------
+
+enum TokKind { TEof; TId; TInt; TString; TKw; TPunct; TStar; TComma; TLp; TRp; TSemi; TOp; TDot; }
+
+typedef Token = { kind: TokKind, text: String };
+
+enum VTypeTag { VNull; VInt; VText; }
+
+@:structInit
+class Value {
+    public var type:Int; // 0=null,1=int,2=text
+    public var ival:Int;
+    public var sval:String;
+    public function new(type, ival, sval) {
+        this.type = type; this.ival = ival; this.sval = sval;
+    }
+}
+
+typedef Table = { name: String, cols: Array<String> };
+typedef Schema = { tables: Array<Table> };
+typedef Row = { vals: Array<Value> };
+typedef RowNode = { row: Row, next: RowNode };
+typedef RowStore = { head: RowNode, tail: RowNode, nrows: Int };
+
+enum ExprKind { ECol; EInt; EStr; EBinop; }
+typedef Expr = { kind: ExprKind, ival: Int, sval: String, col: String, op: String, l: Expr, r: Expr };
+typedef ResultCol = { col: String, star: Bool };
+typedef TableRef = { tname: String, alias: String };
+typedef Parser = { toks: Array<Token>, i: Int };
+
+typedef Stmt = {
+    isCreate: Bool, isInsert: Bool, isSelect: Bool, isBegin: Bool, isCommit: Bool,
+    ctName: String, ctCols: Array<String>,
+    insTable: String, insVals: Array<Value>,
+    selCols: Array<ResultCol>, selStar: Bool, selTables: Array<TableRef>,
+    selWhere: Expr, selOrderCol: String, selOrderDesc: Bool, selJoinOn: Expr
+};
+
+typedef RowCtx = { refs: Array<TableRef>, n: Int, tabs: Array<Table>, rows: Array<Row> };
+
+// Constants for VType
+@:allow(Sqlite3)
+extern class VType {
+    public static var VNull(default, never):Int;
+    public static var VInt(default, never):Int;
+    public static var VText(default, never):Int;
+}
+
+// ---------- Prepared Statement ----------
+class StmtHandle {
+    var db:Sqlite3;
+    var st:Stmt;
+    var started:Bool;
+    var sorted:Array<Row>;
+    var curSorted:Int;
+    public var outrow:Array<Value>;
+    public var nout:Int;
+
+    public function new(db:Sqlite3, st:Stmt) {
+        this.db = db;
+        this.st = st;
+        started = false;
+        sorted = [];
+        curSorted = 0;
+        outrow = [];
+        nout = 0;
+    }
+
+    function collectMatching() {
+        var n = st.selTables.length;
+        var idxs = [for (i in 0...n) Sqlite3.schemaIndex(db.schema, st.selTables[i].tname)];
+        var tabs = [for (i in 0...n) idxs[i] >= 0 ? db.schema.tables[idxs[i]] : null];
+        var curs = [for (i in 0...n) idxs[i] >= 0 ? db.stores[idxs[i]].head : null];
+
+        while (true) {
+            var ok = true;
+            for (i in 0...n) if (curs[i] == null) { ok = false; break; }
+            if (!ok) break;
+
+            var rows = [for (i in 0...n) curs[i].row];
+            var c:RowCtx = {refs: st.selTables, n: n, tabs: tabs, rows: rows};
+            if (rowMatch(st.selWhere, c) && (st.selJoinOn == null || rowMatch(st.selJoinOn, c))) {
+                var vals:Array<Value> = [];
+                for (i in 0...n) for (j in 0...rows[i].vals.length) vals.push(Sqlite3.vCopy(rows[i].vals[j]));
+                sorted.push({vals: vals});
+            }
+
+            // advance innermost
+            var k = n - 1;
+            while (k >= 0) {
+                curs[k] = curs[k].next;
+                if (curs[k] != null) break;
+                if (k > 0) curs[k] = idxs[k] >= 0 ? db.stores[idxs[k]].head : null;
+                k--;
+            }
+            if (k < 0) break;
+        }
+
+        // ORDER BY
+        if (st.selOrderCol != null && st.selTables.length == 1) {
+            var tabs2 = [for (i in 0...st.selTables.length) Sqlite3.schemaFind(db.schema, st.selTables[i].tname)];
+            var cidx = Sqlite3.tableColIndex(tabs2[0], st.selOrderCol);
+            if (cidx >= 0) {
+                // insertion sort
+                for (i in 1...sorted.length) {
+                    var j = i;
+                    while (j > 0) {
+                        var a = sorted[j - 1].vals[cidx];
+                        var b = sorted[j].vals[cidx];
+                        var cmp = Sqlite3.vCmp(a, b);
+                        if ((st.selOrderDesc && cmp < 0) || (!st.selOrderDesc && cmp > 0)) {
+                            var tmp = sorted[j - 1]; sorted[j - 1] = sorted[j]; sorted[j] = tmp;
+                            j--;
+                        } else break;
+                    }
+                }
+            }
+        }
+    }
+
+    static function rowMatch(where:Expr, c:RowCtx):Bool {
+        if (where == null) return true;
+        return Sqlite3.vTruthy(Sqlite3.evalExpr(where, c));
+    }
+
+    public function step():Int {
+        if (!st.isSelect) return 101;
+        if (!started) {
+            started = true;
+            collectMatching();
+        }
+        if (curSorted >= sorted.length) return 101;
+        var r = sorted[curSorted++];
+        var n = st.selTables.length;
+        var tabs = [for (i in 0...n) Sqlite3.schemaFind(db.schema, st.selTables[i].tname)];
+
+        var offsets = [];
+        var off = 0;
+        for (i in 0...n) { offsets.push(off); off += tabs[i].cols.length; }
+
+        var c:RowCtx = {refs: st.selTables, n: n, tabs: tabs, rows: [r]};
+
+        outrow = [];
+        nout = 0;
+
+        if (st.selStar) {
+            for (i in 0...n) for (j in 0...tabs[i].cols.length) outrow.push(Sqlite3.vCopy(r.vals[offsets[i] + j]));
+        } else {
+            for (rc in st.selCols) {
+                if (rc.star) {
+                    for (i in 0...n) for (j in 0...tabs[i].cols.length) outrow.push(Sqlite3.vCopy(r.vals[offsets[i] + j]));
+                } else {
+                    var dot = rc.col.indexOf(".");
+                    var ti = 0, ci = -1;
+                    if (dot >= 0) {
+                        var tname = rc.col.substr(0, dot);
+                        var cname = rc.col.substr(dot + 1);
+                        for (i in 0...n) {
+                            var tn = st.selTables[i].alias != null ? st.selTables[i].alias : st.selTables[i].tname;
+                            if (tn.toLowerCase() == tname.toLowerCase()) {
+                                ci = Sqlite3.tableColIndex(tabs[i], cname);
+                                ti = i;
+                                break;
+                            }
+                        }
+                    } else {
+                        for (i in 0...n) {
+                            ci = Sqlite3.tableColIndex(tabs[i], rc.col);
+                            if (ci >= 0) { ti = i; break; }
+                        }
+                    }
+                    if (ci < 0) outrow.push({type: 0, ival: 0, sval: null});
+                    else outrow.push(Sqlite3.vCopy(r.vals[offsets[ti] + ci]));
+                }
+            }
+        }
+        nout = outrow.length;
+        return 100;
+    }
+
+    public function columnCount():Int return nout;
+
+    public function columnText(i:Int):String {
+        if (i < 0 || i >= nout) return null;
+        return Sqlite3.vToText(outrow[i]);
+    }
+
+    public function columnInt64(i:Int):Int {
+        if (i < 0 || i >= nout) return 0;
+        return outrow[i].type == 1 ? outrow[i].ival : 0;
+    }
+
+    public function finalize():Int {
+        return 0;
+    }
+}
