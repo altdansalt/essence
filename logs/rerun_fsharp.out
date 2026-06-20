@@ -11,3 +11,14 @@
                             ^^^^^^
 NameError: name 'finish' is not defined
 
+[main f6dd57b] port: fsharp failed: name 'finish' is not defined
+ 7 files changed, 618 insertions(+)
+ create mode 100644 logs/rerun_fsharp.out
+ create mode 100644 logs/rerun_nostos.out
+ create mode 100644 logs/rerun_odin.out
+ create mode 100644 logs/rerun_vim9.out
+ create mode 100644 runs/fsharp/ERROR.txt
+ create mode 100644 runs/fsharp/sqlite_core.fs
+To https://github.com/altdansalt/essence.git
+   ef95d33..f6dd57b  main -> main
+[2026-06-20T17:25:46Z] loop done: 0 runs
