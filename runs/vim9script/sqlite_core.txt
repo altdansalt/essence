@@ -1,0 +1,12 @@
+def PrintRow(arg: any, vals: list<string>): void
+  echo join(vals, ' | ')
+enddef
+
+# Demo
+var db = Sqlite3.Open()
+var sql = "CREATE TABLE users (id INTEGER, name TEXT);INSERT INTO users VALUES (1, 'ada');INSERT INTO users VALUES (2, 'grace');INSERT INTO users VALUES (3, 'linus');SELECT * FROM users WHERE id > 1 ORDER BY id DESC;"
+var rc = db.Exec(sql, PrintRow, null)
+if rc != 0
+  echoerr $'err: {db.Errmsg()}'
+endif
+db.Close()

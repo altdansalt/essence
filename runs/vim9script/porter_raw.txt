@@ -1,0 +1,1861 @@
+Let me port the C SQLite-style SQL engine to Vim9 script faithfully, preserving all the public API surface, SQL subset, architecture, and behaviors.
+
+Let me carefully design this in Vim9 script using classes.
+
+Key components:
+1. Value type (NULL/INT/TEXT) - use a class
+2. Schema/Table - use classes
+3. RowStore - linked list of rows
+4. Lexer
+5. Parser (recursive descent)
+6. AST (Expr, Stmt)
+7. Executor
+8. Public API: sqlite3_open, exec, prepare_v2, step, finalize, close, column_count, column_text, column_int64, errmsg
+
+Let me write this as a Vim9 script with classes.
+
+In Vim9 script:
+- Classes with `class`/`endclass`
+- Methods with `def`/`enddef`
+- No pointers, use references to objects
+
+Let me structure this:
+
+```vim9script
+vim9script
+
+# Value class
+class Value
+  var type: number  # 0=NULL, 1=INT, 2=TEXT
+  var ival: number
+  var sval: string
+
+  def new(type: number, ival: number = 0, sval: string = '')
+    this.type = type
+    this.ival = ival
+    this.sval = sval
+  enddef
+
+  static def Null(): Value
+    return Value.new(0)
+  enddef
+
+  static def Int(i: number): Value
+    return Value.new(1, i)
+  enddef
+
+  static def Text(s: string): Value
+    return Value.new(2, 0, s)
+  enddef
+
+  def Copy(): Value
+    if this.type == 2
+      return Value.Text(this.sval)
+    endif
+    return Value.new(this.type, this.ival)
+  enddef
+
+  def Cmp(other: Value): number
+    if this.type != other.type
+      return this.type - other.type
+    endif
+    if this.type == 1
+      return this.ival < other.ival ? -1 : (this.ival > other.ival ? 1 : 0)
+    endif
+    if this.type == 2
+      return this.sval < other.sval ? -1 : (this.sval > other.sval ? 1 : 0)
+    endif
+    return 0
+  enddef
+
+  def ToText(): string
+    if this.type == 1
+      return string(this.ival)
+    endif
+    if this.type == 2
+      return this.sval
+    endif
+    return 'NULL'
+  enddef
+
+  def Truthy(): bool
+    return this.Cmp(Value.Int(0)) != 0
+  enddef
+endclass
+```
+
+Wait, in Vim9 `string(this.ival)` for a number gives just the number as string. Let me check - `string(42)` returns `"42"`. Actually `string()` on a number returns the number as a string. But it might add quotes? No, `string(42)` returns `"42"` (the string "42"). Let me use `printf('%d', this.ival)` to be safe.
+
+Actually, in Vim9, `string(42)` returns the string `"42"`. Let me verify... `string()` converts to a Vim representation. For numbers it's just the number. So `string(42)` → `"42"`. That should work. But to be safe I'll use `printf('%d', ...)`.
+
+Now let me think about the overall structure. I'll use classes for the main types.
+
+Let me think about the lexer. In Vim9, I can iterate over characters of a string.
+
+For case-insensitive comparison, Vim has `==#` and `==?` operators. `==?` is case-insensitive. Or I can use `tolower()`.
+
+Let me write the full port now.
+
+For the Token, I'll use a simple class or just lists.
+
+Let me think about how to represent things concisely.
+
+Actually, let me use a more functional approach where possible, but classes for the main objects.
+
+Let me write it:
+
+```vim9script
+vim9script
+
+# Constants for value types
+const V_NULL = 0
+const V_INT = 1
+const V_TEXT = 2
+
+# Token kinds
+const TK_EOF = 0
+const TK_ID = 1
+const TK_INT = 2
+const TK_STRING = 3
+const TK_KW = 4
+const TK_PUNCT = 5
+const TK_STAR = 6
+const TK_COMMA = 7
+const TK_LP = 8
+const TK_RP = 9
+const TK_SEMI = 10
+const TK_OP = 11
+const TK_DOT = 12
+```
+
+Hmm, this is getting long. Let me think about how to be concise.
+
+Actually, let me use classes more aggressively and keep things compact.
+
+Let me think about the Value class - I can use a class with static factory methods.
+
+For the lexer, I'll create a function that returns a list of tokens (each token is a list [kind, text] or a small class).
+
+For the parser, I'll create a class that holds tokens and position.
+
+For AST, I'll use classes for Expr and Stmt.
+
+For the database, I'll use a class.
+
+Let me write this out:
+
+```vim9script
+vim9script
+
+class Value
+  var type: number  # 0=null, 1=int, 2=text
+  var ival: number
+  var sval: string
+
+  def new(type: number, ival: number = 0, sval: string = '')
+    this.type = type
+    this.ival = ival
+    this.sval = sval
+  enddef
+
+  static def Null(): Value
+    return Value.new(0)
+  enddef
+
+  static def Int(i: number): Value
+    return Value.new(1, i)
+  enddef
+
+  static def Text(s: string): Value
+    return Value.new(2, 0, s)
+  enddef
+
+  def Copy(): Value
+    if this.type == 2
+      return Value.Text(this.sval)
+    endif
+    return Value.new(this.type, this.ival)
+  enddef
+
+  def Cmp(other: Value): number
+    if this.type != other.type
+      return this.type - other.type
+    endif
+    if this.type == 1
+      if this.ival < other.ival | return -1 | endif
+      if this.ival > other.ival | return 1 | endif
+      return 0
+    endif
+    if this.type == 2
+      if this.sval < other.sval | return -1 | endif
+      if this.sval > other.sval | return 1 | endif
+      return 0
+    endif
+    return 0
+  enddef
+
+  def ToText(): string
+    if this.type == 1
+      return printf('%d', this.ival)
+    endif
+    if this.type == 2
+      return this.sval
+    endif
+    return 'NULL'
+  enddef
+
+  def Truthy(): bool
+    return this.Cmp(Value.Int(0)) != 0
+  enddef
+endclass
+```
+
+Now for Table schema:
+
+```vim9script
+class Table
+  var name: string
+  var cols: list<string>
+endclass
+```
+
+For Row:
+
+```vim9script
+class Row
+  var vals: list<Value>
+enddef
+```
+
+Actually, let me use a simpler representation. Rows are just lists of Values.
+
+For the store, I'll use a list of rows per table.
+
+Let me think about the overall Database class:
+
+```vim9script
+class Database
+  var tables: list<Table> = []
+  var stores: list<list<list<Value>>> = []  # per table, list of rows, each row is list<Value>
+  var errmsg: string = ''
+  var in_txn: bool = false
+
+  def FindTable(name: string): Table
+    for t in this.tables
+      if t.name ==? name
+        return t
+      endif
+    endfor
+    return null_object  # hmm, Vim9 doesn't have null for classes easily
+  enddef
+  ...
+endclass
+```
+
+Wait, in Vim9, can a function return a class instance or null? I think you can return `null` but the return type needs to be compatible. Actually in Vim9, you might need to use `any` type or optional types. Let me check...
+
+In Vim9, you can return `null` from a function that returns an object, but I'm not 100% sure. Let me use a different approach - return index -1 or use a sentinel.
+
+Actually, let me just return the index or use a different pattern. Let me return the table or null. In Vim9 script, `null` can be used for objects I think. Let me use `any` return type to be safe, or just check differently.
+
+Hmm, let me think about this differently. I'll use indices into the tables list.
+
+Let me restructure:
+
+```vim9script
+class Database
+  var tables: list<string> = []           # table names
+  var cols: list<list<string>> = []       # column names per table
+  var stores: list<list<list<Value>>> = []  # rows per table
+  var errmsg: string = ''
+```
+
+Actually, let me keep it simpler with parallel arrays or a dict.
+
+Let me use a class for table info:
+
+```vim9script
+class TableInfo
+  var name: string
+  var cols: list<string>
+  var rows: list<list<Value>>
+endclass
+```
+
+And Database holds a list of TableInfo.
+
+For FindTable, I'll return a number index (-1 if not found).
+
+Let me write the whole thing now. I'll try to be concise but complete.
+
+For the lexer, I need to handle:
+- whitespace
+- comments (-- to end of line)
+- identifiers/keywords (alpha or _ start, alnum or _ continue)
+- numbers (digits)
+- strings ('...')
+- quoted identifiers ("...")
+- operators (* , ( ) ; . = <> < > <= >= !=)
+- other punctuation
+
+Keywords list from C:
+create, table, insert, into, values, select, from, where, order, by, asc, desc, and, or, not, null, begin, commit, inner, join, on, int, integer, text, primary, key, transaction
+
+For case-insensitive comparison in Vim9, I can use `==?` operator or `tolower()`.
+
+Let me write the lexer as a function that takes a string and returns a list of [kind, text] pairs.
+
+Actually, in Vim9 I can use a list of dicts or a simple list of lists. Let me use a class for Token to be clean, or just use lists.
+
+Let me use lists: each token is [kind_number, text_string].
+
+Here's my plan for the lexer:
+
+```vim9script
+const KEYWORDS: list<string> = ['create', 'table', 'insert', 'into', 'values', 'select', 'from', 'where', 'order', 'by', 'asc', 'desc', 'and', 'or', 'not', 'null', 'begin', 'commit', 'inner', 'join', 'on', 'int', 'integer', 'text', 'primary', 'key', 'transaction']
+
+def IsKeyword(s: string): bool
+  for kw in KEYWORDS
+    if s ==? kw
+      return true
+    endif
+  endfor
+  return false
+enddef
+
+def Lex(sql: string): list<list<any>>
+  var toks: list<list<any>> = []
+  var i = 0
+  var n = len(sql)
+  while i < n
+    var c = sql[i]
+    if c == ' ' || c == "\t" || c == "\n" || c == "\r"
+      i += 1
+      continue
+    endif
+    if c == '-' && i + 1 < n && sql[i + 1] == '-'
+      while i < n && sql[i] != "\n"
+        i += 1
+      endwhile
+      continue
+    endif
+    # identifier or keyword
+    if c =~ '\a' || c == '_'
+      var st = i
+      while i < n && (sql[i] =~ '\a' || sql[i] =~ '\d' || sql[i] == '_')
+        i += 1
+      endwhile
+      var word = sql[st : i - 1]
+      add(toks, [IsKeyword(word) ? 4 : 1, word])  # TK_KW=4, TK_ID=1
+      continue
+    endif
+    # number
+    if c =~ '\d'
+      var st = i
+      while i < n && sql[i] =~ '\d'
+        i += 1
+      endwhile
+      add(toks, [2, sql[st : i - 1]])  # TK_INT=2
+      continue
+    endif
+    # string literal
+    if c == "'"
+      i += 1
+      var st = i
+      while i < n && sql[i] != "'"
+        i += 1
+      endwhile
+      add(toks, [3, sql[st : i - 1]])  # TK_STRING=3
+      if i < n
+        i += 1
+      endif
+      continue
+    endif
+    # quoted identifier
+    if c == '"'
+      i += 1
+      var st = i
+      while i < n && sql[i] != '"'
+        i += 1
+      endwhile
+      add(toks, [1, sql[st : i - 1]])  # TK_ID=1
+      if i < n
+        i += 1
+      endif
+      continue
+    endif
+    # single-char tokens
+    if c == '*'
+      add(toks, [6, '*']); i += 1; continue
+    endif
+    if c == ','
+      add(toks, [7, ',']); i += 1; continue
+    endif
+    if c == '('
+      add(toks, [8, '(']); i += 1; continue
+    endif
+    if c == ')'
+      add(toks, [9, ')']); i += 1; continue
+    endif
+    if c == ';'
+      add(toks, [10, ';']); i += 1; continue
+    endif
+    if c == '.'
+      add(toks, [12, '.']); i += 1; continue
+    endif
+    # operators
+    if c == '=' || c == '<' || c == '>' || c == '!'
+      var st = i
+      if i + 1 < n && sql[i + 1] == '='
+        i += 1
+      endif
+      if c == '<' && i + 1 < n && sql[i + 1] == '>'
+        i += 1
+      endif
+      if c == '!' && i + 1 < n && sql[i + 1] == '='
+        i += 1
+      endif
+      i += 1
+      add(toks, [11, sql[st : i - 1]])  # TK_OP=11
+      continue
+    endif
+    # other punctuation
+    add(toks, [5, c]); i += 1
+  endwhile
+  add(toks, [0, ''])  # TK_EOF=0
+  return toks
+enddef
+```
+
+Wait, in Vim9, `sql[i]` gives a single character string. And `sql[i] =~ '\a'` should work for checking if it's alphabetic. Actually, `=~` with `\a` matches the pattern. But for a single character, I need to check if the character matches the pattern. Let me use `matchstr()` or just check with `=~`.
+
+Actually, `c =~ '\a'` checks if c matches the pattern `\a` (alphabetic). For a single character, this should work. But I need to be careful - `=~` does a regex match, and `\a` matches an alphabetic character. So `'a' =~ '\a'` should be true. Let me verify... yes, in Vim, `'a' =~ '\a'` is true.
+
+But wait, `\d` matches a digit. `'5' =~ '\d'` is true. Good.
+
+However, there's a subtlety: `=~` is case-sensitive by default for the pattern side, but `\a` matches both upper and lower case. So that should be fine.
+
+Now for the parser. Let me create a Parser class:
+
+```vim9script
+class Parser
+  var toks: list<list<any>>
+  var i: number = 0
+
+  def new(toks: list<list<any>>)
+    this.toks = toks
+  enddef
+
+  def Cur(): list<any>
+    return this.toks[this.i]
+  enddef
+
+  def Kind(): number
+    return this.toks[this.i][0]
+  enddef
+
+  def Text(): string
+    return this.toks[this.i][1]
+  enddef
+
+  def Accept(kind: number, text: string = ''): bool
+    if this.Kind() != kind
+      return false
+    endif
+    if text != '' && this.Text() !=? text
+      return false
+    endif
+    this.i += 1
+    return true
+  enddef
+
+  def AcceptKW(kw: string): bool
+    return this.Accept(4, kw)  # TK_KW=4
+  enddef
+
+  def PeekKW(kw: string): bool
+    return this.Kind() == 4 && this.Text() ==? kw
+  enddef
+  ...
+endclass
+```
+
+Wait, `!=?` is case-insensitive inequality. `==?` is case-insensitive equality. So for checking if text matches case-insensitively, I should use `==?`. And for not matching, `!=?`.
+
+Hmm, actually in the C code, `strcasecmp` is used which is case-insensitive. So I should use `==?` for comparison.
+
+Let me fix: `if text != '' && this.Text() !=? text` → this checks if text is not empty AND the token text doesn't match case-insensitively.
+
+Wait, `!=?` is case-insensitive not-equal. So `this.Text() !=? text` means "not equal case-insensitively". If this is true, we don't accept. That's correct.
+
+Actually wait, I need to double-check Vim9 comparison operators:
+- `==` case-sensitive (depends on 'ignorecase' setting actually)
+- `==#` always case-sensitive
+- `==?` always case-insensitive
+- `!=`, `!=#`, `!=?` similarly
+
+In Vim9 script, `==` is case-sensitive by default (unlike legacy). So I should use `==?` for case-insensitive.
+
+Let me use `==?` and `!=?` consistently.
+
+Now for the AST. Let me use classes:
+
+```vim9script
+class Expr
+  var kind: number  # 0=COL, 1=INT, 2=STR, 3=BINOP
+  var col: string = ''
+  var ival: number = 0
+  var sval: string = ''
+  var op: string = ''
+  var l: Expr = null_object  # hmm
+  var r: Expr = null_object
+endclass
+```
+
+Wait, can I have `null` for class instances in Vim9? I think in Vim9, you can use `null` but the type would need to be `any` or the specific class type with possible null. Actually, I think Vim9 doesn't support nullable types easily. Let me check...
+
+In Vim9, you can assign `null` to an object variable. The type would be `Expr` but it can hold null. Actually, I'm not sure. Let me use a different approach - maybe use `any` type or just not initialize and check with `empty()`.
+
+Hmm, actually in Vim9 script, I think you can do:
+```
+var l: Expr = null
+```
+But I'm not 100% sure this works. Let me use `any` type to be safe, or just not type the l/r fields.
+
+Actually, looking at Vim9 docs more carefully, I think you can use `null` for object references. Let me try:
+
+```
+var l: any = null
+```
+
+Or I could just not declare the type and let it be inferred.
+
+Actually, in Vim9 classes, member variables must have types. Let me use `any` for the Expr references:
+
+```vim9script
+class Expr
+  var kind: number
+  var col: string = ''
+  var ival: number = 0
+  var sval: string = ''
+  var op: string = ''
+  var l: any = null
+  var r: any = null
+endclass
+```
+
+Hmm, but `any` type might cause issues. Let me think...
+
+Actually, I think in Vim9 you can do:
+```
+var l: Expr
+```
+and it defaults to null. Or maybe not. Let me just use `any` to be safe.
+
+Wait, actually I just realized - in Vim9 class definitions, all member variables must be initialized. So I need to give them default values. For object references, I can use `null` but the type annotation... Let me check if `null` is valid for a typed variable.
+
+I think in Vim9, `null` is a special value that can be assigned to any type. So:
+```
+var l: Expr = null
+```
+should work. But I'm not 100% sure. Let me use `any` to be safe.
+
+Actually, let me just look at what I know about Vim9:
+- `null` is a special value
+- `null_object`, `null_string`, etc. exist but `null` is generic
+- For class types, I believe `null` works
+
+Let me just use it and see. If it doesn't work, the alternative is to use a sentinel.
+
+Actually, I just realized I should be more careful. In Vim9 script, I think you can't directly assign `null` to a typed variable of a class type. You might need to use `null_object` or just `any`.
+
+Let me use `any` for safety:
+
+```vim9script
+class Expr
+  var kind: number
+  var col: string = ''
+  var ival: number = 0
+  var sval: string = ''
+  var op: string = ''
+  var l: any = null
+  var r: any = null
+endclass
+```
+
+Now for the Stmt class. In C, Stmt is a struct with many fields. Let me create a similar class:
+
+```vim9script
+class Stmt
+  var is_create: bool = false
+  var is_insert: bool = false
+  var is_select: bool = false
+  var is_begin: bool = false
+  var is_commit: bool = false
+  var ct_name: string = ''
+  var ct_cols: list<string> = []
+  var ins_table: string = ''
+  var ins_vals: list<Value> = []
+  var sel_cols: list<list<any>> = []  # each is [col, star]
+  var sel_star: bool = false
+  var sel_tables: list<list<string>> = []  # each is [tname, alias]
+  var sel_where: any = null  # Expr
+  var sel_order_col: string = ''
+  var sel_order_desc: bool = false
+  var sel_join_on: any = null  # Expr
+endclass
+```
+
+Hmm, `list<list<any>>` might not work. Let me use a simpler representation. For sel_cols, each entry is [col_string, star_bool]. I can use a list of dicts or just two parallel lists. Or use `list<any>` where each element is a list.
+
+Actually, in Vim9, `list<any>` should work, and each element can be a list. Let me use that.
+
+Wait, actually I think `list<list<any>>` should work in Vim9. Let me try it.
+
+Hmm, let me simplify. For ResultCol, I'll use a small class:
+
+```vim9script
+class ResultCol
+  var col: string = ''
+  var star: bool = false
+endclass
+```
+
+And for TableRef:
+
+```vim9script
+class TableRef
+  var tname: string = ''
+  var alias: string = ''
+endclass
+```
+
+This is cleaner. Let me use these.
+
+Now let me write the parser methods. The parser needs to handle:
+- parse_primary: INT, STRING, ID/KW (column, possibly with dot), parenthesized expr
+- parse_cmp: primary followed by optional OP primary
+- parse_expr: cmp followed by optional AND/OR expr
+
+For parse_create: table name, ( col defs )
+For parse_insert: INTO table VALUES ( val, val, ... )
+For parse_select: projections, FROM table [JOIN ... ON ...], [WHERE], [ORDER BY ...]
+
+Let me write the full parser:
+
+```vim9script
+class Parser
+  var toks: list<list<any>>
+  var i: number = 0
+
+  def new(toks: list<list<any>>)
+    this.toks = toks
+  enddef
+
+  def Kind(): number
+    return this.toks[this.i][0]
+  enddef
+
+  def Text(): string
+    return this.toks[this.i][1]
+  enddef
+
+  def Accept(kind: number, text: string = ''): bool
+    if this.Kind() != kind
+      return false
+    endif
+    if text != '' && this.Text() !=? text
+      return false
+    endif
+    this.i += 1
+    return true
+  enddef
+
+  def AcceptKW(kw: string): bool
+    return this.Accept(4, kw)
+  enddef
+
+  def PeekKW(kw: string): bool
+    return this.Kind() == 4 && this.Text() ==? kw
+  enddef
+
+  def ParsePrimary(): any
+    var k = this.Kind()
+    if k == 2  # TK_INT
+      var e = Expr.new(1)
+      e.ival = str2nr(this.Text())
+      this.i += 1
+      return e
+    endif
+    if k == 3  # TK_STRING
+      var e = Expr.new(2)
+      e.sval = this.Text()
+      this.i += 1
+      return e
+    endif
+    if k == 1 || k == 4  # TK_ID or TK_KW
+      var e = Expr.new(0)
+      var buf = this.Text()
+      this.i += 1
+      if this.Kind() == 12  # TK_DOT
+        this.i += 1
+        buf ..= '.' .. this.Text()
+        this.i += 1
+      endif
+      e.col = buf
+      return e
+    endif
+    if this.Accept(8)  # TK_LP
+      var e = this.ParseExpr()
+      this.Accept(9)  # TK_RP
+      return e
+    endif
+    return null
+  enddef
+
+  def ParseCmp(): any
+    var l = this.ParsePrimary()
+    if this.Kind() == 11  # TK_OP
+      var e = Expr.new(3)
+      e.op = this.Text()
+      this.i += 1
+      e.l = l
+      e.r = this.ParsePrimary()
+      return e
+    endif
+    return l
+  enddef
+
+  def ParseExpr(): any
+    var l = this.ParseCmp()
+    if this.PeekKW('and') || this.PeekKW('or')
+      var e = Expr.new(3)
+      e.op = this.PeekKW('and') ? 'AND' : 'OR'
+      this.i += 1
+      e.l = l
+      e.r = this.ParseExpr()
+      return e
+    endif
+    return l
+  enddef
+
+  def ParseCreate(st: Stmt): number
+    st.is_create = true
+    if this.Kind() != 1 && this.Kind() != 4
+      return -1
+    endif
+    st.ct_name = this.Text()
+    this.i += 1
+    if !this.Accept(8)  # TK_LP
+      return -1
+    endif
+    while this.Kind() != 9 && this.Kind() != 0  # not RP or EOF
+      if this.Kind() != 1 && this.Kind() != 4
+        return -1
+      endif
+      add(st.ct_cols, this.Text())
+      this.i += 1
+      # skip to comma or RP
+      while this.Kind() != 7 && this.Kind() != 9 && this.Kind() != 0
+        this.i += 1
+      endwhile
+      this.Accept(7)  # TK_COMMA
+    endwhile
+    this.Accept(9)  # TK_RP
+    return 0
+  enddef
+
+  def ParseInsert(st: Stmt): number
+    st.is_insert = true
+    if !this.AcceptKW('into')
+      return -1
+    endif
+    if this.Kind() != 1  # TK_ID
+      return -1
+    endif
+    st.ins_table = this.Text()
+    this.i += 1
+    if !this.AcceptKW('values')
+      return -1
+    endif
+    if !this.Accept(8)  # TK_LP
+      return -1
+    endif
+    while this.Kind() != 9 && this.Kind() != 0  # not RP or EOF
+      if this.Kind() == 2  # TK_INT
+        add(st.ins_vals, Value.Int(str2nr(this.Text())))
+      elseif this.Kind() == 3  # TK_STRING
+        add(st.ins_vals, Value.Text(this.Text()))
+      elseif this.AcceptKW('null')
+        add(st.ins_vals, Value.Null())
+      else
+        return -1
+      endif
+      this.i += 1
+      if !this.Accept(7)  # TK_COMMA
+        break
+      endif
+    endwhile
+    if !this.Accept(9)  # TK_RP
+      return -1
+    endif
+    return 0
+  enddef
+```
+
+Wait, there's a bug. When we AcceptKW('null'), it already advances i. But then we do `this.i += 1` after the if-elseif-else block. That would skip an extra token. Let me look at the C code more carefully.
+
+In C:
+```c
+if (P->t[P->i].kind==TK_INT) v=v_int(atol(P->t[P->i].text));
+else if (P->t[P->i].kind==TK_STRING) v=v_text(P->t[P->i].text);
+else if (p_accept_kw(P,"null")) v=v_null();
+else return -1;
+P->i++;
+```
+
+So in C, `p_accept_kw` advances i if it matches. Then `P->i++` advances again. Wait, that would be a bug in C too... unless `p_accept_kw` for null doesn't advance because it's checked in the else-if and the P->i++ handles it.
+
+Actually wait, let me re-read. `p_accept_kw(P,"null")` checks if current token is KW "null" and if so, advances i and returns 1. Then `P->i++` advances again. That would skip the token after null!
+
+Hmm, but looking more carefully at the C code:
+```c
+if (P->t[P->i].kind==TK_INT) v=v_int(atol(P->t[P->i].text));
+else if (P->t[P->i].kind==TK_STRING) v=v_text(P->t[P->i].text);
+else if (p_accept_kw(P,"null")) v=v_null();
+else return -1;
+P->i++;
+```
+
+For TK_INT and TK_STRING, the i is not advanced inside the if, so P->i++ advances past the token. For null, p_accept_kw advances i, then P->i++ advances again. This seems like a bug... but maybe it works because after null there's always a comma or RP, and the extra advance skips... no, that would skip the comma.
+
+Wait, let me re-read p_accept_kw:
+```c
+static int p_accept_kw(Parser *P, const char *kw){ return p_accept(P, TK_KW, kw); }
+static int p_accept(Parser *P, TokKind k, const char *text){
+    if (P->t[P->i].kind!=k) return 0;
+    if (text && strcasecmp(P->t[P->i].text,text)) return 0;
+    P->i++; return 1;
+}
+```
+
+So yes, p_accept_kw advances i. Then P->i++ advances again. This would indeed skip a token. But the demo doesn't use NULL in INSERT, so this bug might not manifest. Let me just replicate the behavior faithfully... actually, let me fix it to be correct since the C code seems buggy here. Or should I replicate the bug?
+
+The instructions say "port faithfully and completely: every public function, every behavior". But this seems like a bug. Let me replicate the behavior as-is to be faithful. Actually, let me think again...
+
+For the INT and STRING cases, P->i is NOT advanced inside the if, so P->i++ advances past the INT/STRING token. For the null case, p_accept_kw advances past the null token, then P->i++ advances past the NEXT token (comma or RP). Then the code checks `if (!p_accept(P,TK_COMMA,NULL)) break;` - but we've already skipped the comma, so this would fail and break. Then `if (!p_accept(P,TK_RP,NULL)) return -1;` - but we've also potentially skipped the RP...
+
+This is definitely a bug in the C code. But since the demo doesn't use NULL in INSERT, it doesn't matter. Let me just handle it correctly in my port - advance i only once for each value.
+
+Actually, let me be more careful. Let me restructure to match the C logic but fix the double-advance:
+
+```vim9script
+def ParseInsert(st: Stmt): number
+  st.is_insert = true
+  if !this.AcceptKW('into')
+    return -1
+  endif
+  if this.Kind() != 1
+    return -1
+  endif
+  st.ins_table = this.Text()
+  this.i += 1
+  if !this.AcceptKW('values')
+    return -1
+  endif
+  if !this.Accept(8)  # TK_LP
+    return -1
+  endif
+  while this.Kind() != 9 && this.Kind() != 0
+    if this.Kind() == 2  # TK_INT
+      add(st.ins_vals, Value.Int(str2nr(this.Text())))
+      this.i += 1
+    elseif this.Kind() == 3  # TK_STRING
+      add(st.ins_vals, Value.Text(this.Text()))
+      this.i += 1
+    elseif this.PeekKW('null')
+      add(st.ins_vals, Value.Null())
+      this.i += 1
+    else
+      return -1
+    endif
+    if !this.Accept(7)  # TK_COMMA
+      break
+    endif
+  endwhile
+  if !this.Accept(9)  # TK_RP
+    return -1
+  endif
+  return 0
+enddef
+```
+
+This is cleaner and correct. I'll handle the advance in each branch.
+
+Now for ParseSelect:
+
+```vim9script
+def ParseSelect(st: Stmt): number
+  st.is_select = true
+  if this.Accept(6)  # TK_STAR
+    st.sel_star = true
+  else
+    while true
+      var rc = ResultCol.new()
+      if this.Accept(6)  # TK_STAR
+        rc.star = true
+      elseif this.Kind() == 1 || this.Kind() == 4  # TK_ID or TK_KW
+        var buf = this.Text()
+        this.i += 1
+        if this.Kind() == 12  # TK_DOT
+          this.i += 1
+          if this.Accept(6)  # TK_STAR
+            rc.star = true
+          else
+            buf ..= '.' .. this.Text()
+            this.i += 1
+            rc.col = buf
+          endif
+        else
+          rc.col = buf
+        endif
+      else
+        return -1
+      endif
+      add(st.sel_cols, rc)
+      if !this.Accept(7)  # TK_COMMA
+        break
+      endif
+    endwhile
+  endif
+  if !this.AcceptKW('from')
+    return -1
+  endif
+  if this.Kind() != 1  # TK_ID
+    return -1
+  endif
+  # first table
+  var tr = TableRef.new()
+  tr.tname = this.Text()
+  this.i += 1
+  if this.Kind() == 1 && !this.PeekKW('on') && !this.PeekKW('where') && !this.PeekKW('order') && !this.PeekKW('inner') && !this.PeekKW('join')
+    tr.alias = this.Text()
+    this.i += 1
+  endif
+  add(st.sel_tables, tr)
+  # joins
+  while this.PeekKW('inner') || this.PeekKW('join')
+    if this.AcceptKW('inner')
+      if !this.AcceptKW('join')
+        return -1
+      endif
+    else
+      this.AcceptKW('join')
+    endif
+    if this.Kind() != 1
+      return -1
+    endif
+    var tr2 = TableRef.new()
+    tr2.tname = this.Text()
+    this.i += 1
+    if this.Kind() == 1 && !this.PeekKW('on') && !this.PeekKW('where') && !this.PeekKW('order')
+      tr2.alias = this.Text()
+      this.i += 1
+    endif
+    add(st.sel_tables, tr2)
+    if this.AcceptKW('on')
+      var on = this.ParseExpr()
+      if st.sel_join_on == null
+        st.sel_join_on = on
+      else
+        var andExpr = Expr.new(3)
+        andExpr.op = 'AND'
+        andExpr.l = st.sel_join_on
+        andExpr.r = on
+        st.sel_join_on = andExpr
+      endif
+    endif
+  endwhile
+  if this.AcceptKW('where')
+    st.sel_where = this.ParseExpr()
+  endif
+  if this.AcceptKW('order')
+    if !this.AcceptKW('by')
+      return -1
+    endif
+    if this.Kind() != 1 && this.Kind() != 4
+      return -1
+    endif
+    st.sel_order_col = this.Text()
+    this.i += 1
+    if this.AcceptKW('desc')
+      st.sel_order_desc = true
+    else
+      this.AcceptKW('asc')
+    endif
+  endif
+  return 0
+enddef
+```
+
+And the top-level Parse:
+
+```vim9script
+def Parse(): Stmt
+  var st = Stmt.new()
+  if this.PeekKW('begin')
+    st.is_begin = true
+    this.i += 1
+    this.AcceptKW('transaction')
+  elseif this.PeekKW('commit')
+    st.is_commit = true
+    this.i += 1
+    this.AcceptKW('transaction')
+  elseif this.AcceptKW('create')
+    if this.AcceptKW('table')
+      this.ParseCreate(st)
+    else
+      return null  # error
+    endif
+  elseif this.AcceptKW('insert')
+    this.ParseInsert(st)
+  elseif this.AcceptKW('select')
+    this.ParseSelect(st)
+  else
+    return null
+  endif
+  this.Accept(10)  # TK_SEMI
+  return st
+enddef
+```
+
+Hmm, returning null from a function that returns Stmt... I need to handle this. Let me return a Stmt with an error flag, or use `any` return type.
+
+Actually, let me add an `error` field to Stmt:
+
+```vim9script
+class Stmt
+  var error: bool = false
+  ...
+endclass
+```
+
+And set `st.error = true` on parse error.
+
+Now for the executor. Let me think about the RowCtx and eval_expr.
+
+In the C code, RowCtx contains:
+- refs (TableRef array)
+- n (number of tables)
+- tabs (Table array)
+- rows (Row array, current row from each table)
+
+For eval_expr, it resolves column references to [tabidx, colidx] and gets the value from the appropriate row.
+
+In my port, I'll create a similar context. Since Vim9 doesn't have structs, I'll use a class or just pass the relevant data.
+
+Let me think about the execution flow:
+
+1. For SELECT, collect_matching does nested loop join, filters by WHERE and JOIN ON, and collects matching combined rows.
+2. Then sorts by ORDER BY column if specified.
+3. stmt_step_select iterates through sorted rows, building output projections.
+
+Let me implement this.
+
+For the Database class:
+
+```vim9script
+class Database
+  var tables: list<string> = []
+  var colsArr: list<list<string>> = []
+  var stores: list<list<list<Value>>> = []
+  var errmsg: string = ''
+  var in_txn: bool = false
+
+  def FindTableIndex(name: string): number
+    for i in range(len(this.tables))
+      if this.tables[i] ==? name
+        return i
+      endif
+    endfor
+    return -1
+  enddef
+
+  def ColIndex(tabIdx: number, col: string): number
+    var cols = this.colsArr[tabIdx]
+    for i in range(len(cols))
+      if cols[i] ==? col
+        return i
+      endif
+    endfor
+    return -1
+  enddef
+
+  def ExecCreate(st: Stmt): number
+    if this.FindTableIndex(st.ct_name) >= 0
+      this.errmsg = $'table already exists: {st.ct_name}'
+      return -1
+    endif
+    add(this.tables, st.ct_name)
+    add(this.colsArr, copy(st.ct_cols))
+    add(this.stores, [])
+    return 0
+  enddef
+
+  def ExecInsert(st: Stmt): number
+    var idx = this.FindTableIndex(st.ins_table)
+    if idx < 0
+      this.errmsg = $'no such table: {st.ins_table}'
+      return -1
+    endif
+    var row: list<Value> = []
+    for v in st.ins_vals
+      add(row, v.Copy())
+    endfor
+    add(this.stores[idx], row)
+    return 0
+  enddef
+endclass
+```
+
+Now for the SELECT executor. Let me create a Stmt (prepared statement) class:
+
+```vim9script
+class PreparedStmt
+  var db: Database
+  var st: Stmt
+  var sorted: list<list<Value>> = []
+  var cur: number = 0
+  var started: bool = false
+  var outrow: list<Value> = []
+  var nout: number = 0
+
+  def new(db: Database, st: Stmt)
+    this.db = db
+    this.st = st
+  enddef
+
+  def ColIndexInCtx(col: string, refs: list<TableRef>, tabs: list<string>, rows: list<list<Value>>): list<number>
+    # returns [tabidx, colidx] or [-1, -1]
+    var dot = stridx(col, '.')
+    if dot >= 0
+      var tname = col[: dot - 1]
+      var cname = col[dot + 1 :]
+      for i in range(len(refs))
+        var tn = refs[i].alias != '' ? refs[i].alias : refs[i].tname
+        if tn ==? tname
+          var ci = this.db.ColIndex(this.db.FindTableIndex(tabs[i]), cname)
+          if ci >= 0
+            return [i, ci]
+          endif
+        endif
+      endfor
+      return [-1, -1]
+    endif
+    for i in range(len(refs))
+      var ci = this.db.ColIndex(this.db.FindTableIndex(tabs[i]), col)
+      if ci >= 0
+        return [i, ci]
+      endif
+    endfor
+    return [-1, -1]
+  enddef
+```
+
+Hmm, this is getting complicated. Let me simplify by precomputing table indices.
+
+Actually, let me think about this more carefully. The C code uses Table* pointers and RowCtx. In Vim9, I'll pass around the relevant data.
+
+Let me restructure. I'll have the eval function take:
+- the expression
+- list of table indices (into db.tables)
+- list of current rows (one per table)
+- list of TableRef (for alias resolution)
+
+Let me write a standalone eval function:
+
+```vim9script
+def EvalExpr(e: any, db: Database, tabIdxs: list<number>, refs: list<TableRef>, rows: list<list<Value>>): Value
+  if e == null
+    return Value.Null()
+  endif
+  if e.kind == 1  # E_INT
+    return Value.Int(e.ival)
+  endif
+  if e.kind == 2  # E_STR
+    return Value.Text(e.sval)
+  endif
+  if e.kind == 0  # E_COL
+    var res = ResolveCol(e.col, db, tabIdxs, refs)
+    if res[0] < 0
+      return Value.Null()
+    endif
+    return rows[res[0]][res[1]].Copy()
+  endif
+  if e.kind == 3  # E_BINOP
+    var a = EvalExpr(e.l, db, tabIdxs, refs, rows)
+    var b = EvalExpr(e.r, db, tabIdxs, refs, rows)
+    var res = Value.Null()
+    if e.op ==? 'AND'
+      res = Value.Int(a.Truthy() && b.Truthy() ? 1 : 0)
+    elseif e.op ==? 'OR'
+      res = Value.Int(a.Truthy() || b.Truthy() ? 1 : 0)
+    else
+      var cmp = a.Cmp(b)
+      if e.op == '='
+        res = Value.Int(cmp == 0 ? 1 : 0)
+      elseif e.op == '<>'
+        res = Value.Int(cmp != 0 ? 1 : 0)
+      elseif e.op == '<'
+        res = Value.Int(cmp < 0 ? 1 : 0)
+      elseif e.op == '>'
+        res = Value.Int(cmp > 0 ? 1 : 0)
+      elseif e.op == '<='
+        res = Value.Int(cmp <= 0 ? 1 : 0)
+      elseif e.op == '>='
+        res = Value.Int(cmp >= 0 ? 1 : 0)
+      endif
+    endif
+    return res
+  endif
+  return Value.Null()
+enddef
+
+def ResolveCol(col: string, db: Database, tabIdxs: list<number>, refs: list<TableRef>): list<number>
+  var dot = stridx(col, '.')
+  if dot >= 0
+    var tname = col[: dot - 1]
+    var cname = col[dot + 1 :]
+    for i in range(len(refs))
+      var tn = refs[i].alias != '' ? refs[i].alias : refs[i].tname
+      if tn ==? tname
+        var ci = db.ColIndex(tabIdxs[i], cname)
+        if ci >= 0
+          return [i, ci]
+        endif
+      endif
+    endfor
+    return [-1, -1]
+  endif
+  for i in range(len(refs))
+    var ci = db.ColIndex(tabIdxs[i], col)
+    if ci >= 0
+      return [i, ci]
+    endif
+  endfor
+  return [-1, -1]
+enddef
+```
+
+Wait, but these are standalone functions, not methods. In Vim9, I can define standalone `def` functions at script level. That should work.
+
+But there's a problem: `e` is of type `any`, and accessing `e.kind` might not work directly. In Vim9, you can access members of `any` typed variables... actually I think you need to cast. Let me check.
+
+In Vim9, if a variable is typed `any`, you can't directly access object members. You'd need to cast it first. Hmm, that's a problem.
+
+Let me make EvalExpr a method of the Expr class instead, or use a different approach.
+
+Actually, let me make EvalExpr a method that takes the Expr as a typed parameter. Since Expr is a class, I can type the parameter as `Expr`:
+
+```vim9script
+def EvalExpr(e: Expr, db: Database, tabIdxs: list<number>, refs: list<TableRef>, rows: list<list<Value>>): Value
+```
+
+But the problem is that e.l and e.r are typed as `any` (or null). When I recursively call EvalExpr with e.l, I need to pass it as Expr. If e.l is null, I need to handle that.
+
+Let me handle null separately:
+
+```vim9script
+def EvalExpr(e: any, db: Database, tabIdxs: list<number>, refs: list<TableRef>, rows: list<list<Value>>): Value
+  if e == null
+    return Value.Null()
+  endif
+  var ex = e  # now ex is any, but we know it's Expr
+  ...
+```
+
+Hmm, this still has the problem of accessing members on `any` type.
+
+Actually, in Vim9, I think you CAN access members on `any` typed variables at runtime. The type checking is done at compile time for typed variables, but `any` is dynamically typed. Let me check...
+
+Actually, I think in Vim9, member access on `any` type might work at runtime but could generate warnings. Or it might not work at all.
+
+Let me try a different approach: make the Expr fields properly typed and use `Expr` type for l and r, allowing null.
+
+Actually, I just realized that in Vim9 script, you can use `null` with object types. Let me try:
+
+```vim9script
+class Expr
+  var kind: number
+  var col: string = ''
+  var ival: number = 0
+  var sval: string = ''
+  var op: string = ''
+  var l: Expr = null
+  var r: Expr = null
+endclass
+```
+
+If this works, then I can type the parameter as `Expr` and handle null:
+
+```vim9script
+def EvalExpr(e: Expr, ...): Value
+  if e == null
+    return Value.Null()
+  endif
+  if e.kind == 1
+    return Value.Int(e.ival)
+  endif
+  ...
+  if e.kind == 3
+    var a = EvalExpr(e.l, ...)
+    ...
+  endif
+enddef
+```
+
+I think this should work in Vim9. Let me go with this approach.
+
+Actually wait, can a class member variable be of the same class type? Like `var l: Expr = null`? I think this should work since it's just a reference.
+
+Let me proceed with this approach.
+
+Now for the collect_matching function (nested loop join):
+
+```vim9script
+def CollectMatching(s: PreparedStmt): void
+  var st = s.st
+  var db = s.db
+  var n = len(st.sel_tables)
+  var tabIdxs: list<number> = []
+  for i in range(n)
+    add(tabIdxs, db.FindTableIndex(st.sel_tables[i].tname))
+  endfor
+  # nested loop
+  var cur: list<number> = []  # current row index in each table
+  for i in range(n)
+    add(cur, 0)
+  endfor
+  # Initialize cur to first row of each table
+  for i in range(n)
+    if tabIdxs[i] < 0 || len(db.stores[tabIdxs[i]]) == 0
+      return  # no rows in some table
+    endif
+  endfor
+  while true
+    # Build current rows
+    var rows: list<list<Value>> = []
+    for i in range(n)
+      add(rows, db.stores[tabIdxs[i]][cur[i]])
+    endfor
+    # Check WHERE and JOIN ON
+    if EvalExpr(st.sel_where, db, tabIdxs, st.sel_tables, rows).Truthy()
+      if st.sel_join_on == null || EvalExpr(st.sel_join_on, db, tabIdxs, st.sel_tables, rows).Truthy()
+        # Collect combined row
+        var combined: list<Value> = []
+        for i in range(n)
+          for v in rows[i]
+            add(combined, v.Copy())
+          endfor
+        endfor
+        add(s.sorted, combined)
+      endif
+    endif
+    # Advance innermost
+    var k = n - 1
+    while k >= 0
+      cur[k] += 1
+      if cur[k] < len(db.stores[tabIdxs[k]])
+        break
+      endif
+      if k > 0
+        cur[k] = 0
+        k -= 1
+      else
+        k = -1
+      endif
+    endwhile
+    if k < 0
+      break
+    endif
+  endwhile
+  # ORDER BY
+  if st.sel_order_col != '' && n == 1
+    var cidx = db.ColIndex(tabIdxs[0], st.sel_order_col)
+    if cidx >= 0
+      # insertion sort
+      for i in range(1, len(s.sorted) - 1)
+        var j = i
+        while j > 0
+          var a = s.sorted[j - 1][cidx]
+          var b = s.sorted[j][cidx]
+          var cmp = a.Cmp(b)
+          if (st.sel_order_desc && cmp < 0) || (!st.sel_order_desc && cmp > 0)
+            var tmp = s.sorted[j - 1]
+            s.sorted[j - 1] = s.sorted[j]
+            s.sorted[j] = tmp
+            j -= 1
+          else
+            break
+          endif
+        endwhile
+      endfor
+    endif
+  endif
+enddef
+```
+
+Wait, there's an issue with the nested loop advancement. Let me re-examine the C code:
+
+```c
+/* advance innermost */
+int k;
+for (k=n-1;k>=0;k--){
+    cur[k]=cur[k]->next;
+    if (cur[k]) break;
+    if (k>0) cur[k]= idx[k]>=0 ? db->stores[idx[k]].head : NULL;
+    else { /* all done */ }
+}
+if (k<0) break;
+```
+
+So it advances the innermost cursor (k=n-1). If it reaches the end (null), it resets to head and moves to the next outer cursor. If all cursors are exhausted (k<0), we're done.
+
+In my version with indices:
+- cur[k] += 1 (advance)
+- if cur[k] < len(store), break (found next row)
+- if k > 0, reset cur[k] = 0 and continue to k-1
+- if k == 0, all done (k becomes -1)
+
+Let me fix:
+
+```vim9script
+while true
+  # ... process current rows ...
+  # Advance innermost
+  var k = n - 1
+  var done = false
+  while k >= 0
+    cur[k] += 1
+    if cur[k] < len(db.stores[tabIdxs[k]])
+      break
+    endif
+    if k > 0
+      cur[k] = 0
+      k -= 1
+    else
+      done = true
+      break
+    endif
+  endwhile
+  if done
+    break
+  endif
+endwhile
+```
+
+Wait, but the inner while loop decrements k, and then the for loop condition checks k >= 0. In my while loop, I'm manually decrementing k. Let me trace through:
+
+Say n=2, cur=[0,0], and table 0 has 2 rows, table 1 has 3 rows.
+
+First iteration: process rows [0,0].
+Advance: k=1, cur[1]=1, 1<3, break. cur=[0,1].
+
+Second iteration: process [0,1].
+Advance: k=1, cur[1]=2, 2<3, break. cur=[0,2].
+
+Third iteration: process [0,2].
+Advance: k=1, cur[1]=3, 3>=3, k>0 so cur[1]=0, k=0.
+  k=0, cur[0]=1, 1<2, break. cur=[1,0].
+
+Fourth iteration: process [1,0].
+... and so on.
+
+This looks correct. But there's a bug in my while loop: after `k -= 1`, the while condition `k >= 0` is checked, and if k >= 0, we continue the loop. But we need to do `cur[k] += 1` for the new k. Let me re-check:
+
+```
+while k >= 0
+  cur[k] += 1
+  if cur[k] < len(...)
+    break
+  endif
+  if k > 0
+    cur[k] = 0
+    k -= 1
+    # loop continues, cur[k] += 1 for new k
+  else
+    done = true
+    break
+  endif
+endwhile
+```
+
+Yes, this is correct. After k -= 1, the while loop continues, and cur[k] += 1 is executed for the new k.
+
+Now for the step function:
+
+```vim9script
+def StepSelect(s: PreparedStmt): number
+  if !s.started
+    s.started = true
+    CollectMatching(s)
+  endif
+  if s.cur >= len(s.sorted)
+    return 101  # DONE
+  endif
+  var r = s.sorted[s.cur]
+  s.cur += 1
+  var st = s.st
+  var db = s.db
+  var n = len(st.sel_tables)
+  var tabIdxs: list<number> = []
+  for i in range(n)
+    add(tabIdxs, db.FindTableIndex(st.sel_tables[i].tname))
+  endfor
+  # compute offsets
+  var offsets: list<number> = []
+  var off = 0
+  for i in range(n)
+    add(offsets, off)
+    off += len(db.colsArr[tabIdxs[i]])
+  endfor
+  # build output row
+  s.outrow = []
+  s.nout = 0
+  if st.sel_star
+    for i in range(n)
+      for j in range(len(db.colsArr[tabIdxs[i]]))
+        add(s.outrow, r[offsets[i] + j].Copy())
+        s.nout += 1
+      endfor
+    endfor
+  else
+    for rc in st.sel_cols
+      if rc.star
+        for i in range(n)
+          for j in range(len(db.colsArr[tabIdxs[i]]))
+            add(s.outrow, r[offsets[i] + j].Copy())
+            s.nout += 1
+          endfor
+        endfor
+      else
+        # resolve column
+        var dot = stridx(rc.col, '.')
+        var ti = 0
+        var ci = -1
+        if dot >= 0
+          var tname = rc.col[: dot - 1]
+          var cname = rc.col[dot + 1 :]
+          for i in range(n)
+            var tn = st.sel_tables[i].alias != '' ? st.sel_tables[i].alias : st.sel_tables[i].tname
+            if tn ==? tname
+              ci = db.ColIndex(tabIdxs[i], cname)
+              ti = i
+              break
+            endif
+          endfor
+        else
+          for i in range(n)
+            ci = db.ColIndex(tabIdxs[i], rc.col)
+            if ci >= 0
+              ti = i
+              break
+            endif
+          endfor
+        endif
+        if ci < 0
+          add(s.outrow, Value.Null())
+        else
+          add(s.outrow, r[offsets[ti] + ci].Copy())
+        endif
+        s.nout += 1
+      endif
+    endfor
+  endif
+  return 100  # ROW
+enddef
+```
+
+Now for the public API. Let me create a Sqlite3 class (Database) and a Stmt class (PreparedStmt).
+
+Actually, looking at the requirements again: "Name them as idiomatic for Vim9 script (e.g. a class/module Sqlite3 with methods open/exec/prepare/step/finalize/close)"
+
+So I should have:
+- Sqlite3 class with open, exec, prepare, step, finalize, close, column_count, column_text, column_int64, errmsg
+
+Wait, but in C, sqlite3_open creates a db handle, and sqlite3_prepare_v2 creates a stmt handle. These are separate types. In Vim9, I could have:
+- `Sqlite3` class for the database
+- `Sqlite3Stmt` class for prepared statements
+
+Or I could combine them. Let me keep them separate for clarity.
+
+Actually, looking at the C API:
+- `sqlite3_open(name, &db)` → creates db
+- `sqlite3_exec(db, sql, cb, arg, &err)` → executes SQL with callback
+- `sqlite3_prepare_v2(db, sql, n, &stmt, &tail)` → creates prepared statement
+- `sqlite3_step(stmt)` → steps through results
+- `sqlite3_finalize(stmt)` → frees statement
+- `sqlite3_close(db)` → closes database
+- `sqlite3_column_count(stmt)` → number of columns
+- `sqlite3_column_text(stmt, i)` → text value
+- `sqlite3_column_int64(stmt, i)` → int value
+- `sqlite3_errmsg(db)` → error message
+
+In Vim9, I'll create:
+- `Sqlite3` class with methods: `Exec`, `Prepare`, `Close`, `Errmsg` (instance methods)
+- `Sqlite3Stmt` class with methods: `Step`, `Finalize`, `ColumnCount`, `ColumnText`, `ColumnInt64`
+- Static method `Sqlite3.Open()` to create a new database
+
+Let me also think about the exec callback. In C, the callback is `void (*cb)(void*, int, char**, char**)`. In Vim9, I'll use a `func` type callback.
+
+Let me write the classes:
+
+```vim9script
+class Sqlite3
+  var tables: list<string> = []
+  var colsArr: list<list<string>> = []
+  var stores: list<list<list<Value>>> = []
+  var errmsg: string = ''
+  var in_txn: bool = false
+
+  static def Open(name: string = ':memory:'): Sqlite3
+    return Sqlite3.new()
+  enddef
+
+  def new()
+    # nothing special
+  enddef
+
+  def Close(): number
+    # Vim9 has garbage collection, nothing to explicitly free
+    return 0
+  enddef
+
+  def Errmsg(): string
+    return this.errmsg
+  enddef
+
+  def FindTableIndex(name: string): number
+    ...
+  enddef
+
+  def ColIndex(tabIdx: number, col: string): number
+    ...
+  enddef
+
+  def Exec(sql: string, cb: func(any, list<string>): void = null, arg: any = null): number
+    ...
+  enddef
+
+  def Prepare(sql: string): Sqlite3Stmt
+    ...
+  enddef
+endclass
+
+class Sqlite3Stmt
+  var db: Sqlite3
+  var st: Stmt
+  var sorted: list<list<Value>> = []
+  var cur: number = 0
+  var started: bool = false
+  var outrow: list<Value> = []
+  var nout: number = 0
+
+  def new(db: Sqlite3, st: Stmt)
+    this.db = db
+    this.st = st
+  enddef
+
+  def Step(): number
+    ...
+  enddef
+
+  def Finalize(): number
+    return 0
+  enddef
+
+  def ColumnCount(): number
+    return this.nout
+  enddef
+
+  def ColumnText(i: number): string
+    if i < 0 || i >= this.nout
+      return ''
+    endif
+    return this.outrow[i].ToText()
+  enddef
+
+  def ColumnInt64(i: number): number
+    if i < 0 || i >= this.nout
+      return 0
+    endif
+    return this.outrow[i].type == 1 ? this.outrow[i].ival : 0
+  enddef
+endclass
+```
+
+Now let me think about the Exec method. It needs to:
+1. Lex the SQL
+2. Parse each statement
+3. Execute each statement (CREATE, INSERT, SELECT)
+4. For SELECT, call the callback for each row
+
+```vim9script
+def Exec(sql: string, cb: func(any, list<string>): void = null, arg: any = null): number
+  var toks = Lex(sql)
+  var p = Parser.new(toks)
+  while p.Kind() != 0  # TK_EOF
+    var st = p.Parse()
+    if st == null || st.error
+      this.errmsg = 'parse error'
+      return 1
+    endif
+    if st.is_begin
+      this.in_txn = true
+    elseif st.is_commit
+      this.in_txn = false
+    elseif st.is_create
+      var rc = this.ExecCreate(st)
+      if rc != 0
+        return rc
+      endif
+    elseif st.is_insert
+      var rc = this.ExecInsert(st)
+      if rc != 0
+        return rc
+      endif
+    elseif st.is_select
+      var stmt = Sqlite3Stmt.new(this, st)
+      while stmt.Step() == 100
+        if cb != null
+          var vals: list<string> = []
+          for i in range(stmt.nout)
+            add(vals, stmt.outrow[i].ToText())
+          endfor
+          cb(arg, vals)
+        endif
+      endwhile
+    endif
+  endwhile
+  return 0
+enddef
+```
+
+Wait, but the callback signature in C is `void (*cb)(void*, int, char**, char**)`. The int is the number of columns, char** is the values, and the second char** is the column names (always NULL in this implementation). In my Vim9 version, I'll pass (arg, list_of_values).
+
+Actually, looking at the demo:
+```c
+static void print_row(void *arg, int n, char **vals, char **cols){
+    (void)arg;(void)cols;
+    for (int i=0;i<n;i++) printf("%s%s", vals[i], i+1<n?" | ":"\n");
+}
+```
+
+So the callback receives arg, n, vals, cols. In Vim9, I'll make the callback receive (arg, vals) where vals is a list of strings. The number of columns is len(vals).
+
+Let me adjust the callback type. Actually, in Vim9, defining function types with specific signatures can be tricky. Let me use `func(any, list<string>)` as the callback type.
+
+Hmm, but Vim9 might not support default null for func types. Let me check... I think you can do `cb: func(any, list<string>): void = null` but I'm not sure if null is a valid default for a func type. Let me use `any` type for the callback and check inside.
+
+Actually, let me just use `any` for the callback:
+
+```vim9script
+def Exec(sql: string, cb: any = null, arg: any = null): number
+```
+
+And inside, check `if cb != null && type(cb) == v:t_func`.
+
+Hmm, this is getting complicated. Let me simplify and just use `any`.
+
+Now let me also think about the Prepare method:
+
+```vim9script
+def Prepare(sql: string): Sqlite3Stmt
+  var toks = Lex(sql)
+  var p = Parser.new(toks)
+  var st = p.Parse()
+  if st == null || st.error
+    this.errmsg = 'parse error'
+    return null
+  endif
+  return Sqlite3Stmt.new(this, st)
+enddef
+```
+
+But returning null from a function typed to return Sqlite3Stmt... same issue as before. Let me handle this with error checking.
+
+Actually, in Vim9, I think you can return null from a function that returns an object type. Let me try it.
+
+Now let me also handle the case where Parse returns a Stmt with error=true. Actually, let me just have Parse return null on error and handle it.
+
+Wait, I need to think about the Stmt class more carefully. In the C code, Parse fills in a Stmt struct and returns 0 on success, -1 on error. In my Vim9 version, I'll have Parse return a Stmt object or null.
+
+But there's a subtlety: the Parse method in C handles one statement at a time, and the loop in exec handles multiple statements separated by semicolons. My Parser.Parse() should do the same.
+
+Let me also think about the `range()` function in Vim9. `range(n)` returns [0, 1, ..., n-1]. `range(1, n-1)` returns [1, 2, ..., n-1]. This is useful for loops.
+
+Actually, I should be careful with `range(1, len(s.sorted) - 1)` when len is 0 or 1. `range(1, 0)` returns [] (empty), and `range(1, 0)` when len is 1 returns []. So that's fine.
+
+Wait, `range(1, 0)` - does this return [] or [1, 0]? In Vim, `range(1, 0)` returns [] because the end is before the start. Good.
+
+Now let me think about the demo. The C demo:
+```c
+int main(void){
+    sqlite3 *db; sqlite3_open(":memory:",&db);
+    char *err=NULL;
+    const char *sql =
+        "CREATE TABLE users (id INTEGER, name TEXT);"
+        "INSERT INTO users VALUES (1, 'ada');"
+        "INSERT INTO users VALUES (2, 'grace');"
+        "INSERT INTO users VALUES (3, 'linus');"
+        "SELECT * FROM users WHERE id > 1 ORDER BY id DESC;";
+    if (sqlite3_exec(db, sql, print_row, NULL, &err)){ fprintf(stderr,"err: %s\n", err?err:"?"); free(err); }
+    sqlite3_close(db);
+    return 0;
+}
+```
+
+Expected output:
+```
+grace | 2
+linus | 3
+```
+
+Wait, the table is `users (id INTEGER, name TEXT)`, so SELECT * returns id, name. The rows with id > 1 are (2, 'grace') and (3, 'linus'). Ordered by id DESC: (3, 'linus'), (2, 'grace').
+
+So output should be:
+```
+3 | linus
+2 | grace
+```
+
+Let me write the Vim9 demo:
+
+```vim9script
+def PrintRow(arg: any, vals: list<string>): void
+  echo join(vals, ' | ')
+enddef
+
+# Demo
+var db = Sqlite3.Open()
+var sql = "CREATE TABLE users (id INTEGER, name TEXT);INSERT INTO users VALUES (1, 'ada');INSERT INTO users VALUES (2, 'grace');INSERT INTO users VALUES (3, 'linus');SELECT * FROM users WHERE id > 1 ORDER BY id DESC;"
+var rc = db.Exec(sql, PrintRow, null)
+if rc != 0
+  echoerr $'err: {db.Errmsg()}'
+endif
+db.Close()
+```
+
+Now let me put it all together. Let me also think about potential issues:
+
+1. In Vim9, `str2nr` converts a string to a number. For "123", it returns 123. Good.
+
+2. String slicing: `sql[st : i - 1]` gives characters from st to i-1 inclusive. In Vim9, string slicing is inclusive on both ends. So `sql[st : i - 1]` gives the substring from position st to position i-1. That's correct.
+
+Wait, actually in Vim9, string slicing `s[a:b]` gives characters from index a to index b inclusive. So `s[0:2]` gives the first 3 characters. And `s[st : i-1]` gives characters from st to i-1 inclusive, which is the substring we want. Good.
+
+3. For the `=~` pattern matching with `\a` and `\d`, I need to make sure these work on single characters. In Vim, `'a' =~ '\a'` should return 1 (true). Let me verify... yes, `\a` matches an alphabetic character, and `=~` checks if the string contains a match. For a single character, it checks if that character matches.
+
+Actually wait, `=~` checks if the string matches the pattern anywhere. So `'abc' =~ '\a'` is true because 'a' matches. And `'a' =~ '\a'` is true. But `'5' =~ '\a'` is false. Good.
+
+But there's a subtlety: `'a5' =~ '\a'` is true because 'a' matches somewhere. So for checking if a character is alphabetic, I should use `c =~ '^\a$'` or just `c =~ '\a'` since c is a single character. Actually, for a single character, `c =~ '\a'` works fine because the pattern just needs to match somewhere in

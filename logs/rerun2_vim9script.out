@@ -1,3 +1,5 @@
 [2026-06-20T17:34:47Z] loop start: 1 languages, orig_tokens=8805
 [2026-06-20T17:34:47Z]   >>> porting vim9script (Vim9 script)
 [2026-06-20T17:37:35Z]       porter length-capped (16000 tok); retry high effort
+[2026-06-20T17:40:37Z]       porter done: 429 bytes, 132 tokens, 350.0s
+[2026-06-20T17:40:39Z]       judge: completeness=8 notes=Port is essentially a stub demo that calls nonexistent Sqlite3 class methods wit
