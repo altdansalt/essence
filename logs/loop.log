@@ -8,3 +8,7 @@
 [2026-06-20T16:50:34Z]       porter done: 100 bytes, 39 tokens, 219.2s
 [2026-06-20T16:50:36Z]       judge: completeness=8 notes=Port snippet shows only a parser loop fragment with no actual Python implementat
 [2026-06-20T16:50:36Z] loop done: 1 runs
+[2026-06-20T17:00:50Z] loop start: 1 languages, orig_tokens=8805
+[2026-06-20T17:00:50Z]   >>> porting python (Python)
+[2026-06-20T17:02:30Z]       porter done: 20003 bytes, 5200 tokens, 100.4s
+[2026-06-20T17:02:32Z]       judge: completeness=42 notes=Python port is incomplete: the Sqlite3Stmt._collect_matching method is truncated

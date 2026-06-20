@@ -52,8 +52,16 @@ def _post(url: str, payload: dict, headers: dict, timeout: int = 1200) -> dict:
 
 
 def fireworks_chat(model: str, messages: list[dict], *, max_tokens: int = 8000,
-                   temperature: float = 0.2, timeout: int = 1800) -> dict:
-    """Call a Fireworks chat-completions model through the gateway."""
+                   temperature: float = 0.2, timeout: int = 1800,
+                   reasoning_effort: str | None = None) -> dict:
+    """Call a Fireworks chat-completions model through the gateway.
+
+    GLM-5.2 (and other reasoning models on Fireworks) support a
+    `reasoning_effort` of "low"/"medium"/"high" that routes chain-of-thought
+    into a hidden channel so the visible output is clean code. Without it,
+    GLM-5.2 burns the entire token budget on visible reasoning and never
+    emits the code. We default to "low" for code generation.
+    """
     url = f"{GATEWAY}/fireworks/inference/v1/chat/completions"
     payload = {
         "model": model,
@@ -61,6 +69,8 @@ def fireworks_chat(model: str, messages: list[dict], *, max_tokens: int = 8000,
         "max_tokens": max_tokens,
         "temperature": temperature,
     }
+    if reasoning_effort:
+        payload["reasoning_effort"] = reasoning_effort
     return _post(url, payload, {"content-type": "application/json"}, timeout)
 
 
@@ -94,14 +104,46 @@ def extract_code(text: str) -> str:
     return text.strip() + "\n"
 
 
-def porter(messages: list[dict], *, max_tokens: int = 8000, temperature: float = 0.2) -> dict:
+def fireworks_chat(model: str, messages: list[dict], *, max_tokens: int = 8000,
+                   temperature: float = 0.2, timeout: int = 1800,
+                   reasoning_effort: str | None = None) -> dict:
+    """Call a Fireworks chat-completions model through the gateway.
+
+    GLM-5.2 (and other reasoning models on Fireworks) support a
+    `reasoning_effort` of "low"/"medium"/"high" that routes chain-of-thought
+    into a hidden channel so the visible output is clean code. Without it,
+    GLM-5.2 burns the entire token budget on visible reasoning and never
+    emits the code. We default to "low" for code generation.
+    """
+    url = f"{GATEWAY}/fireworks/inference/v1/chat/completions"
+    payload = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+    if reasoning_effort:
+        payload["reasoning_effort"] = reasoning_effort
+    return _post(url, payload, {"content-type": "application/json"}, timeout)
+
+
+# Default reasoning effort for the porter. "low" keeps GLM-5.2 focused on
+# emitting code rather than visible chain-of-thought; override via env.
+PORTER_REASONING = os.environ.get("PORTER_REASONING", "low")
+
+
+def porter(messages: list[dict], *, max_tokens: int = 16000, temperature: float = 0.3,
+           reasoning_effort: str | None = PORTER_REASONING) -> dict:
     """Run the porter agent (GLM-5.2). Returns raw gateway response."""
-    return fireworks_chat(PORTER_MODEL, messages, max_tokens=max_tokens, temperature=temperature)
+    return fireworks_chat(PORTER_MODEL, messages, max_tokens=max_tokens,
+                          temperature=temperature, reasoning_effort=reasoning_effort)
 
 
-def porter_text(messages: list[dict], *, max_tokens: int = 8000, temperature: float = 0.2) -> tuple[str, dict]:
+def porter_text(messages: list[dict], *, max_tokens: int = 16000, temperature: float = 0.3,
+                reasoning_effort: str | None = PORTER_REASONING) -> tuple[str, dict]:
     """Run porter and return (assistant_text, usage)."""
-    resp = porter(messages, max_tokens=max_tokens, temperature=temperature)
+    resp = porter(messages, max_tokens=max_tokens, temperature=temperature,
+                  reasoning_effort=reasoning_effort)
     content = resp["choices"][0]["message"]["content"]
     usage = resp.get("usage", {})
     return content, usage

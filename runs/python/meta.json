@@ -1,39 +1,39 @@
 {
   "language": "Python",
   "slug": "python",
-  "timestamp_utc": "2026-06-20T16:50:36Z",
-  "elapsed_seconds": 219.2,
+  "timestamp_utc": "2026-06-20T17:02:32Z",
+  "elapsed_seconds": 100.4,
   "original_tokens": 8805,
-  "ported_tokens": 39,
-  "token_ratio": 0.0044,
-  "reduction_factor": 225.77,
+  "ported_tokens": 5200,
+  "token_ratio": 0.5906,
+  "reduction_factor": 1.69,
   "porter_model": "accounts/fireworks/models/glm-5p2",
   "judge_model": "claude-haiku-4-5",
   "porter_usage": {
     "prompt_tokens": 15442,
-    "total_tokens": 31442,
-    "completion_tokens": 16000,
+    "total_tokens": 26263,
+    "completion_tokens": 10821,
     "prompt_tokens_details": {
-      "cached_tokens": 80
+      "cached_tokens": 9
     }
   },
   "judge_usage": {
-    "input_tokens": 11800,
+    "input_tokens": 17160,
     "cache_creation_input_tokens": 0,
     "cache_read_input_tokens": 0,
     "cache_creation": {
       "ephemeral_5m_input_tokens": 0,
       "ephemeral_1h_input_tokens": 0
     },
-    "output_tokens": 175,
+    "output_tokens": 123,
     "service_tier": "standard",
     "inference_geo": "not_available"
   },
   "judge_score": {
-    "completeness": 8,
-    "api_surface": 5,
-    "sql_features": 5,
-    "architecture": 10,
-    "notes": "Port snippet shows only a parser loop fragment with no actual Python implementation visible. Cannot assess completeness of lexer, parser, executor, value types, schema, row storage, expression evaluation, or any of the 11 public API functions (sqlite3_open, sqlite3_exec, sqlite3_prepare_v2, sqlite3_step, sqlite3_column_count, sqlite3_column_text, sqlite3_column_int64, sqlite3_finalize, sqlite3_close, sqlite3_errmsg, demo). Appears to be incomplete submission."
+    "completeness": 42,
+    "api_surface": 55,
+    "sql_features": 50,
+    "architecture": 35,
+    "notes": "Python port is incomplete: the Sqlite3Stmt._collect_matching method is truncated mid-implementation, breaking SELECT execution entirely. Many public API functions (sqlite3_column_int64, sqlite3_column_text, sqlite3_column_count, sqlite3_finalize) are missing or incomplete in the port."
   }
 }
