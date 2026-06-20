@@ -18,22 +18,22 @@
     }
   },
   "judge_usage": {
-    "input_tokens": 17160,
+    "input_tokens": 18484,
     "cache_creation_input_tokens": 0,
     "cache_read_input_tokens": 0,
     "cache_creation": {
       "ephemeral_5m_input_tokens": 0,
       "ephemeral_1h_input_tokens": 0
     },
-    "output_tokens": 123,
+    "output_tokens": 140,
     "service_tier": "standard",
     "inference_geo": "not_available"
   },
   "judge_score": {
-    "completeness": 42,
-    "api_surface": 55,
-    "sql_features": 50,
-    "architecture": 35,
-    "notes": "Python port is incomplete: the Sqlite3Stmt._collect_matching method is truncated mid-implementation, breaking SELECT execution entirely. Many public API functions (sqlite3_column_int64, sqlite3_column_text, sqlite3_column_count, sqlite3_finalize) are missing or incomplete in the port."
+    "completeness": 78,
+    "api_surface": 85,
+    "sql_features": 80,
+    "architecture": 75,
+    "notes": "Python port covers most API surface (open/exec/prepare/step/finalize/close/column_*/errmsg) and SQL features (CREATE/INSERT/SELECT with WHERE/ORDER BY/JOIN). Minor gaps: lexer line-comment handling differs slightly, parser error handling less granular, no transaction state enforcement, and prepared statement lifecycle differs from C (no separate statement finalization in full sense)."
   }
 }

@@ -113,7 +113,7 @@ Return STRICT JSON only, no prose, with this shape:
 
 Ported source ({lang['name']}):
 ```
-{ported_code[:16000]}
+{ported_code}
 ```
 
 Score the port. The original implements: sqlite3_open/exec/prepare_v2/step/finalize/close, column_count/column_text/column_int64/errmsg; SQL: CREATE TABLE, INSERT VALUES, SELECT with projections, SELECT *, WHERE (=,<>,<,>,<=,>=,AND,OR), ORDER BY [DESC|ASC], INNER JOIN ON; values NULL/int/text; a demo main.
