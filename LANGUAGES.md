@@ -13,3 +13,4 @@ Reduction >1 means the port is smaller than the C reference by token count.
 | 6 | Nostos | 42 | 1.35x | 6506/8805 | The port captures core architectural elements (lexer, parser, AST, schema, execu |
 | 7 | F# | 32 | 1.4x | 6298/8805 | The F# port has significant structural issues: Parser class lacks proper positio |
 | 8 | Odin | 15 | 64.74x | 136/8805 | Port is severely incomplete: only two small cleanup procedures shown (free_stmt, |
+| 9 | Vim9 script | 8 | 66.7x | 132/8805 | Port is essentially a stub demo that calls nonexistent Sqlite3 class methods wit |

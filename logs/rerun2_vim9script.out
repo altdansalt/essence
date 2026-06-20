@@ -3,3 +3,12 @@
 [2026-06-20T17:37:35Z]       porter length-capped (16000 tok); retry high effort
 [2026-06-20T17:40:37Z]       porter done: 429 bytes, 132 tokens, 350.0s
 [2026-06-20T17:40:39Z]       judge: completeness=8 notes=Port is essentially a stub demo that calls nonexistent Sqlite3 class methods wit
+[main 1fc457e] port: vim9script (Vim9 script) completeness=8
+ 7 files changed, 1930 insertions(+)
+ create mode 100644 runs/vim9script/judge_raw.txt
+ create mode 100644 runs/vim9script/meta.json
+ create mode 100644 runs/vim9script/porter_raw.txt
+ create mode 100644 runs/vim9script/sqlite_core.txt
+To https://github.com/altdansalt/essence.git
+   3a61be2..1fc457e  main -> main
+[2026-06-20T17:40:40Z] loop done: 1 runs
