@@ -58,3 +58,14 @@ To https://github.com/altdansalt/essence.git
 [2026-06-20T17:14:50Z]   >>> porting java (Java)
 [2026-06-20T17:15:39Z]       porter done: 24780 bytes, 6175 tokens, 49.1s
 [2026-06-20T17:15:41Z]       judge: completeness=78 notes=Java port captures most C API surface and core SQL features but has structural g
+[main 65d7be3] port: java (Java) completeness=78
+ 6 files changed, 1202 insertions(+)
+ create mode 100644 runs/java/judge_raw.txt
+ create mode 100644 runs/java/meta.json
+ create mode 100644 runs/java/porter_raw.txt
+ create mode 100644 runs/java/sqlite_core.java
+To https://github.com/altdansalt/essence.git
+   41aff36..65d7be3  main -> main
+[2026-06-20T17:15:42Z]   >>> porting odin (Odin)
+[2026-06-20T17:18:08Z]       porter done: 3438 bytes, 940 tokens, 145.9s
+[2026-06-20T17:18:10Z]       judge: completeness=42 notes=Port covers core API functions but lacks critical infrastructure: lexer, parser,

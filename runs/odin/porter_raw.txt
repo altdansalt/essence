@@ -1,0 +1,1836 @@
+Let me port the C SQLite-style engine to Odin faithfully. I need to implement:
+
+1. Value type (NULL/INT/TEXT)
+2. Schema/Table
+3. Row/RowStore (linked list)
+4. Lexer
+5. Parser (recursive descent)
+6. AST
+7. Executor
+8. Public API: open, exec, prepare_v2, step, finalize, close, column_count, column_text, column_int64, errmsg
+9. Demo main
+
+Let me write this in idiomatic Odin. I'll use Odin's features like tagged unions, dynamic arrays, defer, etc.
+
+Let me think about the structure:
+
+- `Value` as a tagged union or struct with enum
+- `Table` struct with name and columns
+- `Row` as []Value
+- `RowStore` as linked list
+- Lexer producing tokens
+- Parser producing AST
+- Executor
+
+Let me write this carefully.
+
+In Odin, I can use a union type for Value, or a struct with an enum tag. Let me use a struct with enum tag for clarity.
+
+Actually, Odin has tagged unions. Let me use:
+```
+Value :: union {
+    nil,
+    i64,
+    string,
+}
+```
+
+But the C code distinguishes V_NULL, V_INT, V_TEXT. With a tagged union, `nil` would be the null case. But I need to be careful - in Odin, a union with `nil` type... let me think. Actually Odin unions can't have `nil` as a member type directly in the same way. Let me use a struct with a tag enum instead, or use `union {i64, string}` and handle nil separately.
+
+Actually, let me just use a struct:
+```odin
+VType :: enum { NULL, INT, TEXT }
+Value :: struct {
+    type: VType,
+    ival: i64,
+    sval: string,
+}
+```
+
+This is cleaner and matches the C code well.
+
+For strings, Odin strings are not null-terminated and are value types (slice + length), so I don't need to worry about strdup/free as much. But I need to be careful about ownership. In the C code, text values own their strings. In Odin, strings are reference-counted-ish (they're just slices). I'll need to clone strings when storing them if they come from temporary buffers.
+
+Actually, in Odin, strings are immutable slices. When I do `v_text(s)`, the string `s` might be from a temporary token. I should use `strings.clone` or just copy. Let me think...
+
+For the lexer, tokens contain strings that are slices of the source. When I create a Value from a token's text, I need to clone it since the token might be freed. Actually in Odin, if I keep the source string alive, the slices remain valid. But the C code uses strdup everywhere. Let me just clone strings when needed.
+
+Let me structure this:
+
+```odin
+package main
+
+import "core:fmt"
+import "core:strings"
+```
+
+Let me write the full code now.
+
+For the lexer, I'll produce a dynamic array of tokens.
+
+For the parser, I'll use an index into the token array.
+
+For the executor, I'll implement nested-loop joins, WHERE filtering, ORDER BY, and projections.
+
+Let me be careful about case-insensitive comparison. The C code uses `strcasecmp` and `strncasecmp`. In Odin, I can use `strings.equal_fold` for case-insensitive comparison.
+
+Let me write the code:
+
+```odin
+package main
+
+import "core:fmt"
+import "core:strings"
+import "core:mem"
+
+// Value
+VType :: enum { NULL, INT, TEXT }
+
+Value :: struct {
+    type: VType,
+    ival: i64,
+    sval: string,
+}
+
+v_null :: proc() -> Value { return {type = .NULL} }
+v_int :: proc(i: i64) -> Value { return {type = .INT, ival = i} }
+v_text :: proc(s: string) -> Value { return {type = .TEXT, sval = s} }
+v_copy :: proc(v: Value) -> Value {
+    if v.type == .TEXT {
+        return {type = .TEXT, sval = strings.clone(v.sval)}
+    }
+    return v
+}
+
+v_cmp :: proc(a, b: Value) -> int {
+    if a.type != b.type {
+        return int(a.type) - int(b.type)
+    }
+    switch a.type {
+    case .INT:
+        if a.ival < b.ival { return -1 }
+        if a.ival > b.ival { return 1 }
+        return 0
+    case .TEXT:
+        return strings.compare(a.sval, b.sval)
+    case:
+        return 0
+    }
+}
+
+v_to_text :: proc(v: Value) -> string {
+    switch v.type {
+    case .INT: return fmt.tprintf("%d", v.ival)
+    case .TEXT: return v.sval
+    case: return "NULL"
+    }
+}
+
+v_truthy :: proc(v: Value) -> bool {
+    return v_cmp(v, v_int(0)) != 0
+}
+```
+
+Wait, I need to be careful. In the C code, `v_to_text` uses a static buffer for INT. In Odin, `fmt.tprintf` allocates. That's fine for our purposes.
+
+Now for the schema:
+
+```odin
+Table :: struct {
+    name: string,
+    cols: [dynamic]string,
+}
+
+Schema :: struct {
+    tables: [dynamic]Table,
+}
+
+schema_find :: proc(s: ^Schema, name: string) -> ^Table {
+    for i in 0..<len(s.tables) {
+        if strings.equal_fold(s.tables[i].name, name) {
+            return &s.tables[i]
+        }
+    }
+    return nil
+}
+
+schema_index :: proc(s: ^Schema, name: string) -> int {
+    for i in 0..<len(s.tables) {
+        if strings.equal_fold(s.tables[i].name, name) {
+            return i
+        }
+    }
+    return -1
+}
+
+schema_add :: proc(s: ^Schema, name: string, cols: [dynamic]string) -> bool {
+    if schema_find(s, name) != nil {
+        return false
+    }
+    append(&s.tables, {name = strings.clone(name), cols = cols})
+    return true
+}
+
+table_colindex :: proc(t: ^Table, col: string) -> int {
+    for i in 0..<len(t.cols) {
+        if strings.equal_fold(t.cols[i], col) {
+            return i
+        }
+    }
+    return -1
+}
+```
+
+Row and RowStore:
+
+```odin
+Row :: struct {
+    vals: [dynamic]Value,
+}
+
+RowNode :: struct {
+    row: Row,
+    next: ^RowNode,
+}
+
+RowStore :: struct {
+    head: ^RowNode,
+    tail: ^RowNode,
+    nrows: int,
+}
+```
+
+Lexer:
+
+```odin
+TokKind :: enum {
+    EOF, ID, INT, STRING, KW, PUNCT,
+    STAR, COMMA, LP, RP, SEMI, OP, DOT,
+}
+
+Token :: struct {
+    kind: TokKind,
+    text: string,
+}
+
+KEYWORDS :: []string{
+    "create", "table", "insert", "into", "values", "select", "from", "where",
+    "order", "by", "asc", "desc", "and", "or", "not", "null", "begin", "commit",
+    "inner", "join", "on", "int", "integer", "text", "primary", "key", "transaction",
+}
+
+is_kw :: proc(s: string) -> bool {
+    for kw in KEYWORDS {
+        if strings.equal_fold(kw, s) {
+            return true
+        }
+    }
+    return false
+}
+
+lex :: proc(sql: string) -> [dynamic]Token {
+    toks: [dynamic]Token
+    pos := 0
+    src := sql
+    
+    while pos < len(src) {
+        c := src[pos]
+        if c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v' {
+            pos += 1
+            continue
+        }
+        if c == '-' && pos+1 < len(src) && src[pos+1] == '-' {
+            while pos < len(src) && src[pos] != '\n' { pos += 1 }
+            continue
+        }
+        if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' {
+            st := pos
+            while pos < len(src) && ((src[pos] >= 'a' && src[pos] <= 'z') || (src[pos] >= 'A' && src[pos] <= 'Z') || (src[pos] >= '0' && src[pos] <= '9') || src[pos] == '_') {
+                pos += 1
+            }
+            word := src[st:pos]
+            append(&toks, {kind = is_kw(word) ? .KW : .ID, text = strings.clone(word)})
+            continue
+        }
+        if c >= '0' && c <= '9' {
+            st := pos
+            while pos < len(src) && src[pos] >= '0' && src[pos] <= '9' { pos += 1 }
+            append(&toks, {kind = .INT, text = strings.clone(src[st:pos])})
+            continue
+        }
+        if c == '\'' {
+            pos += 1
+            st := pos
+            while pos < len(src) && src[pos] != '\'' { pos += 1 }
+            append(&toks, {kind = .STRING, text = strings.clone(src[st:pos])})
+            if pos < len(src) && src[pos] == '\'' { pos += 1 }
+            continue
+        }
+        if c == '"' {
+            pos += 1
+            st := pos
+            while pos < len(src) && src[pos] != '"' { pos += 1 }
+            append(&toks, {kind = .ID, text = strings.clone(src[st:pos])})
+            if pos < len(src) && src[pos] == '"' { pos += 1 }
+            continue
+        }
+        
+        switch c {
+        case '*': append(&toks, {kind = .STAR, text = "*"}); pos += 1
+        case ',': append(&toks, {kind = .COMMA, text = ","}); pos += 1
+        case '(': append(&toks, {kind = .LP, text = "("}); pos += 1
+        case ')': append(&toks, {kind = .RP, text = ")"}); pos += 1
+        case ';': append(&toks, {kind = .SEMI, text = ";"}); pos += 1
+        case '.': append(&toks, {kind = .DOT, text = "."}); pos += 1
+        case:
+            if c == '=' || c == '<' || c == '>' || c == '!' {
+                st := pos
+                if pos+1 < len(src) && src[pos+1] == '=' { pos += 1 }
+                if c == '<' && pos+1 < len(src) && src[pos+1] == '>' { pos += 1 }
+                if c == '!' && pos+1 < len(src) && src[pos+1] == '=' { pos += 1 }
+                pos += 1
+                append(&toks, {kind = .OP, text = strings.clone(src[st:pos])})
+            } else {
+                append(&toks, {kind = .PUNCT, text = strings.clone(string([c]))})
+                pos += 1
+            }
+        }
+    }
+    append(&toks, {kind = .EOF, text = ""})
+    return toks
+}
+```
+
+Hmm, I need to be careful with character classification. Odin doesn't have `isalpha` etc. built in easily. Let me use rune comparisons.
+
+Actually, Odin has `unicode.is_letter` and `unicode.is_digit` in `core:unicode`. But for simplicity, let me just do ASCII checks.
+
+Now the AST:
+
+```odin
+ExprKind :: enum { COL, INT, STR, BINOP }
+
+Expr :: struct {
+    kind: ExprKind,
+    col: string,
+    ival: i64,
+    sval: string,
+    op: string,
+    l: ^Expr,
+    r: ^Expr,
+}
+
+ResultCol :: struct {
+    col: string,
+    star: bool,
+}
+
+TableRef :: struct {
+    tname: string,
+    alias: string,
+}
+
+Stmt :: struct {
+    is_create: bool,
+    is_insert: bool,
+    is_select: bool,
+    is_begin: bool,
+    is_commit: bool,
+    ct_name: string,
+    ct_cols: [dynamic]string,
+    ins_table: string,
+    ins_vals: [dynamic]Value,
+    sel_cols: [dynamic]ResultCol,
+    sel_star: bool,
+    sel_tables: [dynamic]TableRef,
+    sel_where: ^Expr,
+    sel_order_col: string,
+    sel_order_desc: bool,
+    sel_join_on: ^Expr,
+}
+```
+
+Parser:
+
+```odin
+Parser :: struct {
+    toks: []Token,
+    i: int,
+}
+
+p_accept :: proc(p: ^Parser, k: TokKind, text: string) -> bool {
+    if p.toks[p.i].kind != k { return false }
+    if text != "" && !strings.equal_fold(p.toks[p.i].text, text) { return false }
+    p.i += 1
+    return true
+}
+
+p_accept_kw :: proc(p: ^Parser, kw: string) -> bool {
+    return p_accept(p, .KW, kw)
+}
+
+p_peek_kw :: proc(p: ^Parser, kw: string) -> bool {
+    return p.toks[p.i].kind == .KW && strings.equal_fold(p.toks[p.i].text, kw)
+}
+```
+
+For expression parsing, I need to allocate Expr on the heap. In Odin, I can use `new(Expr)`.
+
+Let me continue with the parser and executor...
+
+Actually, let me think about how to handle the `new_expr` function. In Odin:
+
+```odin
+new_expr :: proc(k: ExprKind) -> ^Expr {
+    e := new(Expr)
+    e.kind = k
+    return e
+}
+```
+
+For the parse_primary, parse_cmp, parse_expr functions, I need to handle the column reference with optional dot notation.
+
+Let me write the full code now. I'll try to be concise but complete.
+
+For the database struct:
+
+```odin
+DB :: struct {
+    schema: Schema,
+    stores: [dynamic]RowStore,
+    errmsg: string,
+    in_txn: bool,
+}
+```
+
+For the prepared statement:
+
+```odin
+Stmt_Handle :: struct {
+    db: ^DB,
+    st: Stmt,
+    started: bool,
+    done: bool,
+    outrow: [dynamic]Value,
+    sorted: [dynamic]Row,
+    cur_sorted: int,
+}
+```
+
+Let me now write the complete code. I need to be careful about memory management - in Odin, dynamic arrays need to be deleted, and heap allocations need to be freed. But for a demo, I can be somewhat loose with cleanup (using defer where appropriate).
+
+Actually, let me think about what's idiomatic. Odin doesn't have GC, so I should clean up. But for conciseness, I'll use defer where it makes sense and not worry too much about every allocation.
+
+Let me also think about the `v_to_text` function. In the C code, it uses a static buffer. In Odin, I'll return a string. For INT, I'll use `fmt.tprintf`. For the column_text API, I need to return a string that's valid.
+
+Let me also handle the `exec` callback. In the C code, the callback signature is `void (*cb)(void*,int,char**,char**)`. In Odin, I'll use a proc signature.
+
+Let me write the complete code now:
+
+```odin
+package main
+
+import "core:fmt"
+import "core:strings"
+
+// ... (all the code)
+```
+
+Let me think about the exec callback. The C signature is:
+```c
+void (*cb)(void*,int,char**,char**)
+```
+
+In Odin, I can define:
+```odin
+Exec_Callback :: proc(arg: rawptr, n: int, vals: []string, cols: []string)
+```
+
+But the C code passes NULL for cols. Let me make cols optional or just pass empty.
+
+Actually, let me simplify. The callback in the demo just prints values. Let me define:
+
+```odin
+Exec_Callback :: proc(arg: rawptr, n: int, vals: []string)
+```
+
+Wait, the C code has `char **cols` but always passes NULL. Let me keep it simple.
+
+Actually, to match the API surface, let me include cols but it can be nil.
+
+Let me now write the full code. I'll try to be as concise as possible while being complete.
+
+One thing I need to handle: the C code's `lex_push` uses `strndup`. In Odin, slicing a string gives a sub-slice, but I need to clone it to own the memory. I'll use `strings.clone`.
+
+Actually wait - in Odin, strings are just (data pointer, length) pairs. When I slice `src[st:pos]`, I get a sub-string that points into the original `src` string. As long as `src` is alive, the slice is valid. Since I'm keeping the original SQL string around during parsing, I might not need to clone. But to be safe (and match the C behavior of strdup), I'll clone.
+
+Hmm, but actually for the tokens, I clone them. Then when creating Values from tokens, I clone again. This is a bit wasteful but correct.
+
+Let me think about whether I really need to clone. The issue is:
+1. Lexer creates tokens with cloned strings
+2. Parser creates AST nodes that reference token strings (in C, it uses strdup)
+3. Executor creates Values from AST nodes
+
+If I don't clone, the token strings point into the original SQL string. The AST nodes point to token strings. Values point to AST strings. As long as the original SQL string is alive, everything is fine.
+
+But in the C code, tokens are freed after parsing, and AST strings are strdup'd from token text. So AST strings are independent of tokens.
+
+In Odin, if I use string slices that point into the original SQL, and I keep the SQL string alive, everything works. But if the SQL string is temporary (like in `prepare_v2` where `buf` is freed), then I need to clone.
+
+Let me just clone everywhere to be safe. It's simpler to reason about.
+
+Actually, let me reconsider. In `prepare_v2`, the C code creates a `buf` (strdup of sql), lexes it, parses it, then frees the tokens and buf. The AST strings are strdup'd from token text, so they're independent. The Stmt is kept in the prepared statement.
+
+In Odin, if I clone token strings, and then clone AST strings from token strings, and then free token strings, the AST strings are independent. That works.
+
+But actually, in Odin, `strings.clone` allocates a new string with `make([]u8, len(s))` and copies. I need to `delete` these strings eventually. For a demo, I might not bother with full cleanup, but let me at least try.
+
+Actually, let me simplify: I'll keep the original SQL string alive in the prepared statement, and use slices into it. This avoids cloning. But for `exec`, the SQL string is a parameter that might be temporary...
+
+You know what, let me just clone strings where the C code uses strdup, and not worry too much about freeing everything. The demo will work correctly.
+
+Let me write the code now. I'll aim for correctness and conciseness.
+
+For the `collect_matching` function and `stmt_step_select`, I need to implement the nested loop join and projection logic.
+
+Let me also think about the RowCtx. In the C code:
+
+```c
+typedef struct { TableRef *refs; int n; Table **tabs; Row *rows; } RowCtx;
+```
+
+In Odin:
+```odin
+RowCtx :: struct {
+    refs: []TableRef,
+    tabs: []^Table,
+    rows: []Row,
+}
+```
+
+OK let me write the full code now. I'll be thorough.
+
+Actually, one more thing: in Odin, `strings.compare` returns -1, 0, or 1 (or maybe it returns an `int` with different semantics). Let me check... In Odin, `strings.compare(a, b)` returns -1 if a < b, 0 if equal, 1 if a > b. That matches `strcmp`.
+
+Also, `strings.equal_fold(a, b)` does case-insensitive comparison. Good.
+
+For `fmt.tprintf`, it returns a string allocated with the temp allocator. This might be an issue if I need the string to persist. Let me use `fmt.tprintf` and clone if needed, or use a different approach.
+
+Actually, for `v_to_text` with INT, the C code uses a static buffer. In the API `sqlite3_column_text`, it also uses a static buffer. In Odin, I can use a similar approach with a global buffer, or I can just allocate. For the demo, allocating is fine.
+
+Wait, but `fmt.tprintf` uses the temp allocator by default in Odin. The string might be invalidated after the procedure returns. Let me use `fmt.aprintf` with a regular allocator, or construct the string manually.
+
+Actually, in Odin, `fmt.tprintf` allocates from `context.temp_allocator`. If I'm calling it in a context where the temp allocator is valid, it works. But for returning a string that persists, I should use a different approach.
+
+Let me just use `fmt.tprintf` for the demo and not worry about it. The strings will be valid within the scope.
+
+Hmm, actually for `column_text`, the returned string needs to be valid until the next call to `step`. If I use `fmt.tprintf`, the string is from the temp allocator and might be invalidated. Let me use a global buffer approach like the C code.
+
+Actually, let me just use a simple approach: convert the i64 to string manually or use `fmt.tprintf` and store the result. For the demo, it'll work.
+
+Let me think about this differently. In Odin, I can do:
+
+```odin
+v_to_text :: proc(v: Value) -> string {
+    switch v.type {
+    case .INT:
+        return fmt.tprintf("%d", v.ival)
+    case .TEXT:
+        return v.sval
+    case:
+        return "NULL"
+    }
+}
+```
+
+The `fmt.tprintf` returns a string from the temp allocator. In the context of `exec`'s callback, this should be fine because the callback is called within the same scope. For `column_text`, I need the string to persist. Let me store it in the stmt handle.
+
+Actually, let me look at how the C code works for `column_text`:
+```c
+const char *sqlite3_column_text(sqlite3_stmt *s, int i){
+    static __thread char buf[64];
+    if (i<0||i>=s->nout) return NULL;
+    return v_to_text(&s->outrow[i],buf,sizeof buf);
+}
+```
+
+It uses a static buffer. So each call overwrites the previous. In Odin, I can use a similar approach with a global variable:
+
+```odin
+column_text_buf: [64]u8
+
+column_text :: proc(s: ^Stmt_Handle, i: int) -> string {
+    if i < 0 || i >= len(s.outrow) { return "" }
+    v := s.outrow[i]
+    switch v.type {
+    case .INT:
+        n := fmt.snprintf(column_text_buf[:], "%d", v.ival)
+        return string(column_text_buf[:n])
+    case .TEXT:
+        return v.sval
+    case:
+        return "NULL"
+    }
+}
+```
+
+Wait, `fmt.snprintf` might not exist in Odin. Let me check... Odin has `fmt.bprintf` which formats into a byte buffer. Or I can use `fmt.snprintf`. Actually, I think the function is `fmt.bprintf(buf, format, args...)` which returns the number of bytes written.
+
+Hmm, let me just use a simpler approach. I'll convert the integer to a string using a helper.
+
+Actually, in Odin, I can do:
+```odin
+import "core:strconv"
+strconv.int_to_string(v.ival)
+```
+
+But that returns a string too. Let me just use `fmt.tprintf` and accept that it uses the temp allocator. For the demo, it'll work fine.
+
+Actually, you know what, let me just keep it simple and use `fmt.tprintf` everywhere. The demo will work. For a production library, I'd be more careful, but this is a port of a compact demo.
+
+Let me now write the complete code. I'll focus on getting it right and concise.
+
+Here's my plan for the structure:
+
+1. Value type and operations
+2. Schema/Table
+3. Row/RowStore  
+4. Lexer
+5. AST types
+6. Parser
+7. Executor (collect_matching, stmt_step_select)
+8. Public API (open, exec, prepare_v2, step, finalize, close, column_count, column_text, column_int64, errmsg)
+9. Demo main
+
+Let me write it all now.
+
+For the exec callback, I'll define:
+```odin
+Exec_Callback :: proc(arg: rawptr, n: int, vals: []string, cols: []string)
+```
+
+And in exec, I'll build the vals array and call the callback.
+
+Let me also handle the `or_return` pattern for error handling where appropriate.
+
+OK, let me also think about how to handle the `Stmt` cleanup. In the C code, `free_stmt` frees all the strings and expressions in the Stmt. In Odin, I need to delete dynamic arrays and free heap-allocated Exprs.
+
+For Expr, I'll write a `free_expr` proc:
+```odin
+free_expr :: proc(e: ^Expr) {
+    if e == nil { return }
+    // strings are cloned, but in Odin we might not free them individually
+    free_expr(e.l)
+    free_expr(e.r)
+    free(e)
+}
+```
+
+Actually, in Odin, strings allocated with `strings.clone` need to be `delete`d. But tracking every string is tedious. For the demo, I'll skip some cleanup. The important thing is that the behavior matches.
+
+Let me write the code now. I'll be as concise as possible.
+
+Actually, I realize I should think about whether Odin's `strings.clone` is the right function. Let me check: `strings.clone(s: string) -> string` - yes, it allocates a new string and copies the content. The result needs to be `delete`d.
+
+But actually, for many of the strings, they come from the token array which comes from `strings.clone` of slices of the source SQL. If I just keep references (slices) to the source SQL, and keep the source SQL alive, I don't need to clone at all.
+
+Let me take a simpler approach: in the lexer, I'll store string slices (not cloned) that point into the source SQL. The parser will store references to these slices in the AST. The executor will clone strings when creating Values (since Values might outlive the SQL string). For `exec`, the SQL string is a parameter that's alive during the whole execution. For `prepare_v2`, I'll keep the SQL string alive in the stmt handle.
+
+Wait, but in `exec`, the C code frees tokens after parsing. If I use slices, the tokens point into the SQL string which is still alive. The AST also points into the SQL string. Values are cloned. This works.
+
+For `prepare_v2`, the C code creates a `buf` (copy of sql), lexes it, parses it, frees tokens and buf. The AST strings are strdup'd (independent copies). In Odin, if I use slices into `buf`, I need to keep `buf` alive. So I'll store `buf` in the stmt handle.
+
+Actually, let me just clone strings in the lexer (like the C code does with strndup) and then in the parser, clone from token text (like the C code does with strdup). Then I can free tokens after parsing. The AST owns its strings.
+
+But in Odin, freeing individual strings from a dynamic array of tokens is tedious. Let me just not free them and let the program exit clean up. For a demo, this is fine.
+
+OK, I'm overthinking this. Let me just write the code, using `strings.clone` where the C code uses `strdup`, and not worry about freeing everything. The behavior will match.
+
+Let me write the complete code now:
+
+```odin
+package main
+
+import "core:fmt"
+import "core:strings"
+
+// ========== Value ==========
+VType :: enum { NULL, INT, TEXT }
+
+Value :: struct {
+    type: VType,
+    ival: i64,
+    sval: string,
+}
+
+v_null :: proc() -> Value { return {type = .NULL} }
+v_int :: proc(i: i64) -> Value { return {type = .INT, ival = i} }
+v_text :: proc(s: string) -> Value { return {type = .TEXT, sval = strings.clone(s)} }
+
+v_copy :: proc(v: Value) -> Value {
+    if v.type == .TEXT { return {type = .TEXT, sval = strings.clone(v.sval)} }
+    return v
+}
+
+v_cmp :: proc(a, b: Value) -> int {
+    if a.type != b.type { return int(a.type) - int(b.type) }
+    switch a.type {
+    case .INT:
+        if a.ival < b.ival { return -1 }
+        if a.ival > b.ival { return 1 }
+        return 0
+    case .TEXT:
+        return strings.compare(a.sval, b.sval)
+    case:
+        return 0
+    }
+}
+
+v_to_text :: proc(v: Value) -> string {
+    switch v.type {
+    case .INT: return fmt.tprintf("%d", v.ival)
+    case .TEXT: return v.sval
+    case: return "NULL"
+    }
+}
+
+v_truthy :: proc(v: Value) -> bool {
+    return v_cmp(v, v_int(0)) != 0
+}
+
+// ========== Schema ==========
+Table :: struct {
+    name: string,
+    cols: [dynamic]string,
+}
+
+Schema :: struct {
+    tables: [dynamic]Table,
+}
+
+schema_find :: proc(s: ^Schema, name: string) -> ^Table {
+    for i in 0..<len(s.tables) {
+        if strings.equal_fold(s.tables[i].name, name) {
+            return &s.tables[i]
+        }
+    }
+    return nil
+}
+
+schema_index :: proc(s: ^Schema, name: string) -> int {
+    for i in 0..<len(s.tables) {
+        if strings.equal_fold(s.tables[i].name, name) {
+            return i
+        }
+    }
+    return -1
+}
+
+table_colindex :: proc(t: ^Table, col: string) -> int {
+    for i in 0..<len(t.cols) {
+        if strings.equal_fold(t.cols[i], col) {
+            return i
+        }
+    }
+    return -1
+}
+
+// ========== Row / Store ==========
+Row :: struct {
+    vals: [dynamic]Value,
+}
+
+RowNode :: struct {
+    row: Row,
+    next: ^RowNode,
+}
+
+RowStore :: struct {
+    head: ^RowNode,
+    tail: ^RowNode,
+    nrows: int,
+}
+
+// ========== Lexer ==========
+TokKind :: enum { EOF, ID, INT, STRING, KW, PUNCT, STAR, COMMA, LP, RP, SEMI, OP, DOT }
+
+Token :: struct {
+    kind: TokKind,
+    text: string,
+}
+
+KEYWORDS := []string{
+    "create", "table", "insert", "into", "values", "select", "from", "where",
+    "order", "by", "asc", "desc", "and", "or", "not", "null", "begin", "commit",
+    "inner", "join", "on", "int", "integer", "text", "primary", "key", "transaction",
+}
+
+is_kw :: proc(s: string) -> bool {
+    for kw in KEYWORDS {
+        if strings.equal_fold(kw, s) { return true }
+    }
+    return false
+}
+
+is_alpha :: proc(c: u8) -> bool {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'
+}
+
+is_alnum :: proc(c: u8) -> bool {
+    return is_alpha(c) || (c >= '0' && c <= '9')
+}
+
+is_digit :: proc(c: u8) -> bool {
+    return c >= '0' && c <= '9'
+}
+
+is_space :: proc(c: u8) -> bool {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v'
+}
+
+lex :: proc(sql: string) -> [dynamic]Token {
+    toks: [dynamic]Token
+    pos := 0
+    src := sql
+    
+    while pos < len(src) {
+        c := src[pos]
+        if is_space(c) { pos += 1; continue }
+        if c == '-' && pos+1 < len(src) && src[pos+1] == '-' {
+            while pos < len(src) && src[pos] != '\n' { pos += 1 }
+            continue
+        }
+        if is_alpha(c) {
+            st := pos
+            while pos < len(src) && is_alnum(src[pos]) { pos += 1 }
+            word := src[st:pos]
+            append(&toks, {kind = is_kw(word) ? .KW : .ID, text = strings.clone(word)})
+            continue
+        }
+        if is_digit(c) {
+            st := pos
+            while pos < len(src) && is_digit(src[pos]) { pos += 1 }
+            append(&toks, {kind = .INT, text = strings.clone(src[st:pos])})
+            continue
+        }
+        if c == '\'' {
+            pos += 1
+            st := pos
+            while pos < len(src) && src[pos] != '\'' { pos += 1 }
+            append(&toks, {kind = .STRING, text = strings.clone(src[st:pos])})
+            if pos < len(src) && src[pos] == '\'' { pos += 1 }
+            continue
+        }
+        if c == '"' {
+            pos += 1
+            st := pos
+            while pos < len(src) && src[pos] != '"' { pos += 1 }
+            append(&toks, {kind = .ID, text = strings.clone(src[st:pos])})
+            if pos < len(src) && src[pos] == '"' { pos += 1 }
+            continue
+        }
+        
+        switch c {
+        case '*': append(&toks, {kind = .STAR, text = "*"}); pos += 1
+        case ',': append(&toks, {kind = .COMMA, text = ","}); pos += 1
+        case '(': append(&toks, {kind = .LP, text = "("}); pos += 1
+        case ')': append(&toks, {kind = .RP, text = ")"}); pos += 1
+        case ';': append(&toks, {kind = .SEMI, text = ";"}); pos += 1
+        case '.': append(&toks, {kind = .DOT, text = "."}); pos += 1
+        case:
+            if c == '=' || c == '<' || c == '>' || c == '!' {
+                st := pos
+                if pos+1 < len(src) && src[pos+1] == '=' { pos += 1 }
+                if c == '<' && pos+1 < len(src) && src[pos+1] == '>' { pos += 1 }
+                if c == '!' && pos+1 < len(src) && src[pos+1] == '=' { pos += 1 }
+                pos += 1
+                append(&toks, {kind = .OP, text = strings.clone(src[st:pos])})
+            } else {
+                append(&toks, {kind = .PUNCT, text = string([c])})
+                pos += 1
+            }
+        }
+    }
+    append(&toks, {kind = .EOF, text = ""})
+    return toks
+}
+```
+
+Now the AST and parser:
+
+```odin
+// ========== AST ==========
+ExprKind :: enum { COL, INT, STR, BINOP }
+
+Expr :: struct {
+    kind: ExprKind,
+    col: string,
+    ival: i64,
+    sval: string,
+    op: string,
+    l: ^Expr,
+    r: ^Expr,
+}
+
+ResultCol :: struct {
+    col: string,
+    star: bool,
+}
+
+TableRef :: struct {
+    tname: string,
+    alias: string,
+}
+
+Stmt :: struct {
+    is_create: bool,
+    is_insert: bool,
+    is_select: bool,
+    is_begin: bool,
+    is_commit: bool,
+    ct_name: string,
+    ct_cols: [dynamic]string,
+    ins_table: string,
+    ins_vals: [dynamic]Value,
+    sel_cols: [dynamic]ResultCol,
+    sel_star: bool,
+    sel_tables: [dynamic]TableRef,
+    sel_where: ^Expr,
+    sel_order_col: string,
+    sel_order_desc: bool,
+    sel_join_on: ^Expr,
+}
+
+new_expr :: proc(k: ExprKind) -> ^Expr {
+    e := new(Expr)
+    e.kind = k
+    return e
+}
+
+free_expr :: proc(e: ^Expr) {
+    if e == nil { return }
+    free_expr(e.l)
+    free_expr(e.r)
+    free(e)
+}
+
+// ========== Parser ==========
+Parser :: struct {
+    toks: []Token,
+    i: int,
+}
+
+p_accept :: proc(p: ^Parser, k: TokKind, text: string) -> bool {
+    if p.toks[p.i].kind != k { return false }
+    if text != "" && !strings.equal_fold(p.toks[p.i].text, text) { return false }
+    p.i += 1
+    return true
+}
+
+p_accept_kw :: proc(p: ^Parser, kw: string) -> bool {
+    return p_accept(p, .KW, kw)
+}
+
+p_peek_kw :: proc(p: ^Parser, kw: string) -> bool {
+    return p.toks[p.i].kind == .KW && strings.equal_fold(p.toks[p.i].text, kw)
+}
+
+parse_primary :: proc(p: ^Parser) -> ^Expr {
+    t := &p.toks[p.i]
+    if t.kind == .INT {
+        e := new_expr(.INT)
+        e.ival = strconv.parse_int(t.text, 10) or_else 0
+        p.i += 1
+        return e
+    }
+    if t.kind == .STRING {
+        e := new_expr(.STR)
+        e.sval = strings.clone(t.text)
+        p.i += 1
+        return e
+    }
+    if t.kind == .ID || t.kind == .KW {
+        e := new_expr(.COL)
+        buf := strings.clone(t.text)
+        p.i += 1
+        if p.toks[p.i].kind == .DOT {
+            p.i += 1
+            buf = fmt.tprintf("%s.%s", buf, p.toks[p.i].text)
+            p.i += 1
+        }
+        e.col = buf
+        return e
+    }
+    if p_accept(p, .LP, "") {
+        e := parse_expr(p)
+        p_accept(p, .RP, "")
+        return e
+    }
+    return nil
+}
+```
+
+Wait, I need `strconv` for parsing integers. Let me import it. Actually, in Odin, I can use `strconv.parse_int` or just do a simple conversion. Let me check what's available.
+
+`core:strconv` has `parse_int(s: string, base: int) -> (i64, strconv.ParseError)`. I can use `or_else` to handle errors.
+
+Actually, let me just use a simple approach. The C code uses `atol(t->text)`. In Odin:
+
+```odin
+import "core:strconv"
+// ...
+e.ival = strconv.parse_int(t.text, 10) or_else 0
+```
+
+Hmm, but `strconv.parse_int` might have a different signature. Let me check... In Odin, it's `strconv.parse_int(s: string, base: int) -> (res: i64, err: strconv.ParseError)`. So I can do:
+
+```odin
+val, _ := strconv.parse_int(t.text, 10)
+e.ival = val
+```
+
+Or with `or_else`:
+```odin
+e.ival = strconv.parse_int(t.text, 10) or_else 0
+```
+
+Wait, `or_else` works with the `?` return type. `strconv.parse_int` returns a tuple `(i64, strconv.ParseError)`, not a `?` type. Let me just do:
+
+```odin
+val, ok := strconv.parse_int(t.text, 10)
+e.ival = val
+```
+
+Actually, I think in Odin, `strconv.parse_int` returns `(i64, bool)` or `(i64, ParseError)`. Let me just use it and ignore the error.
+
+Hmm, I'm not 100% sure of the exact API. Let me use a simple manual parse instead:
+
+```odin
+parse_int_simple :: proc(s: string) -> i64 {
+    n: i64 = 0
+    for c in s {
+        if c >= '0' && c <= '9' {
+            n = n * 10 + i64(c - '0')
+        }
+    }
+    return n
+}
+```
+
+This is simpler and avoids import issues. Let me use this.
+
+Actually, let me just import strconv and use it. The exact API in Odin is:
+
+```odin
+// core:strconv
+parse_int :: proc(s: string, base: int, success: ^bool = nil) -> i64
+```
+
+or maybe it's:
+
+```odin
+parse_int :: proc(s: string, base: int) -> (i64, ParseError)
+```
+
+I'm not sure. Let me just use my own simple parser to avoid issues.
+
+OK let me continue with the parser:
+
+```odin
+parse_cmp :: proc(p: ^Parser) -> ^Expr {
+    l := parse_primary(p)
+    if p.toks[p.i].kind == .OP {
+        e := new_expr(.BINOP)
+        e.op = strings.clone(p.toks[p.i].text)
+        p.i += 1
+        e.l = l
+        e.r = parse_primary(p)
+        return e
+    }
+    return l
+}
+
+parse_expr :: proc(p: ^Parser) -> ^Expr {
+    l := parse_cmp(p)
+    if p_peek_kw(p, "and") || p_peek_kw(p, "or") {
+        e := new_expr(.BINOP)
+        e.op = p_peek_kw(p, "and") ? "AND" : "OR"
+        p.i += 1
+        e.l = l
+        e.r = parse_expr(p)
+        return e
+    }
+    return l
+}
+```
+
+Now the statement parsers:
+
+```odin
+parse_create :: proc(p: ^Parser, st: ^Stmt) -> bool {
+    st.is_create = true
+    if p.toks[p.i].kind != .ID && p.toks[p.i].kind != .KW { return false }
+    st.ct_name = strings.clone(p.toks[p.i].text)
+    p.i += 1
+    if !p_accept(p, .LP, "") { return false }
+    while p.toks[p.i].kind != .RP && p.toks[p.i].kind != .EOF {
+        if p.toks[p.i].kind != .ID && p.toks[p.i].kind != .KW { return false }
+        append(&st.ct_cols, strings.clone(p.toks[p.i].text))
+        p.i += 1
+        while p.toks[p.i].kind != .COMMA && p.toks[p.i].kind != .RP && p.toks[p.i].kind != .EOF {
+            p.i += 1
+        }
+        p_accept(p, .COMMA, "")
+    }
+    p_accept(p, .RP, "")
+    return true
+}
+
+parse_insert :: proc(p: ^Parser, st: ^Stmt) -> bool {
+    st.is_insert = true
+    if !p_accept_kw(p, "into") { return false }
+    if p.toks[p.i].kind != .ID { return false }
+    st.ins_table = strings.clone(p.toks[p.i].text)
+    p.i += 1
+    if !p_accept_kw(p, "values") { return false }
+    if !p_accept(p, .LP, "") { return false }
+    while p.toks[p.i].kind != .RP && p.toks[p.i].kind != .EOF {
+        if p.toks[p.i].kind == .INT {
+            append(&st.ins_vals, v_int(parse_int_simple(p.toks[p.i].text)))
+        } else if p.toks[p.i].kind == .STRING {
+            append(&st.ins_vals, v_text(p.toks[p.i].text))
+        } else if p_accept_kw(p, "null") {
+            append(&st.ins_vals, v_null())
+            // p_accept_kw already advanced, so don't double-advance
+            if !p_accept(p, .COMMA, "") { break }
+            continue
+        } else {
+            return false
+        }
+        p.i += 1
+        if !p_accept(p, .COMMA, "") { break }
+    }
+    if !p_accept(p, .RP, "") { return false }
+    return true
+}
+```
+
+Wait, there's a subtlety with the `null` case. When `p_accept_kw(p, "null")` is called, it advances `p.i`. So after that, I should not do `p.i += 1`. Let me restructure:
+
+```odin
+parse_insert :: proc(p: ^Parser, st: ^Stmt) -> bool {
+    st.is_insert = true
+    if !p_accept_kw(p, "into") { return false }
+    if p.toks[p.i].kind != .ID { return false }
+    st.ins_table = strings.clone(p.toks[p.i].text)
+    p.i += 1
+    if !p_accept_kw(p, "values") { return false }
+    if !p_accept(p, .LP, "") { return false }
+    while p.toks[p.i].kind != .RP && p.toks[p.i].kind != .EOF {
+        if p.toks[p.i].kind == .INT {
+            append(&st.ins_vals, v_int(parse_int_simple(p.toks[p.i].text)))
+            p.i += 1
+        } else if p.toks[p.i].kind == .STRING {
+            append(&st.ins_vals, v_text(p.toks[p.i].text))
+            p.i += 1
+        } else if p_accept_kw(p, "null") {
+            append(&st.ins_vals, v_null())
+        } else {
+            return false
+        }
+        if !p_accept(p, .COMMA, "") { break }
+    }
+    if !p_accept(p, .RP, "") { return false }
+    return true
+}
+```
+
+This is cleaner. The `p_accept_kw` for "null" advances `p.i`, and then we check for comma.
+
+Now parse_select:
+
+```odin
+parse_select :: proc(p: ^Parser, st: ^Stmt) -> bool {
+    st.is_select = true
+    if p_accept(p, .STAR, "") {
+        st.sel_star = true
+    } else {
+        do {
+            rc := ResultCol{}
+            if p_accept(p, .STAR, "") {
+                rc.star = true
+            } else if p.toks[p.i].kind == .ID || p.toks[p.i].kind == .KW {
+                buf := strings.clone(p.toks[p.i].text)
+                p.i += 1
+                if p.toks[p.i].kind == .DOT {
+                    p.i += 1
+                    if p_accept(p, .STAR, "") {
+                        rc.star = true
+                    } else {
+                        buf = fmt.tprintf("%s.%s", buf, p.toks[p.i].text)
+                        p.i += 1
+                        rc.col = buf
+                    }
+                } else {
+                    rc.col = buf
+                }
+            } else {
+                return false
+            }
+            append(&st.sel_cols, rc)
+        } while p_accept(p, .COMMA, "")
+    }
+    if !p_accept_kw(p, "from") { return false }
+    if p.toks[p.i].kind != .ID { return false }
+    
+    // first table
+    tr := TableRef{tname = strings.clone(p.toks[p.i].text)}
+    p.i += 1
+    if p.toks[p.i].kind == .ID && !p_peek_kw(p, "on") && !p_peek_kw(p, "where") && !p_peek_kw(p, "order") && !p_peek_kw(p, "inner") && !p_peek_kw(p, "join") {
+        tr.alias = strings.clone(p.toks[p.i].text)
+        p.i += 1
+    }
+    append(&st.sel_tables, tr)
+    
+    // joins
+    while p_peek_kw(p, "inner") || p_peek_kw(p, "join") {
+        if p_accept_kw(p, "inner") {
+            if !p_accept_kw(p, "join") { return false }
+        } else {
+            p_accept_kw(p, "join")
+        }
+        if p.toks[p.i].kind != .ID { return false }
+        tr2 := TableRef{tname = strings.clone(p.toks[p.i].text)}
+        p.i += 1
+        if p.toks[p.i].kind == .ID && !p_peek_kw(p, "on") && !p_peek_kw(p, "where") && !p_peek_kw(p, "order") {
+            tr2.alias = strings.clone(p.toks[p.i].text)
+            p.i += 1
+        }
+        append(&st.sel_tables, tr2)
+        if p_accept_kw(p, "on") {
+            on := parse_expr(p)
+            if st.sel_join_on == nil {
+                st.sel_join_on = on
+            } else {
+                and := new_expr(.BINOP)
+                and.op = "AND"
+                and.l = st.sel_join_on
+                and.r = on
+                st.sel_join_on = and
+            }
+        }
+    }
+    
+    if p_accept_kw(p, "where") {
+        st.sel_where = parse_expr(p)
+    }
+    if p_accept_kw(p, "order") {
+        if !p_accept_kw(p, "by") { return false }
+        if p.toks[p.i].kind != .ID && p.toks[p.i].kind != .KW { return false }
+        st.sel_order_col = strings.clone(p.toks[p.i].text)
+        p.i += 1
+        if p_accept_kw(p, "desc") {
+            st.sel_order_desc = true
+        } else {
+            p_accept_kw(p, "asc")
+        }
+    }
+    return true
+}
+```
+
+Wait, I used `do { ... } while ...` but Odin doesn't have do-while. Let me restructure. The C code uses:
+
+```c
+do {
+    ...
+} while (p_accept(P,TK_COMMA,NULL));
+```
+
+In Odin, I can use:
+```odin
+for {
+    // ... parse one result col
+    if !p_accept(p, .COMMA, "") { break }
+}
+```
+
+Let me fix that.
+
+Now the main parse function:
+
+```odin
+parse :: proc(p: ^Parser, st: ^Stmt) -> bool {
+    st^ = {}  // zero-initialize
+    
+    if p_peek_kw(p, "begin") {
+        st.is_begin = true
+        p.i += 1
+        p_accept_kw(p, "transaction")
+    } else if p_peek_kw(p, "commit") {
+        st.is_commit = true
+        p.i += 1
+        p_accept_kw(p, "transaction")
+    } else if p_accept_kw(p, "create") {
+        if p_accept_kw(p, "table") {
+            if !parse_create(p, st) { return false }
+        } else {
+            return false
+        }
+    } else if p_accept_kw(p, "insert") {
+        if !parse_insert(p, st) { return false }
+    } else if p_accept_kw(p, "select") {
+        if !parse_select(p, st) { return false }
+    } else {
+        return false
+    }
+    p_accept(p, .SEMI, "")
+    return true
+}
+```
+
+Wait, `st^ = {}` might not work for zeroing a struct with dynamic arrays. Let me think... In Odin, `st^ = {}` should zero-initialize all fields, including dynamic arrays (which become empty). Actually, I need to be careful - if the Stmt already has allocated dynamic arrays, this would leak them. But since we're parsing a new statement, the Stmt should be fresh. Let me use `st^ = Stmt{}` to be explicit.
+
+Actually, in the C code, `memset(st,0,sizeof *st)` zeros the struct. In Odin, `st^ = Stmt{}` does the same. But dynamic arrays in Odin are (data, len, cap) tuples, so zeroing them gives empty arrays. That's fine for a fresh Stmt.
+
+Now the database and executor:
+
+```odin
+// ========== Database ==========
+DB :: struct {
+    schema: Schema,
+    stores: [dynamic]RowStore,
+    errmsg: string,
+    in_txn: bool,
+}
+
+db_exec_create :: proc(db: ^DB, st: ^Stmt) -> int {
+    if schema_find(&db.schema, st.ct_name) != nil {
+        db.errmsg = fmt.tprintf("table already exists: %s", st.ct_name)
+        return -1
+    }
+    append(&db.schema.tables, {name = strings.clone(st.ct_name), cols = st.ct_cols})
+    st.ct_cols = {}  // transfer ownership
+    append(&db.stores, {})
+    return 0
+}
+
+db_exec_insert :: proc(db: ^DB, st: ^Stmt) -> int {
+    idx := schema_index(&db.schema, st.ins_table)
+    if idx < 0 {
+        db.errmsg = fmt.tprintf("no such table: %s", st.ins_table)
+        return -1
+    }
+    rs := &db.stores[idx]
+    n := new(RowNode)
+    for v in st.ins_vals {
+        append(&n.row.vals, v_copy(v))
+    }
+    if rs.tail != nil {
+        rs.tail.next = n
+    } else {
+        rs.head = n
+    }
+    rs.tail = n
+    rs.nrows += 1
+    return 0
+}
+```
+
+Now the expression evaluation:
+
+```odin
+RowCtx :: struct {
+    refs: []TableRef,
+    tabs: []^Table,
+    rows: []Row,
+}
+
+rowctx_colindex :: proc(c: ^RowCtx, col: string) -> (int, int, bool) {
+    dot_pos := strings.index(col, ".")
+    if dot_pos >= 0 {
+        tname := col[:dot_pos]
+        cname := col[dot_pos+1:]
+        for i in 0..<len(c.refs) {
+            tn := c.refs[i].alias != "" ? c.refs[i].alias : c.refs[i].tname
+            if strings.equal_fold(tn, tname) {
+                ci := table_colindex(c.tabs[i], cname)
+                if ci >= 0 {
+                    return i, ci, true
+                }
+            }
+        }
+        return 0, 0, false
+    }
+    for i in 0..<len(c.tabs) {
+        ci := table_colindex(c.tabs[i], col)
+        if ci >= 0 {
+            return i, ci, true
+        }
+    }
+    return 0, 0, false
+}
+
+eval_expr :: proc(e: ^Expr, c: ^RowCtx) -> Value {
+    if e == nil { return v_null() }
+    switch e.kind {
+    case .INT: return v_int(e.ival)
+    case .STR: return v_text(e.sval)
+    case .COL:
+        ti, ci, ok := rowctx_colindex(c, e.col)
+        if !ok { return v_null() }
+        return v_copy(c.rows[ti].vals[ci])
+    case .BINOP:
+        a := eval_expr(e.l, c)
+        b := eval_expr(e.r, c)
+        res := v_null()
+        if strings.equal_fold(e.op, "AND") {
+            res = v_int(v_truthy(a) && v_truthy(b) ? 1 : 0)
+        } else if strings.equal_fold(e.op, "OR") {
+            res = v_int(v_truthy(a) || v_truthy(b) ? 1 : 0)
+        } else {
+            cmp := v_cmp(a, b)
+            #partial switch e.op {
+            case "=": res = v_int(cmp == 0 ? 1 : 0)
+            case "<>": res = v_int(cmp != 0 ? 1 : 0)
+            case "<": res = v_int(cmp < 0 ? 1 : 0)
+            case ">": res = v_int(cmp > 0 ? 1 : 0)
+            case "<=": res = v_int(cmp <= 0 ? 1 : 0)
+            case ">=": res = v_int(cmp >= 0 ? 1 : 0)
+            case: res = v_null()
+            }
+        }
+        return res
+    case:
+        return v_null()
+    }
+}
+
+row_match :: proc(where: ^Expr, c: ^RowCtx) -> bool {
+    if where == nil { return true }
+    v := eval_expr(where, c)
+    return v_truthy(v)
+}
+```
+
+Wait, I need to be careful with the `#partial switch` on strings. In Odin, switch on string works with exact matching. The C code uses `strcmp` for the operators, which is exact matching. So `e.op` should be exactly "=", "<>", etc. Let me use a regular switch.
+
+Actually, `strings.equal_fold` is used for "AND" and "OR" (case-insensitive), but `strcmp` is used for the comparison operators (case-sensitive). In the lexer, operators are tokenized as-is, so they'll be exactly "=", "<>", "<", ">", "<=", ">=". And "AND"/"OR" come from keywords, which could be any case. So I should use `strings.equal_fold` for AND/OR and exact match for operators.
+
+Let me use if-else for the operators:
+
+```odin
+case .BINOP:
+    a := eval_expr(e.l, c)
+    b := eval_expr(e.r, c)
+    res := v_null()
+    if strings.equal_fold(e.op, "AND") {
+        res = v_int(bool(v_truthy(a) && v_truthy(b)))
+    } else if strings.equal_fold(e.op, "OR") {
+        res = v_int(bool(v_truthy(a) || v_truthy(b)))
+    } else {
+        cmp := v_cmp(a, b)
+        if e.op == "=" { res = v_int(cmp == 0) }
+        else if e.op == "<>" { res = v_int(cmp != 0) }
+        else if e.op == "<" { res = v_int(cmp < 0) }
+        else if e.op == ">" { res = v_int(cmp > 0) }
+        else if e.op == "<=" { res = v_int(cmp <= 0) }
+        else if e.op == ">=" { res = v_int(cmp >= 0) }
+    }
+    return res
+```
+
+Wait, `v_int` takes `i64`, but `cmp == 0` is `bool`. In Odin, I need to convert: `v_int(cmp == 0 ? 1 : 0)` or use a cast. Let me use the ternary form.
+
+Actually, in Odin, `v_int(bool_value)` won't work because `v_int` expects `i64`. I need `v_int(1)` or `v_int(0)`. Let me use:
+
+```odin
+res = v_int(v_truthy(a) && v_truthy(b) ? 1 : 0)
+```
+
+Or I can define v_int to accept bool... no, let me just use the ternary.
+
+Now the prepared statement and executor:
+
+```odin
+Stmt_Handle :: struct {
+    db: ^DB,
+    st: Stmt,
+    started: bool,
+    outrow: [dynamic]Value,
+    sorted: [dynamic]Row,
+    cur_sorted: int,
+}
+
+collect_matching :: proc(s: ^Stmt_Handle) {
+    db := s.db
+    n := len(s.st.sel_tables)
+    idx: [dynamic]int
+    tabs: [dynamic]^Table
+    for i in 0..<n {
+        ti := schema_index(&db.schema, s.st.sel_tables[i].tname)
+        append(&idx, ti)
+        if ti >= 0 {
+            append(&tabs, &db.schema.tables[ti])
+        } else {
+            append(&tabs, nil)
+        }
+    }
+    
+    // nested loop
+    cur: [dynamic]^RowNode
+    for i in 0..<n {
+        if idx[i] >= 0 {
+            append(&cur, db.stores[idx[i]].head)
+        } else {
+            append(&cur, nil)
+        }
+    }
+    
+    rows: [dynamic]Row  // temporary for each iteration
+    
+    for {
+        ok := true
+        for i in 0..<n {
+            if cur[i] == nil { ok = false; break }
+        }
+        if !ok { break }
+        
+        // build row context
+        ctx_rows: [dynamic]Row
+        for i in 0..<n {
+            append(&ctx_rows, cur[i].row)
+        }
+        c := RowCtx{refs = s.st.sel_tables[:], tabs = tabs[:], rows = ctx_rows[:]}
+        
+        if row_match(s.st.sel_where, &c) && (s.st.sel_join_on == nil || row_match(s.st.sel_join_on, &c)) {
+            // collect combined row
+            combined: [dynamic]Value
+            for i in 0..<n {
+                for v in cur[i].row.vals {
+                    append(&combined, v_copy(v))
+                }
+            }
+            append(&s.sorted, {vals = combined})
+        }
+        
+        // advance innermost
+        k := n - 1
+        for k >= 0 {
+            cur[k] = cur[k].next
+            if cur[k] != nil { break }
+            if k > 0 {
+                if idx[k] >= 0 {
+                    cur[k] = db.stores[idx[k]].head
+                }
+            }
+            k -= 1
+        }
+        if k < 0 { break }
+    }
+    
+    // ORDER BY
+    if s.st.sel_order_col != "" && n == 1 {
+        cidx := table_colindex(tabs[0], s.st.sel_order_col)
+        if cidx >= 0 {
+            // insertion sort
+            for i in 1..<len(s.sorted) {
+                for j in i; j > 0; j -= 1 {
+                    a := s.sorted[j-1].vals[cidx]
+                    b := s.sorted[j].vals[cidx]
+                    cmp := v_cmp(a, b)
+                    if (s.st.sel_order_desc && cmp < 0) || (!s.st.sel_order_desc && cmp > 0) {
+                        tmp := s.sorted[j-1]
+                        s.sorted[j-1] = s.sorted[j]
+                        s.sorted[j] = tmp
+                    } else {
+                        break
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+Hmm, I need to be careful with the nested loop advancement. Let me re-examine the C code:
+
+```c
+int k;
+for (k=n-1;k>=0;k--){
+    cur[k]=cur[k]->next;
+    if (cur[k]) break;
+    if (k>0) cur[k]= idx[k]>=0 ? db->stores[idx[k]].head : NULL;
+    else { /* all done */ }
+}
+if (k<0) break;
+```
+
+So it advances the innermost cursor (k=n-1). If it becomes NULL, it resets to head and moves to the next outer cursor. If all cursors are exhausted (k<0), we're done.
+
+Let me rewrite this more carefully:
+
+```odin
+// advance innermost
+k := n - 1
+for k >= 0 {
+    cur[k] = cur[k].next
+    if cur[k] != nil { break }
+    if k > 0 {
+        if idx[k] >= 0 {
+            cur[k] = db.stores[idx[k]].head
+        }
+    }
+    k -= 1
+}
+if k < 0 { break }
+```
+
+This looks correct. When `cur[k]` becomes nil after advancing:
+- If k > 0, reset cur[k] to head and continue to k-1
+- If k == 0, we fall through to k -= 1, making k = -1, and then the outer `if k < 0 { break }` triggers
+
+Wait, but there's a subtle issue. When `cur[k]` is nil after `cur[k] = cur[k].next`, and k > 0, we reset `cur[k]` to head. But then we do `k -= 1` and continue the loop, which advances `cur[k-1]`. That's correct - it's like an odometer.
+
+But when k == 0 and cur[0] becomes nil, we don't reset (the `if k > 0` is false), then k -= 1 makes k = -1, and we break out of the for loop. Then `if k < 0 { break }` breaks the while loop. Correct.
+
+Now the step function:
+
+```odin
+stmt_step_select :: proc(s: ^Stmt_Handle) -> int {
+    if !s.started {
+        s.started = true
+        collect_matching(s)
+    }
+    if s.cur_sorted >= len(s.sorted) {
+        return 101  // DONE
+    }
+    r := &s.sorted[s.cur_sorted]
+    s.cur_sorted += 1
+    
+    db := s.db
+    n := len(s.st.sel_tables)
+    tabs: [dynamic]^Table
+    for i in 0..<n {
+        append(&tabs, schema_find(&db.schema, s.st.sel_tables[i].tname))
+    }
+    
+    // compute offsets
+    offsets: [dynamic]int
+    off := 0
+    for i in 0..<n {
+        append(&offsets, off)
+        off += tabs[i].ncols  // wait, tabs[i] could be nil
+    }
+    
+    // Actually, tabs[i] should not be nil if the table exists
+    // Let me handle it safely
+    
+    // build output row
+    clear(&s.outrow)
+    
+    if s.st.sel_star {
+        for i in 0..<n {
+            for j in 0..<len(tabs[i].cols) {
+                append(&s.outrow, v_copy(r.vals[offsets[i] + j]))
+            }
+        }
+    } else {
+        for k in 0..<len(s.st.sel_cols) {
+            rc := &s.st.sel_cols[k]
+            if rc.star {
+                for i in 0..<n {
+                    for j in 0..<len(tabs[i].cols) {
+                        append(&s.outrow, v_copy(r.vals[offsets[i] + j]))
+                    }
+                }
+            } else {
+                dot_pos := strings.index(rc.col, ".")
+                ti := 0
+                ci := -1
+                if dot_pos >= 0 {
+                    tname := rc.col[:dot_pos]
+                    cname := rc.col[dot_pos+1:]
+                    for i in 0..<n {
+                        tn := s.st.sel_tables[i].alias != "" ? s.st.sel_tables[i].alias : s.st.sel_tables[i].tname
+                        if strings.equal_fold(tn, tname) {
+                            ci = table_colindex(tabs[i], cname)
+                            ti = i
+                            break
+                        }
+                    }
+                } else {
+                    for i in 0..<n {
+                        ci = table_colindex(tabs[i], rc.col)
+                        if ci >= 0 {
+                            ti = i
+                            break
+                        }
+                    }
+                }
+                if ci < 0 {
+                    append(&s.outrow, v_null())
+                } else {
+                    append(&s.outrow, v_copy(r.vals[offsets[ti] + ci]))
+                }
+            }
+        }
+    }
+    
+    return 100  // ROW
+}
+```
+
+Wait, `clear(&s.outrow)` - does Odin have `clear` for dynamic arrays? I think `clear(&dynamic_array)` sets the length to 0. Let me check... In Odin, `clear(&da)` removes all elements. Yes, that should work.
+
+Now the public API:
+
+```odin
+Exec_Callback :: proc(arg: rawptr, n: int, vals: []string, cols: []string)
+
+open :: proc(name: string) -> ^DB {
+    db := new(DB)
+    return db
+}
+
+close :: proc(db: ^DB) -> int {
+    if db == nil { return 0 }
+    for i in 0..<len(db.schema.tables) {
+        // free row nodes
+        no := db.stores[i].head
+        for no != nil {
+            nx := no.next
+            delete(no.row.vals)
+            free(no)
+            no = nx
+        }
+    }
+    delete(db.schema.tables)
+    delete(db.stores)
+    free(db)
+    return 0
+}
+
+errmsg :: proc(db: ^DB) -> string {
+    if db == nil { return "" }
+    return db.errmsg
+}
+
+exec :: proc(db: ^DB, sql: string, cb: Exec_Callback, arg: rawptr) -> (int, string) {
+    toks := lex(sql)
+    defer delete(toks)
+    
+    p := Parser{toks = toks[:]}
+    rc := 0
+    err_msg := ""
+    
+    for p.toks[p.i].kind != .EOF {
+        st: Stmt
+        if !parse(&p, &st) {
+            err_msg = "parse error"
+            rc = 1
+            break
+        }
+        if st.is_begin {
+            db.in_txn = true
+        } else if st.is_commit {
+            db.in_txn = false
+        } else if st.is_create {
+            rc = db_exec_create(db, &st)
+        } else if st.is_insert {
+            rc = db_exec_insert(db, &st)
+        } else if st.is_select {
+            s := new(Stmt_Handle)
+            s.db = db
+            s.st = st
+            for {
+                r := stmt_step_select(s)
+                if r != 100 { break }
+                vals: [dynamic]string
+                for v in s.outrow {
+                    append(&vals, v_to_text(v))
+                }
+                if cb != nil {
+                    cb(arg, len(s.outrow), vals[:], nil)
+                }
+                delete(vals)
+                // free outrow values
+                for v in s.outrow {
+                    // text values are cloned, but v_to_text for INT uses tprintf
+                    // we don't need to free individual values in Odin
+                }
+            }
+            for r in s.sorted {
+                delete(r.vals)
+            }
+            delete(s.sorted)
+            delete(s.outrow)
+            free(s)
+        }
+        // free_stmt - in Odin, dynamic arrays in st need cleanup
+        // but for simplicity, we skip this
+    }
+    
+    if rc != 0 && err_msg == "" {
+        err_msg = db.errmsg
+    }
+    
+    return rc, err_msg
+}
+
+prepare_v2 :: proc(db: ^DB, sql: string) -> (^Stmt_Handle, int) {
+    toks := lex(sql)
+    defer delete(toks)
+    
+    p := Parser{toks = toks[:]}
+    st: Stmt
+    if !parse(&p, &st) {
+        return nil, 1
+    }
+    s := new(Stmt_Handle)
+    s.db = db
+    s.st = st
+    return s, 0
+}
+
+step :: proc(s: ^Stmt_Handle) -> int {
+    if s.st.is_select {
+        return stmt_step_select(s)
+    }
+    return 101
+}
+
+column_count :: proc(s: ^Stmt_Handle) -> int {
+    return len(s.outrow)
+}
+
+column_text :: proc(s: ^Stmt_Handle, i: int) -> string {
+    if i < 0 || i >= len(s.outrow) { return "" }
+    return v_to_text(s.outrow[i])
+}
+
+column_int64 :: proc(s: ^Stmt_Handle, i: int) -> i64 {
+    if i < 0 || i >= len(s.outrow) { return 0 }
+    v := s.outrow[i]
+    if v.type == .INT { return v.ival }
+    return 0
+}
+
+finalize :: proc(s: ^Stmt_Handle) -> int {
+    if s == nil { return 0 }
+    free_expr(s.st.sel_where)
+    free_expr(s.st.sel_join_on)
+    for r in s.sorted {
+        delete(r.vals)
+    }
+    delete(s.sorted)
+    delete(s.outrow)
+    free(s)
+    return 0
+}
+```
+
+Now the demo:
+
+```odin
+print_row :: proc(arg: rawptr, n: int, vals: []string, cols: []string) {
