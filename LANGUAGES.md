@@ -19,5 +19,6 @@ Reduction >1 means the port is smaller than the C reference by token count.
 | 12 | Odin | 15 | n/a | 136/8805 | Port is severely incomplete: only two small cleanup procedures shown ( ⚠️ capped/incomplete |
 | 13 | OCaml | 15 | n/a | 623/8805 | The port is severely incomplete, containing only expression evaluation ⚠️ capped/incomplete |
 | 14 | Gleam | 12 | n/a | 180/8805 | The port shows only a single utility function (v_cmp) with no database ⚠️ capped/incomplete |
-| 15 | Vim9 script | 8 | n/a | 132/8805 | Port is essentially a stub demo that calls nonexistent Sqlite3 class m ⚠️ capped/incomplete |
-| 16 | Erlang | 8 | n/a | 167/8805 | The Erlang port provides only a single `project/6` function for column ⚠️ capped/incomplete |
+| 15 | Haskell | 8 | n/a | 57/8805 | The port defines only a single data structure (StmtState) with no impl ⚠️ capped/incomplete |
+| 16 | Vim9 script | 8 | n/a | 132/8805 | Port is essentially a stub demo that calls nonexistent Sqlite3 class m ⚠️ capped/incomplete |
+| 17 | Erlang | 8 | n/a | 167/8805 | The Erlang port provides only a single `project/6` function for column ⚠️ capped/incomplete |

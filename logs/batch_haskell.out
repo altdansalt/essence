@@ -3,3 +3,12 @@
 [2026-06-20T17:47:10Z]       porter length-capped (16000 tok); retry high effort
 [2026-06-20T17:51:07Z]       porter done: 162 bytes, 57 tokens, 484.9s
 [2026-06-20T17:51:09Z]       judge: completeness=8 notes=The port defines only a single data structure (StmtState) with no implementation
+[main 1ad2af9] port: haskell (Haskell) completeness=8
+ 7 files changed, 1550 insertions(+)
+ create mode 100644 runs/haskell/judge_raw.txt
+ create mode 100644 runs/haskell/meta.json
+ create mode 100644 runs/haskell/porter_raw.txt
+ create mode 100644 runs/haskell/sqlite_core.hs
+To https://github.com/altdansalt/essence.git
+   c7be59c..1ad2af9  main -> main
+[2026-06-20T17:51:10Z] loop done: 1 runs
